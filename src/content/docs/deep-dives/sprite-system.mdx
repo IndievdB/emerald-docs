@@ -1,0 +1,664 @@
+---
+title: "Deep Dive: Sprite System"
+description: High-level sprite management in pokeemerald - templates, callbacks, and animations
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+While the [GBA hardware](/gba-hardware/graphics/sprites) provides 128 OAM entries for sprites, Pokemon Emerald builds a comprehensive sprite engine on top with templates, animations, callbacks, and tile management. This deep dive covers the software layer.
+
+## System Architecture
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Templates["Sprite Templates"]
+        ST["SpriteTemplate"]
+        OD["OamData"]
+        Anims["AnimTable"]
+        AffAnims["AffineAnimTable"]
+    end
+
+    subgraph Engine["Sprite Engine"]
+        gSprites["gSprites[64]"]
+        CreateSprite["CreateSprite()"]
+        Callbacks["Sprite Callbacks"]
+        AnimSystem["Animation System"]
+    end
+
+    subgraph Hardware["Hardware Layer"]
+        OAM["OAM Buffer"]
+        VRAM["OBJ VRAM"]
+        Palettes["OBJ Palettes"]
+    end
+
+    ST --> CreateSprite
+    CreateSprite --> gSprites
+    gSprites --> Callbacks
+    gSprites --> AnimSystem
+    gSprites --> OAM
+
+    style gSprites fill:#9f9,stroke:#333,color:#000
+    style CreateSprite fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Core Sprite Structure
+
+```c
+#define MAX_SPRITES 64
+
+struct Sprite
+{
+    // Hardware attributes (copied to OAM)
+    struct OamData oam;
+
+    // Animation
+    const union AnimCmd *const *anims;
+    const struct SpriteSheet *images;
+    const union AffineAnimCmd *const *affineAnims;
+
+    // Template
+    const struct SpriteTemplate *template;
+
+    // Subsprites for multi-part sprites
+    const struct SubspriteTable *subspriteTables;
+
+    // Per-frame callback
+    SpriteCallback callback;
+
+    // Position
+    s16 x;                        // X position on screen
+    s16 y;                        // Y position on screen
+    s16 x2;                       // X offset
+    s16 y2;                       // Y offset
+    s16 centerToCornerVecX;       // For rotation centering
+    s16 centerToCornerVecY;
+
+    // Animation state
+    u8 animNum;                   // Current animation index
+    u8 animCmdIndex;              // Current command in animation
+    u8 animDelayCounter;          // Frame delay counter
+    u8 animPaused:1;              // Animation paused
+    u8 affineAnimPaused:1;        // Affine animation paused
+    u8 animLoopCounter;           // Loop iteration counter
+
+    // State flags
+    u16 inUse:1;                  // Sprite slot active
+    u16 coordOffsetEnabled:1;     // Use gSpriteCoordOffsetX/Y
+    u16 invisible:1;              // Don't render
+    u16 flags_3:1;
+    u16 flags_4:1;
+    u16 flags_5:1;
+    u16 flags_6:1;
+    u16 flags_7:1;
+    u16 hFlip:1;                  // Horizontal flip
+    u16 vFlip:1;                  // Vertical flip
+    u16 animBeginning:1;
+    u16 affineAnimBeginning:1;
+    u16 animEnded:1;              // Animation finished
+    u16 affineAnimEnded:1;
+    u16 usingSheet:1;
+    u16 flags_f:1;
+
+    // Affine
+    u8 affineAnimNum;
+    u8 affineAnimCmdIndex;
+    u8 affineAnimDelayCounter;
+    u8 affineAnimLoopCounter;
+
+    // Priority within sprite layer
+    u8 subpriority;
+
+    // Sprite substructure index
+    u8 subspriteTableNum;
+    u8 subspriteMode:1;
+
+    // User data (16 fields for callbacks to use)
+    s16 data[8];
+};
+
+struct Sprite gSprites[MAX_SPRITES];
+```
+
+## Sprite Template
+
+Templates define how to create a sprite:
+
+```c
+struct SpriteTemplate
+{
+    u16 tileTag;                  // Tile graphics tag
+    u16 paletteTag;               // Palette tag
+    const struct OamData *oam;    // Default OAM settings
+    const union AnimCmd *const *anims;  // Animation table
+    const struct SpriteSheet *images;   // Alternative to tileTag
+    const union AffineAnimCmd *const *affineAnims;  // Affine animations
+    SpriteCallback callback;      // Initial callback
+};
+
+// Example template
+const struct SpriteTemplate gBallSpriteTemplate = {
+    .tileTag = TAG_POKEBALL_GFX,
+    .paletteTag = TAG_POKEBALL_PAL,
+    .oam = &gOamData_16x16,
+    .anims = gPokeballAnimTable,
+    .images = NULL,
+    .affineAnims = gDummySpriteAffineAnimTable,
+    .callback = SpriteCB_Pokeball,
+};
+```
+
+## Creating Sprites
+
+<DiagramContainer title="CreateSprite Flow">
+<pre class="mermaid">
+{`flowchart TD
+    Code[Your Code] -->|CreateSprite| Find[Find empty gSprites slot]
+    Find --> TileTag[GetSpriteTileStartByTag]
+    TileTag --> PalTag[IndexOfSpritePaletteTag]
+    PalTag --> Init[Initialize sprite fields]
+    Init --> Return[Return spriteId]
+    Return --> Code
+
+    subgraph Later[BuildOamBuffer]
+        Copy[Copy active sprites to OAM]
+    end
+
+    Init -.-> Copy`}
+</pre>
+</DiagramContainer>
+
+```c
+u8 CreateSprite(const struct SpriteTemplate *template,
+                s16 x, s16 y, u8 subpriority)
+{
+    u8 i;
+
+    // Find free slot
+    for (i = 0; i < MAX_SPRITES; i++)
+    {
+        if (!gSprites[i].inUse)
+            break;
+    }
+
+    if (i == MAX_SPRITES)
+        return MAX_SPRITES;  // No free slots
+
+    // Initialize sprite
+    struct Sprite *sprite = &gSprites[i];
+
+    sprite->inUse = TRUE;
+    sprite->x = x;
+    sprite->y = y;
+    sprite->subpriority = subpriority;
+    sprite->template = template;
+    sprite->callback = template->callback;
+
+    // Copy OAM defaults
+    sprite->oam = *template->oam;
+
+    // Set tile number from tag
+    sprite->oam.tileNum = GetSpriteTileStartByTag(template->tileTag);
+
+    // Set palette from tag
+    sprite->oam.paletteNum = IndexOfSpritePaletteTag(template->paletteTag);
+
+    // Setup animations
+    sprite->anims = template->anims;
+    sprite->affineAnims = template->affineAnims;
+    sprite->animNum = 0;
+    sprite->animCmdIndex = 0;
+    sprite->animDelayCounter = 0;
+
+    // Clear data fields
+    for (int j = 0; j < 8; j++)
+        sprite->data[j] = 0;
+
+    return i;
+}
+```
+
+## Sprite Callbacks
+
+Every sprite can have a callback function executed each frame:
+
+```c
+typedef void (*SpriteCallback)(struct Sprite *sprite);
+
+// Called from AnimateSprites()
+void AnimateSprites(void)
+{
+    for (u8 i = 0; i < MAX_SPRITES; i++)
+    {
+        struct Sprite *sprite = &gSprites[i];
+
+        if (sprite->inUse)
+        {
+            // Run animation system
+            UpdateSpriteAnimation(sprite);
+
+            // Run sprite callback
+            if (sprite->callback)
+                sprite->callback(sprite);
+        }
+    }
+}
+```
+
+### Common Callback Patterns
+
+```c
+// State machine callback
+void SpriteCB_Bounce(struct Sprite *sprite)
+{
+    switch (sprite->data[0])  // State
+    {
+    case 0:  // Rise
+        sprite->y -= 2;
+        if (++sprite->data[1] > 10)
+        {
+            sprite->data[0]++;
+            sprite->data[1] = 0;
+        }
+        break;
+
+    case 1:  // Fall
+        sprite->y += 2;
+        if (++sprite->data[1] > 10)
+        {
+            sprite->data[0] = 0;
+            sprite->data[1] = 0;
+        }
+        break;
+    }
+}
+
+// Movement callback
+void SpriteCB_MoveRight(struct Sprite *sprite)
+{
+    sprite->x += sprite->data[0];  // Speed in data[0]
+
+    if (sprite->x > 240)
+        DestroySprite(sprite);
+}
+
+// Timer callback
+void SpriteCB_DestroyAfterDelay(struct Sprite *sprite)
+{
+    if (--sprite->data[0] == 0)
+        DestroySprite(sprite);
+}
+```
+
+## Animation System
+
+### Animation Commands
+
+```c
+// Animation command union
+union AnimCmd
+{
+    // Show frame for N frames
+    struct {
+        u16 frame:8;          // Frame index
+        u16 duration:8;       // Duration in frames
+    } frame;
+
+    // End animation
+    struct {
+        u16 type:8;           // ANIM_END (0xFFFF)
+        u16 unused:8;
+    } end;
+
+    // Jump to another animation
+    struct {
+        u16 type:8;           // ANIM_JUMP (0xFFFE)
+        u16 target:8;         // Target anim index
+    } jump;
+
+    // Loop N times
+    struct {
+        u16 type:8;           // ANIM_LOOP (0xFFFD)
+        u16 count:8;          // Loop count (0 = infinite)
+    } loop;
+
+    u16 data;                 // Raw value
+};
+
+// Animation command macros
+#define ANIMCMD_FRAME(frame, duration) \
+    {.frame = {frame, duration}}
+
+#define ANIMCMD_LOOP(count) \
+    {.loop = {ANIM_LOOP, count}}
+
+#define ANIMCMD_JUMP(animNum) \
+    {.jump = {ANIM_JUMP, animNum}}
+
+#define ANIMCMD_END \
+    {.end = {ANIM_END, 0}}
+```
+
+### Animation Table Example
+
+```c
+// Walking animation - 4 frames
+static const union AnimCmd sAnim_Walk[] = {
+    ANIMCMD_FRAME(0, 8),   // Frame 0 for 8 ticks
+    ANIMCMD_FRAME(1, 8),   // Frame 1 for 8 ticks
+    ANIMCMD_FRAME(2, 8),   // Frame 2 for 8 ticks
+    ANIMCMD_FRAME(3, 8),   // Frame 3 for 8 ticks
+    ANIMCMD_LOOP(0),       // Loop forever
+};
+
+// Idle animation - single frame
+static const union AnimCmd sAnim_Idle[] = {
+    ANIMCMD_FRAME(0, 0),   // Frame 0, no advance
+    ANIMCMD_END,
+};
+
+// Animation table
+static const union AnimCmd *const sAnimTable[] = {
+    [ANIM_IDLE] = sAnim_Idle,
+    [ANIM_WALK] = sAnim_Walk,
+};
+```
+
+### Playing Animations
+
+```c
+void StartSpriteAnim(struct Sprite *sprite, u8 animNum)
+{
+    sprite->animNum = animNum;
+    sprite->animCmdIndex = 0;
+    sprite->animDelayCounter = 0;
+    sprite->animBeginning = TRUE;
+    sprite->animEnded = FALSE;
+    sprite->animLoopCounter = 0;
+}
+
+// Change to walking animation
+StartSpriteAnim(&gSprites[spriteId], ANIM_WALK);
+```
+
+## Affine Animations
+
+For rotation and scaling effects:
+
+```c
+union AffineAnimCmd
+{
+    // Set matrix
+    struct {
+        s16 xScale;           // X scale (256 = 1.0)
+        s16 yScale;           // Y scale
+        u8 rotation;          // Rotation (0-255 = 0-360°)
+        u8 duration;          // Duration
+    } frame;
+
+    // End, loop, jump similar to regular anims
+    u16 type;
+};
+
+// Affine animation macros
+#define AFFINEANIMCMD_FRAME(xScale, yScale, rotation, duration) \
+    {.frame = {xScale, yScale, rotation, duration}}
+
+#define AFFINEANIMCMD_LOOP(count) \
+    {.type = AFFINE_ANIM_LOOP | (count << 8)}
+
+#define AFFINEANIMCMD_END \
+    {.type = AFFINE_ANIM_END}
+
+// Spinning animation
+static const union AffineAnimCmd sAffineAnim_Spin[] = {
+    AFFINEANIMCMD_FRAME(256, 256, 0, 0),    // Start normal
+    AFFINEANIMCMD_FRAME(256, 256, 4, 64),   // Rotate over 64 frames
+    AFFINEANIMCMD_LOOP(0),                   // Loop forever
+};
+```
+
+## Tile and Palette Tags
+
+The tag system manages shared graphics:
+
+```c
+struct SpriteSheet
+{
+    const u8 *data;           // Tile data
+    u16 size;                 // Size in bytes
+    u16 tag;                  // Unique identifier
+};
+
+struct SpritePalette
+{
+    const u16 *data;          // Palette data
+    u16 tag;                  // Unique identifier
+};
+
+// Load graphics with tag
+void LoadSpriteSheet(const struct SpriteSheet *sheet)
+{
+    // Find free VRAM slot
+    u16 tileStart = AllocSpriteTiles(sheet->size / 32);
+
+    // Copy to VRAM
+    RequestDma3Copy(sheet->data,
+                   (void *)(OBJ_VRAM0 + tileStart * 32),
+                   sheet->size, DMA3_32BIT);
+
+    // Register tag
+    RegisterSpriteTileTag(sheet->tag, tileStart);
+}
+
+// Load palette with tag
+void LoadSpritePalette(const struct SpritePalette *palette)
+{
+    // Find free palette slot
+    u8 palNum = AllocSpritePalette(palette->tag);
+
+    // Copy to palette RAM
+    LoadPalette(palette->data, OBJ_PLTT_ID(palNum), 32);
+}
+
+// Lookup
+u16 GetSpriteTileStartByTag(u16 tag);
+u8 IndexOfSpritePaletteTag(u16 tag);
+```
+
+## OAM Building
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph Sprites["gSprites[64]"]
+        S0["Sprite 0<br/>subpri: 5"]
+        S1["Sprite 1<br/>subpri: 2"]
+        S2["Sprite 2<br/>subpri: 10"]
+        S3["Sprite 3<br/>subpri: 2"]
+    end
+
+    subgraph Sorted["Sorted by Priority"]
+        P0["Sprite 1 (subpri 2)"]
+        P1["Sprite 3 (subpri 2)"]
+        P2["Sprite 0 (subpri 5)"]
+        P3["Sprite 2 (subpri 10)"]
+    end
+
+    subgraph OAM["OAM Buffer"]
+        O0["OAM[0]"]
+        O1["OAM[1]"]
+        O2["OAM[2]"]
+        O3["OAM[3]"]
+    end
+
+    S0 --> Sorted
+    S1 --> Sorted
+    S2 --> Sorted
+    S3 --> Sorted
+
+    P0 --> O0
+    P1 --> O1
+    P2 --> O2
+    P3 --> O3
+
+    style S1 fill:#9f9,stroke:#333,color:#000
+    style O0 fill:#9f9,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+```c
+void BuildOamBuffer(void)
+{
+    u8 oamIndex = 0;
+
+    // Sort sprites by priority and subpriority
+    SortSprites();
+
+    // Build OAM from sorted sprites
+    for (u8 i = 0; i < MAX_SPRITES; i++)
+    {
+        struct Sprite *sprite = &gSprites[sSpriteOrder[i]];
+
+        if (!sprite->inUse || sprite->invisible)
+            continue;
+
+        // Copy to OAM buffer
+        gMain.oamBuffer[oamIndex] = sprite->oam;
+
+        // Apply position with offsets
+        s16 x = sprite->x + sprite->x2;
+        s16 y = sprite->y + sprite->y2;
+
+        if (sprite->coordOffsetEnabled)
+        {
+            x += gSpriteCoordOffsetX;
+            y += gSpriteCoordOffsetY;
+        }
+
+        gMain.oamBuffer[oamIndex].x = x & 0x1FF;
+        gMain.oamBuffer[oamIndex].y = y & 0xFF;
+
+        // Apply flips
+        if (sprite->hFlip)
+            gMain.oamBuffer[oamIndex].matrixNum |= 0x08;
+        if (sprite->vFlip)
+            gMain.oamBuffer[oamIndex].matrixNum |= 0x10;
+
+        oamIndex++;
+    }
+
+    // Disable unused OAM entries
+    for (; oamIndex < 128; oamIndex++)
+    {
+        gMain.oamBuffer[oamIndex].affineMode = ST_OAM_AFFINE_OFF;
+        gMain.oamBuffer[oamIndex].y = 160;  // Off screen
+    }
+}
+```
+
+## Sprite Destruction
+
+```c
+void DestroySprite(struct Sprite *sprite)
+{
+    sprite->inUse = FALSE;
+}
+
+void DestroySpriteAndFreeResources(struct Sprite *sprite)
+{
+    // Free tile graphics
+    if (sprite->template && sprite->template->tileTag != TAG_NONE)
+        FreeSpriteTilesByTag(sprite->template->tileTag);
+
+    // Free palette
+    if (sprite->template && sprite->template->paletteTag != TAG_NONE)
+        FreeSpritePaletteByTag(sprite->template->paletteTag);
+
+    sprite->inUse = FALSE;
+}
+```
+
+## Subsprites
+
+For sprites larger than 64×64 or complex shapes:
+
+```c
+struct Subsprite
+{
+    s8 x;                     // Offset from main sprite
+    s8 y;
+    u16 shape:2;
+    u16 size:2;
+    u16 tileOffset:10;
+    u16 priority:2;
+};
+
+struct SubspriteTable
+{
+    u8 subspriteCount;
+    const struct Subsprite *subsprites;
+};
+
+// Large Pokemon sprite made of 4 subsprites
+static const struct Subsprite sSubsprites_LargeMon[] = {
+    {.x = -32, .y = -32, .shape = ST_OAM_SQUARE, .size = ST_OAM_SIZE_3, .tileOffset = 0},
+    {.x =   0, .y = -32, .shape = ST_OAM_SQUARE, .size = ST_OAM_SIZE_3, .tileOffset = 64},
+    {.x = -32, .y =   0, .shape = ST_OAM_SQUARE, .size = ST_OAM_SIZE_3, .tileOffset = 128},
+    {.x =   0, .y =   0, .shape = ST_OAM_SQUARE, .size = ST_OAM_SIZE_3, .tileOffset = 192},
+};
+```
+
+## Common Sprite Patterns
+
+### Spawning with Offset
+
+```c
+u8 CreateSpriteAtObjectEvent(struct ObjectEvent *obj,
+                             const struct SpriteTemplate *template)
+{
+    s16 x = obj->currentCoords.x * 16 + 8;
+    s16 y = obj->currentCoords.y * 16 + 8;
+
+    return CreateSprite(template, x, y, 0);
+}
+```
+
+### Sprite Following Another
+
+```c
+void SpriteCB_FollowSprite(struct Sprite *sprite)
+{
+    u8 targetId = sprite->data[0];
+    struct Sprite *target = &gSprites[targetId];
+
+    sprite->x = target->x + sprite->data[1];  // X offset
+    sprite->y = target->y + sprite->data[2];  // Y offset
+}
+```
+
+### Fading Sprite
+
+```c
+void SpriteCB_FadeOut(struct Sprite *sprite)
+{
+    sprite->data[0]++;
+
+    if (sprite->data[0] % 4 == 0)
+    {
+        sprite->invisible = !sprite->invisible;
+    }
+
+    if (sprite->data[0] > 30)
+    {
+        DestroySprite(sprite);
+    }
+}
+```
+
+## Related Topics
+
+- [Sprites (Hardware)](/gba-hardware/graphics/sprites) - OAM and hardware details
+- [Palettes](/gba-hardware/graphics/palettes) - Sprite palette management
+- [Task System](/deep-dives/task-system) - Coordinating with sprite callbacks

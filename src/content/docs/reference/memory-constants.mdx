@@ -1,0 +1,26 @@
+---
+title: Memory Constants
+description: Key memory addresses and sizes
+---
+
+## Memory Regions
+
+| Region | Start | End | Size |
+|--------|-------|-----|------|
+| BIOS | `0x00000000` | `0x00003FFF` | 16 KB |
+| EWRAM | `0x02000000` | `0x0203FFFF` | 256 KB |
+| IWRAM | `0x03000000` | `0x03007FFF` | 32 KB |
+| I/O | `0x04000000` | `0x040003FF` | 1 KB |
+| Palette | `0x05000000` | `0x050003FF` | 1 KB |
+| VRAM | `0x06000000` | `0x06017FFF` | 96 KB |
+| OAM | `0x07000000` | `0x070003FF` | 1 KB |
+| ROM | `0x08000000` | `0x0DFFFFFF` | 32 MB max |
+
+## Key Registers
+
+| Register | Address | Purpose |
+|----------|---------|---------|
+| DISPCNT | `0x04000000` | Display control |
+| KEYINPUT | `0x04000130` | Button state |
+| IE | `0x04000200` | Interrupt enable |
+| IME | `0x04000208` | Master interrupt |

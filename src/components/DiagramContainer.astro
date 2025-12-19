@@ -1,0 +1,56 @@
+---
+interface Props {
+	title?: string;
+	caption?: string;
+}
+
+const { title, caption } = Astro.props;
+---
+
+<figure class="diagram-container">
+	{title && <figcaption class="diagram-title">{title}</figcaption>}
+	<div class="mermaid-wrapper">
+		<slot />
+	</div>
+	{caption && <figcaption class="diagram-caption">{caption}</figcaption>}
+</figure>
+
+<script>
+	function initMermaid() {
+		if (typeof mermaid !== 'undefined') {
+			mermaid.initialize({
+				startOnLoad: false,
+				theme: 'base',
+				themeVariables: {
+					background: '#1a202c',
+					primaryColor: '#4a5568',
+					primaryTextColor: '#fff',
+					primaryBorderColor: '#718096',
+					secondaryColor: '#2d3748',
+					secondaryTextColor: '#fff',
+					tertiaryColor: '#374151',
+					tertiaryTextColor: '#fff',
+					lineColor: '#a0aec0',
+					textColor: '#fff',
+					mainBkg: '#4a5568',
+					nodeBorder: '#718096',
+					clusterBkg: '#2d374888',
+					clusterBorder: '#4a5568',
+					titleColor: '#fff',
+					edgeLabelBackground: '#2d3748',
+					nodeTextColor: '#fff'
+				}
+			});
+			mermaid.run();
+		} else {
+			// Retry if mermaid hasn't loaded yet
+			setTimeout(initMermaid, 100);
+		}
+	}
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', initMermaid);
+	} else {
+		initMermaid();
+	}
+</script>

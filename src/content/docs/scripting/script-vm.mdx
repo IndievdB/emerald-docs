@@ -1,0 +1,594 @@
+---
+title: Script VM
+description: How the script virtual machine executes event scripts in Pokemon Emerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The Script VM (Virtual Machine) is a bytecode interpreter that executes event scripts. Scripts control NPC dialogue, cutscenes, item pickups, trainer battles, and most gameplay events in the overworld.
+
+## Architecture Overview
+
+<DiagramContainer title="Script VM Architecture">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Contexts[Script Contexts]
+        Global[Global Context<br/>Yields to game loop]
+        Immediate[Immediate Context<br/>Runs to completion]
+    end
+
+    subgraph VM[Virtual Machine]
+        Fetch[Fetch Opcode]
+        Decode[Decode via CmdTable]
+        Execute[Execute Handler]
+        Advance[Advance scriptPtr]
+    end
+
+    subgraph State[Execution State]
+        Running[RUNNING<br/>Executing commands]
+        Waiting[WAITING<br/>Paused for callback]
+        Stopped[STOPPED<br/>Script finished]
+    end
+
+    Global --> VM
+    Immediate --> VM
+    Fetch --> Decode
+    Decode --> Execute
+    Execute --> Advance
+    Advance --> Fetch
+    Execute -.->|waitstate| Waiting
+    Execute -.->|end| Stopped
+    Waiting -.->|callback done| Running`}
+</pre>
+</DiagramContainer>
+
+## Script Context Structure
+
+The `ScriptContext` structure holds the complete state of a running script:
+
+```c
+struct ScriptContext
+{
+    u8 stackDepth;           // Current call stack depth
+    u8 mode;                 // Execution mode (stopped/bytecode/native)
+    u8 comparisonResult;     // Result of last compare (0=less, 1=equal, 2=greater)
+    u8 (*nativePtr)(void);   // Native C function to call
+    const u8 *scriptPtr;     // Current position in bytecode
+    const u8 *stack[20];     // Return address stack for calls
+    ScrCmdFunc *cmdTable;    // Pointer to command table
+    ScrCmdFunc *cmdTableEnd; // End of command table
+    u32 data[4];             // Local storage registers
+};
+```
+
+### Execution Modes
+
+```c
+enum {
+    SCRIPT_MODE_STOPPED,    // Not running
+    SCRIPT_MODE_BYTECODE,   // Interpreting bytecode
+    SCRIPT_MODE_NATIVE,     // Running native C callback
+};
+
+enum {
+    CONTEXT_RUNNING,        // Actively executing
+    CONTEXT_WAITING,        // Paused (waitstate)
+    CONTEXT_SHUTDOWN,       // Finished
+};
+```
+
+## Two Script Contexts
+
+The engine maintains two separate script contexts for different use cases:
+
+### Global Script Context
+
+Used for most event scripts. **Yields control back to the game loop** when a `waitstate` command is encountered, allowing animations and other systems to update.
+
+```c
+static struct ScriptContext sGlobalScriptContext;
+static u8 sGlobalScriptContextStatus;
+
+// Start a script in the global context
+void ScriptContext_SetupScript(const u8 *ptr)
+{
+    InitScriptContext(&sGlobalScriptContext, gScriptCmdTable, gScriptCmdTableEnd);
+    SetupBytecodeScript(&sGlobalScriptContext, ptr);
+    LockPlayerFieldControls();
+    sGlobalScriptContextStatus = CONTEXT_RUNNING;
+}
+
+// Called each frame from the overworld main loop
+bool8 ScriptContext_RunScript(void)
+{
+    if (sGlobalScriptContextStatus == CONTEXT_SHUTDOWN)
+        return FALSE;
+
+    if (sGlobalScriptContextStatus == CONTEXT_WAITING)
+        return FALSE;  // Paused, waiting for callback
+
+    LockPlayerFieldControls();
+
+    if (!RunScriptCommand(&sGlobalScriptContext))
+    {
+        sGlobalScriptContextStatus = CONTEXT_SHUTDOWN;
+        UnlockPlayerFieldControls();
+        return FALSE;
+    }
+
+    return TRUE;
+}
+```
+
+### Immediate Script Context
+
+Used for map scripts that must complete before the map loads (like `MAP_SCRIPT_ON_LOAD`). **Runs to completion** in a single call without yielding.
+
+```c
+static struct ScriptContext sImmediateScriptContext;
+
+void RunScriptImmediately(const u8 *ptr)
+{
+    InitScriptContext(&sImmediateScriptContext, gScriptCmdTable, gScriptCmdTableEnd);
+    SetupBytecodeScript(&sImmediateScriptContext, ptr);
+
+    // Run until script ends - no yielding
+    while (RunScriptCommand(&sImmediateScriptContext) == TRUE);
+}
+```
+
+## The Bytecode Interpreter
+
+<DiagramContainer title="Command Execution Loop">
+<pre class="mermaid">
+{`flowchart TB
+    Start[RunScriptCommand] --> CheckMode{Check mode}
+    CheckMode -->|STOPPED| ReturnFalse[Return FALSE]
+    CheckMode -->|NATIVE| CallNative[Call nativePtr]
+    CallNative --> NativeResult{Returns TRUE?}
+    NativeResult -->|Yes| SwitchBytecode[Switch to BYTECODE]
+    NativeResult -->|No| ReturnTrue[Return TRUE]
+    SwitchBytecode --> Bytecode
+    CheckMode -->|BYTECODE| Bytecode[Bytecode Loop]
+
+    Bytecode --> CheckPtr{scriptPtr valid?}
+    CheckPtr -->|No| Stop[Stop script]
+    CheckPtr -->|Yes| ReadOpcode[Read opcode byte]
+    ReadOpcode --> LookupCmd[Lookup in cmdTable]
+    LookupCmd --> ValidCmd{Valid command?}
+    ValidCmd -->|No| Stop
+    ValidCmd -->|Yes| ExecCmd[Execute command]
+    ExecCmd --> CmdResult{Returns TRUE?}
+    CmdResult -->|Yes| ReturnTrue
+    CmdResult -->|No| Bytecode`}
+</pre>
+</DiagramContainer>
+
+### Core Interpreter Loop
+
+```c
+bool8 RunScriptCommand(struct ScriptContext *ctx)
+{
+    if (ctx->mode == SCRIPT_MODE_STOPPED)
+        return FALSE;
+
+    switch (ctx->mode)
+    {
+    case SCRIPT_MODE_NATIVE:
+        // Try to call a C function
+        // Continue to bytecode if no function or it returns TRUE
+        if (ctx->nativePtr)
+        {
+            if (ctx->nativePtr() == TRUE)
+                ctx->mode = SCRIPT_MODE_BYTECODE;
+            return TRUE;
+        }
+        ctx->mode = SCRIPT_MODE_BYTECODE;
+        // fallthrough
+
+    case SCRIPT_MODE_BYTECODE:
+        while (1)
+        {
+            u8 cmdCode;
+            ScrCmdFunc *func;
+
+            if (!ctx->scriptPtr)
+            {
+                ctx->mode = SCRIPT_MODE_STOPPED;
+                return FALSE;
+            }
+
+            // Read opcode and advance pointer
+            cmdCode = *(ctx->scriptPtr);
+            ctx->scriptPtr++;
+
+            // Look up handler in command table
+            func = &ctx->cmdTable[cmdCode];
+
+            if (func >= ctx->cmdTableEnd)
+            {
+                ctx->mode = SCRIPT_MODE_STOPPED;
+                return FALSE;
+            }
+
+            // Execute command - if it returns TRUE, yield
+            if ((*func)(ctx) == TRUE)
+                return TRUE;
+        }
+    }
+
+    return TRUE;
+}
+```
+
+### Reading Script Data
+
+Scripts are byte-aligned and use little-endian encoding for multi-byte values:
+
+```c
+// Read single byte (used as macro for speed)
+#define ScriptReadByte(ctx) (*(ctx->scriptPtr++))
+
+// Read 16-bit halfword (little-endian)
+u16 ScriptReadHalfword(struct ScriptContext *ctx)
+{
+    u16 value = *(ctx->scriptPtr++);
+    value |= *(ctx->scriptPtr++) << 8;
+    return value;
+}
+
+// Read 32-bit word (little-endian)
+u32 ScriptReadWord(struct ScriptContext *ctx)
+{
+    u32 value0 = *(ctx->scriptPtr++);
+    u32 value1 = *(ctx->scriptPtr++);
+    u32 value2 = *(ctx->scriptPtr++);
+    u32 value3 = *(ctx->scriptPtr++);
+    return (((((value3 << 8) + value2) << 8) + value1) << 8) + value0;
+}
+```
+
+## Control Flow
+
+### Call Stack
+
+The VM maintains a 20-level deep call stack for subroutine calls:
+
+```c
+static bool8 ScriptPush(struct ScriptContext *ctx, const u8 *ptr)
+{
+    if (ctx->stackDepth + 1 >= ARRAY_COUNT(ctx->stack))
+        return TRUE;  // Stack overflow
+
+    ctx->stack[ctx->stackDepth] = ptr;
+    ctx->stackDepth++;
+    return FALSE;
+}
+
+static const u8 *ScriptPop(struct ScriptContext *ctx)
+{
+    if (ctx->stackDepth == 0)
+        return NULL;  // Stack underflow
+
+    ctx->stackDepth--;
+    return ctx->stack[ctx->stackDepth];
+}
+```
+
+### Jump, Call, and Return
+
+```c
+void ScriptJump(struct ScriptContext *ctx, const u8 *ptr)
+{
+    ctx->scriptPtr = ptr;  // Unconditional jump
+}
+
+void ScriptCall(struct ScriptContext *ctx, const u8 *ptr)
+{
+    ScriptPush(ctx, ctx->scriptPtr);  // Save return address
+    ctx->scriptPtr = ptr;             // Jump to subroutine
+}
+
+void ScriptReturn(struct ScriptContext *ctx)
+{
+    ctx->scriptPtr = ScriptPop(ctx);  // Pop return address
+}
+```
+
+### Conditional Branching
+
+The comparison system stores results as 0 (less), 1 (equal), or 2 (greater):
+
+```c
+u8 Compare(u16 a, u16 b)
+{
+    if (a < b) return 0;  // Less than
+    if (a == b) return 1; // Equal
+    return 2;             // Greater than
+}
+
+// Condition table: maps condition code to which comparison results pass
+static const u8 sScriptConditionTable[6][3] =
+{
+//  <  =  >
+    {1, 0, 0}, // 0: Less than
+    {0, 1, 0}, // 1: Equal
+    {0, 0, 1}, // 2: Greater than
+    {1, 1, 0}, // 3: Less than or equal
+    {0, 1, 1}, // 4: Greater than or equal
+    {1, 0, 1}, // 5: Not equal
+};
+
+bool8 ScrCmd_goto_if(struct ScriptContext *ctx)
+{
+    u8 condition = ScriptReadByte(ctx);
+    const u8 *ptr = (const u8 *)ScriptReadWord(ctx);
+
+    // Check if condition passes for current comparison result
+    if (sScriptConditionTable[condition][ctx->comparisonResult] == 1)
+        ScriptJump(ctx, ptr);
+    return FALSE;
+}
+```
+
+## Native Callbacks (Wait States)
+
+When a script needs to wait for something (animation, fade, user input), it sets up a native callback:
+
+```c
+void SetupNativeScript(struct ScriptContext *ctx, bool8 (*ptr)(void))
+{
+    ctx->mode = SCRIPT_MODE_NATIVE;
+    ctx->nativePtr = ptr;
+}
+
+// Example: wait for palette fade to complete
+static bool8 IsPaletteNotActive(void)
+{
+    if (!gPaletteFade.active)
+        return TRUE;   // Done waiting, resume bytecode
+    else
+        return FALSE;  // Still waiting
+}
+
+bool8 ScrCmd_fadescreen(struct ScriptContext *ctx)
+{
+    FadeScreen(ScriptReadByte(ctx), 0);
+    SetupNativeScript(ctx, IsPaletteNotActive);
+    return TRUE;  // Yield to game loop
+}
+```
+
+<DiagramContainer title="Wait State Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Script
+    participant VM
+    participant GameLoop
+    participant FadeSystem
+
+    Script->>VM: fadescreen FADE_TO_BLACK
+    VM->>FadeSystem: FadeScreen()
+    VM->>VM: Set native callback
+    VM->>GameLoop: Return TRUE (yield)
+
+    loop Each Frame
+        GameLoop->>VM: RunScriptCommand()
+        VM->>VM: Call IsPaletteNotActive()
+        VM->>FadeSystem: Check gPaletteFade.active
+        alt Fade still active
+            VM->>GameLoop: Return TRUE (keep waiting)
+        else Fade complete
+            VM->>VM: Switch to BYTECODE mode
+            VM->>Script: Continue execution
+        end
+    end`}
+</pre>
+</DiagramContainer>
+
+## Waitstate Command
+
+The explicit `waitstate` command pauses the global context entirely:
+
+```c
+bool8 ScrCmd_waitstate(struct ScriptContext *ctx)
+{
+    ScriptContext_Stop();  // Set status to WAITING
+    return TRUE;           // Yield
+}
+
+void ScriptContext_Stop(void)
+{
+    sGlobalScriptContextStatus = CONTEXT_WAITING;
+}
+
+void ScriptContext_Enable(void)
+{
+    sGlobalScriptContextStatus = CONTEXT_RUNNING;
+    LockPlayerFieldControls();
+}
+```
+
+Other code (like battle end handlers) calls `ScriptContext_Enable()` to resume.
+
+## Map Scripts
+
+Maps can define scripts that run at specific times:
+
+```c
+// Map script types
+enum {
+    MAP_SCRIPT_ON_LOAD,            // When map data loads
+    MAP_SCRIPT_ON_FRAME_TABLE,     // Checked each frame (conditional)
+    MAP_SCRIPT_ON_TRANSITION,      // When entering map
+    MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE, // After warp (conditional)
+    MAP_SCRIPT_ON_RESUME,          // When returning from menu
+    MAP_SCRIPT_ON_RETURN_TO_FIELD, // When returning from battle
+    MAP_SCRIPT_ON_DIVE_WARP,       // When using Dive
+};
+
+void RunOnLoadMapScript(void)
+{
+    MapHeaderRunScriptType(MAP_SCRIPT_ON_LOAD);
+}
+
+void MapHeaderRunScriptType(u8 tag)
+{
+    u8 *ptr = MapHeaderGetScriptTable(tag);
+    if (ptr)
+        RunScriptImmediately(ptr);  // Runs in immediate context
+}
+```
+
+### Conditional Map Scripts (Frame Tables)
+
+```c
+// Check conditions each frame
+bool8 TryRunOnFrameMapScript(void)
+{
+    u8 *ptr = MapHeaderCheckScriptTable(MAP_SCRIPT_ON_FRAME_TABLE);
+
+    if (!ptr)
+        return FALSE;
+
+    ScriptContext_SetupScript(ptr);  // Run in global context
+    return TRUE;
+}
+
+// Format: VAR1, VAR2, script_ptr (runs if VAR1 == VAR2)
+u8 *MapHeaderCheckScriptTable(u8 tag)
+{
+    u8 *ptr = MapHeaderGetScriptTable(tag);
+    if (!ptr)
+        return NULL;
+
+    while (1)
+    {
+        u16 varIndex1 = T1_READ_16(ptr);
+        if (!varIndex1)
+            return NULL;  // End of table
+        ptr += 2;
+
+        u16 varIndex2 = T1_READ_16(ptr);
+        ptr += 2;
+
+        // Run if vars are equal
+        if (VarGet(varIndex1) == VarGet(varIndex2))
+            return T2_READ_PTR(ptr);
+        ptr += 4;
+    }
+}
+```
+
+## Player Control Locking
+
+Scripts typically lock player movement while running:
+
+```c
+static bool8 sLockFieldControls;
+
+void LockPlayerFieldControls(void)
+{
+    sLockFieldControls = TRUE;
+}
+
+void UnlockPlayerFieldControls(void)
+{
+    sLockFieldControls = FALSE;
+}
+
+bool8 ArePlayerFieldControlsLocked(void)
+{
+    return sLockFieldControls;
+}
+```
+
+## RAM Scripts (Mystery Events)
+
+Scripts can be stored in save data for Mystery Gift events:
+
+```c
+#define RAM_SCRIPT_MAGIC 51
+
+struct RamScriptData
+{
+    u8 magic;
+    u8 mapGroup;
+    u8 mapNum;
+    u8 localId;
+    u8 script[995];
+};
+
+bool8 InitRamScript(const u8 *script, u16 scriptSize, u8 mapGroup, u8 mapNum, u8 localId)
+{
+    struct RamScriptData *scriptData = &gSaveBlock1Ptr->ramScript.data;
+
+    ClearRamScript();
+
+    if (scriptSize > sizeof(scriptData->script))
+        return FALSE;
+
+    scriptData->magic = RAM_SCRIPT_MAGIC;
+    scriptData->mapGroup = mapGroup;
+    scriptData->mapNum = mapNum;
+    scriptData->localId = localId;
+    memcpy(scriptData->script, script, scriptSize);
+
+    // Calculate checksum for validation
+    gSaveBlock1Ptr->ramScript.checksum = CalculateRamScriptChecksum();
+    return TRUE;
+}
+```
+
+## Command Handler Pattern
+
+Each script command is a function that:
+1. Reads its parameters from the bytecode stream
+2. Performs its action
+3. Returns `FALSE` to continue or `TRUE` to yield
+
+```c
+// Simple command - doesn't yield
+bool8 ScrCmd_setflag(struct ScriptContext *ctx)
+{
+    FlagSet(ScriptReadHalfword(ctx));
+    return FALSE;  // Continue immediately
+}
+
+// Command that yields
+bool8 ScrCmd_delay(struct ScriptContext *ctx)
+{
+    sPauseCounter = ScriptReadHalfword(ctx);
+    SetupNativeScript(ctx, RunPauseTimer);
+    return TRUE;  // Yield to game loop
+}
+
+static bool8 RunPauseTimer(void)
+{
+    if (--sPauseCounter == 0)
+        return TRUE;   // Done, resume bytecode
+    else
+        return FALSE;  // Keep waiting
+}
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `InitScriptContext()` | script.c | Initialize a script context |
+| `RunScriptCommand()` | script.c | Execute one or more commands |
+| `ScriptContext_SetupScript()` | script.c | Start script in global context |
+| `RunScriptImmediately()` | script.c | Run script to completion |
+| `ScriptContext_Stop()` | script.c | Pause global context |
+| `ScriptContext_Enable()` | script.c | Resume global context |
+| `ScriptJump()` | script.c | Unconditional jump |
+| `ScriptCall()` | script.c | Call subroutine |
+| `ScriptReturn()` | script.c | Return from subroutine |
+| `SetupNativeScript()` | script.c | Set wait callback |
+
+<LearnMore>
+- [Script Commands](/scripting/script-commands) - Complete command reference
+- [Event Scripts](/scripting/event-scripts) - Writing scripts with the macro system
+</LearnMore>

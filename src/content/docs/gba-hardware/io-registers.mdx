@@ -1,0 +1,225 @@
+---
+title: I/O Registers
+description: Memory-mapped hardware registers for controlling the GBA
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The GBA's hardware is controlled through memory-mapped IO registers at addresses `0x04000000`-`0x040003FF`. Pokemon Emerald wraps these in a buffered system to safely apply changes during VBlank.
+
+## Memory Map
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph IO["IO Register Space (0x04000000)"]
+        LCD["0x000-0x056<br/>LCD Control"]
+        SND["0x060-0x0A8<br/>Sound"]
+        DMA["0x0B0-0x0E0<br/>DMA"]
+        TMR["0x100-0x110<br/>Timers"]
+        SIO["0x120-0x15A<br/>Serial/Keys"]
+        INT["0x200-0x208<br/>Interrupts"]
+    end
+
+    style LCD fill:#9f9,stroke:#333,color:#000
+    style SND fill:#99f,stroke:#333,color:#000
+    style DMA fill:#f99,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## LCD Control Registers
+
+### DISPCNT (0x04000000) - Display Control
+
+```c
+#define REG_DISPCNT   *(vu16 *)0x04000000
+
+// Video modes (bits 0-2)
+#define DISPCNT_MODE_0   0  // 4 regular BGs
+#define DISPCNT_MODE_1   1  // 2 regular + 1 affine BG
+#define DISPCNT_MODE_2   2  // 2 affine BGs
+#define DISPCNT_MODE_3   3  // 240x160 15-bit bitmap
+#define DISPCNT_MODE_4   4  // 240x160 8-bit bitmap (palettized)
+#define DISPCNT_MODE_5   5  // 160x128 15-bit bitmap (double buffer)
+
+// Flags
+#define DISPCNT_OBJ_1D_MAP    (1 << 6)   // 1D sprite tile mapping
+#define DISPCNT_FORCED_BLANK  (1 << 7)   // Force blank screen
+#define DISPCNT_BG0_ON        (1 << 8)   // Enable BG0
+#define DISPCNT_BG1_ON        (1 << 9)   // Enable BG1
+#define DISPCNT_BG2_ON        (1 << 10)  // Enable BG2
+#define DISPCNT_BG3_ON        (1 << 11)  // Enable BG3
+#define DISPCNT_OBJ_ON        (1 << 12)  // Enable sprites
+#define DISPCNT_WIN0_ON       (1 << 13)  // Enable window 0
+#define DISPCNT_WIN1_ON       (1 << 14)  // Enable window 1
+#define DISPCNT_OBJWIN_ON     (1 << 15)  // Enable sprite window
+```
+
+### DISPSTAT (0x04000004) - Display Status
+
+```c
+#define REG_DISPSTAT  *(vu16 *)0x04000004
+
+// Status flags (read-only)
+#define DISPSTAT_VBLANK        (1 << 0)   // In VBlank
+#define DISPSTAT_HBLANK        (1 << 1)   // In HBlank
+#define DISPSTAT_VCOUNT_MATCH  (1 << 2)   // VCount == trigger
+
+// Interrupt enables
+#define DISPSTAT_VBLANK_INTR   (1 << 3)   // VBlank interrupt enable
+#define DISPSTAT_HBLANK_INTR   (1 << 4)   // HBlank interrupt enable
+#define DISPSTAT_VCOUNT_INTR   (1 << 5)   // VCount interrupt enable
+
+// Bits 8-15: VCount trigger value
+```
+
+### VCOUNT (0x04000006) - Current Scanline
+
+```c
+#define REG_VCOUNT    *(vu16 *)0x04000006
+
+// Read-only: current scanline (0-227)
+// 0-159: active display
+// 160-227: VBlank period
+```
+
+## Background Registers
+
+### BGxCNT - Background Control
+
+```c
+#define REG_BG0CNT    *(vu16 *)0x04000008
+#define REG_BG1CNT    *(vu16 *)0x0400000A
+#define REG_BG2CNT    *(vu16 *)0x0400000C
+#define REG_BG3CNT    *(vu16 *)0x0400000E
+
+// Priority (bits 0-1) - lower = higher priority
+#define BGCNT_PRIORITY(n)        ((n) & 3)
+
+// Character base block (bits 2-3)
+#define BGCNT_CHARBASE(n)        (((n) & 3) << 2)
+
+// Mosaic enable (bit 6)
+#define BGCNT_MOSAIC             (1 << 6)
+
+// Palette mode (bit 7)
+#define BGCNT_16COLOR            (0 << 7)   // 16 colors
+#define BGCNT_256COLOR           (1 << 7)   // 256 colors
+
+// Screen base block (bits 8-12)
+#define BGCNT_SCREENBASE(n)      (((n) & 31) << 8)
+
+// Screen size (bits 14-15)
+#define BGCNT_SCREENSIZE(n)      (((n) & 3) << 14)
+```
+
+### BGxHOFS/VOFS - Background Scroll
+
+```c
+#define REG_BG0HOFS   *(vu16 *)0x04000010  // BG0 X scroll
+#define REG_BG0VOFS   *(vu16 *)0x04000012  // BG0 Y scroll
+#define REG_BG1HOFS   *(vu16 *)0x04000014
+#define REG_BG1VOFS   *(vu16 *)0x04000016
+#define REG_BG2HOFS   *(vu16 *)0x04000018
+#define REG_BG2VOFS   *(vu16 *)0x0400001A
+#define REG_BG3HOFS   *(vu16 *)0x0400001C
+#define REG_BG3VOFS   *(vu16 *)0x0400001E
+```
+
+## Window Registers
+
+```c
+#define REG_WIN0H     *(vu16 *)0x04000040  // Win0 left/right
+#define REG_WIN1H     *(vu16 *)0x04000042  // Win1 left/right
+#define REG_WIN0V     *(vu16 *)0x04000044  // Win0 top/bottom
+#define REG_WIN1V     *(vu16 *)0x04000046  // Win1 top/bottom
+#define REG_WININ     *(vu16 *)0x04000048  // Inside windows
+#define REG_WINOUT    *(vu16 *)0x0400004A  // Outside windows
+```
+
+## Blend Registers
+
+```c
+#define REG_BLDCNT    *(vu16 *)0x04000050
+#define REG_BLDALPHA  *(vu16 *)0x04000052
+#define REG_BLDY      *(vu16 *)0x04000054
+
+// Blend modes
+#define BLDCNT_EFFECT_NONE      (0 << 6)
+#define BLDCNT_EFFECT_BLEND     (1 << 6)  // Alpha blend
+#define BLDCNT_EFFECT_LIGHTEN   (2 << 6)  // Brighten
+#define BLDCNT_EFFECT_DARKEN    (3 << 6)  // Darken
+```
+
+## Key Input
+
+```c
+#define REG_KEYINPUT  *(vu16 *)0x04000130
+
+// Key bits (active low - 0 when pressed)
+#define KEY_A         (1 << 0)
+#define KEY_B         (1 << 1)
+#define KEY_SELECT    (1 << 2)
+#define KEY_START     (1 << 3)
+#define KEY_RIGHT     (1 << 4)
+#define KEY_LEFT      (1 << 5)
+#define KEY_UP        (1 << 6)
+#define KEY_DOWN      (1 << 7)
+#define KEY_R         (1 << 8)
+#define KEY_L         (1 << 9)
+```
+
+## Interrupt Registers
+
+```c
+#define REG_IE        *(vu16 *)0x04000200  // Interrupt enable
+#define REG_IF        *(vu16 *)0x04000202  // Interrupt flags
+#define REG_IME       *(vu16 *)0x04000208  // Master enable
+```
+
+## GPU Register Buffer System
+
+Pokemon Emerald buffers GPU register writes to apply them during VBlank:
+
+```c
+// Set a buffered register (safe)
+void SetGpuReg(u8 regOffset, u16 value);
+
+// Get a buffered register value
+u16 GetGpuReg(u8 regOffset);
+
+// Apply all buffered values (called in VBlank)
+void CopyBufferedValuesToGpuRegs(void);
+```
+
+### Usage Pattern
+
+```c
+// Instead of direct register writes:
+// REG_DISPCNT = DISPCNT_MODE_0 | DISPCNT_BG0_ON;
+
+// Use buffered writes:
+SetGpuReg(REG_OFFSET_DISPCNT, DISPCNT_MODE_0 | DISPCNT_BG0_ON);
+// Applied safely during next VBlank
+```
+
+## Register Quick Reference
+
+| Register | Offset | Description |
+|----------|--------|-------------|
+| DISPCNT | 0x000 | Display control |
+| DISPSTAT | 0x004 | Display status |
+| VCOUNT | 0x006 | Current scanline |
+| BG0-3CNT | 0x008-00E | Background control |
+| BGxHOFS | 0x010-01E | Background scroll |
+| WIN0/1H/V | 0x040-046 | Window bounds |
+| BLDCNT | 0x050 | Blend control |
+| KEYINPUT | 0x130 | Button input |
+| IE/IF/IME | 0x200-208 | Interrupts |
+
+## Related Topics
+
+- [DMA](/gba-hardware/dma) - DMA controller registers
+- [Interrupts](/gba-hardware/interrupts) - Interrupt handling
+- [Backgrounds](/gba-hardware/graphics/backgrounds) - Background system
+- [Sprites](/gba-hardware/graphics/sprites) - OAM and sprite control

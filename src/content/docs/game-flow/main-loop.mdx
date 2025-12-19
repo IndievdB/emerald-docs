@@ -1,0 +1,352 @@
+---
+title: Main Loop
+description: The 60 FPS loop that drives Pokemon Emerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import CodeReference from '../../../components/CodeReference.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+After initialization, Pokemon Emerald enters an infinite loop that runs **60 times per second**. This main loop is the heartbeat of the entire game.
+
+## The Loop
+
+Here's the actual main loop from `AgbMain()`:
+
+<CodeReference file="src/main.c" startLine={131} endLine={168}>
+```c
+for (;;)
+{
+    ReadKeys();
+
+    // Check for soft reset (A + B + Start + Select)
+    if (gSoftResetDisabled == FALSE
+     && JOY_HELD_RAW(A_BUTTON)
+     && JOY_HELD_RAW(B_START_SELECT) == B_START_SELECT)
+    {
+        rfu_REQ_stopMode();
+        rfu_waitREQComplete();
+        DoSoftReset();
+    }
+
+    // Handle link cable communication and callbacks
+    if (Overworld_SendKeysToLinkIsRunning() == TRUE)
+    {
+        gLinkTransferringData = TRUE;
+        UpdateLinkAndCallCallbacks();
+        gLinkTransferringData = FALSE;
+    }
+    else
+    {
+        gLinkTransferringData = FALSE;
+        UpdateLinkAndCallCallbacks();
+
+        if (Overworld_RecvKeysFromLinkIsRunning() == TRUE)
+        {
+            gMain.newKeys = 0;
+            ClearSpriteCopyRequests();
+            gLinkTransferringData = TRUE;
+            UpdateLinkAndCallCallbacks();
+            gLinkTransferringData = FALSE;
+        }
+    }
+
+    PlayTimeCounter_Update();
+    MapMusicMain();
+    WaitForVBlank();
+}
+```
+</CodeReference>
+
+## Loop Breakdown
+
+<DiagramContainer title="Main Loop Steps">
+<pre class="mermaid">
+{`flowchart TD
+    A[ReadKeys] --> B{Soft Reset?}
+    B -->|Yes| C[DoSoftReset]
+    B -->|No| D{Link Active?}
+    D -->|Yes| E[Handle Link + Callbacks]
+    D -->|No| F[Call Callbacks]
+    E --> G[PlayTimeCounter_Update]
+    F --> G
+    G --> H[MapMusicMain]
+    H --> I[WaitForVBlank]
+    I --> A`}
+</pre>
+</DiagramContainer>
+
+### Step 1: Read Input
+
+```c
+ReadKeys();
+```
+
+Reads the current button state and computes:
+- **heldKeys** - Buttons currently held down
+- **newKeys** - Buttons just pressed this frame
+- **newAndRepeatedKeys** - Includes key repeat for held buttons
+
+<CodeReference file="src/main.c" startLine={250} endLine={278}>
+```c
+static void ReadKeys(void)
+{
+    u16 keyInput = REG_KEYINPUT ^ KEYS_MASK;
+    gMain.newKeysRaw = keyInput & ~gMain.heldKeysRaw;
+    gMain.newKeys = gMain.newKeysRaw;
+    gMain.newAndRepeatedKeys = gMain.newKeysRaw;
+
+    // Handle key repeat for held buttons
+    if (keyInput != 0 && gMain.heldKeys == keyInput)
+    {
+        gMain.keyRepeatCounter--;
+
+        if (gMain.keyRepeatCounter == 0)
+        {
+            gMain.newAndRepeatedKeys = keyInput;
+            gMain.keyRepeatCounter = gKeyRepeatContinueDelay;
+        }
+    }
+    else
+    {
+        gMain.keyRepeatCounter = gKeyRepeatStartDelay;
+    }
+
+    gMain.heldKeysRaw = keyInput;
+    gMain.heldKeys = gMain.heldKeysRaw;
+    // ... L=A button mode handling
+}
+```
+</CodeReference>
+
+<LearnMore title="REG_KEYINPUT explained" summary="Hardware button register">
+`REG_KEYINPUT` is a hardware register at address `0x04000130`. Each bit represents a button:
+
+| Bit | Button |
+|-----|--------|
+| 0 | A |
+| 1 | B |
+| 2 | Select |
+| 3 | Start |
+| 4 | Right |
+| 5 | Left |
+| 6 | Up |
+| 7 | Down |
+| 8 | R |
+| 9 | L |
+
+Bits are **0 when pressed** (active low), so we XOR with `KEYS_MASK` to invert.
+</LearnMore>
+
+### Step 2: Soft Reset Check
+
+```c
+if (gSoftResetDisabled == FALSE
+ && JOY_HELD_RAW(A_BUTTON)
+ && JOY_HELD_RAW(B_START_SELECT) == B_START_SELECT)
+{
+    DoSoftReset();
+}
+```
+
+The classic GBA soft reset combo: **A + B + Start + Select**. This:
+- Stops wireless communication
+- Clears sound/DMA
+- Resets to the beginning (like power cycling)
+
+Some game states disable this (e.g., during saves).
+
+### Step 3: Link Handling & Callbacks
+
+```c
+static void UpdateLinkAndCallCallbacks(void)
+{
+    if (!HandleLinkConnection())
+        CallCallbacks();
+}
+
+static void CallCallbacks(void)
+{
+    if (gMain.callback1)
+        gMain.callback1();
+
+    if (gMain.callback2)
+        gMain.callback2();
+}
+```
+
+The core of the game logic:
+1. **HandleLinkConnection()** - Process link cable data if connected
+2. **callback1** - Per-frame housekeeping (often NULL)
+3. **callback2** - Main game state logic
+
+The link handling is complex because multiplayer requires synchronizing game state between connected GBAs.
+
+<LearnMore title="Why two callbacks?" summary="Separation of concerns">
+The dual callback system allows:
+
+- **callback1**: Low-level, always-run logic (rare)
+- **callback2**: High-level state machine
+
+In practice, most game logic uses `callback2`. The `callback1` is used for:
+- Sprite animation during some transitions
+- Special effects that must run regardless of state
+
+This separation means you can change `callback2` (e.g., enter a menu) without breaking ongoing animations in `callback1`.
+</LearnMore>
+
+### Step 4: Play Time & Music
+
+```c
+PlayTimeCounter_Update();
+MapMusicMain();
+```
+
+- **Play time** - Increments the in-game clock (shown on trainer card)
+- **Music** - Handles music transitions and fading
+
+### Step 5: Wait for VBlank
+
+```c
+static void WaitForVBlank(void)
+{
+    gMain.intrCheck &= ~INTR_FLAG_VBLANK;
+
+    while (!(gMain.intrCheck & INTR_FLAG_VBLANK))
+        ;
+}
+```
+
+This is crucial: the loop **pauses here** until the VBlank interrupt fires. This:
+- Synchronizes the game to 60 FPS
+- Ensures we don't update graphics while the screen is drawing
+- Gives consistent timing for game logic
+
+<DiagramContainer title="VBlank Timing">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant ML as Main Loop
+    participant LCD as LCD (Drawing)
+    participant VB as VBlank Period
+
+    Note over LCD: Lines 0-159 (Active Display)
+    ML->>ML: Game logic runs
+    ML->>ML: WaitForVBlank() - WAITING
+
+    Note over VB: Lines 160-227 (VBlank)
+    VB->>ML: VBlank interrupt fires
+    VB->>VB: Copy sprites, DMA transfers
+    ML->>ML: Resume, next iteration
+
+    Note over LCD: Lines 0-159 again`}
+</pre>
+</DiagramContainer>
+
+## The VBlank Interrupt
+
+When VBlank fires, the interrupt handler runs:
+
+<CodeReference file="src/main.c" startLine={340} endLine={372}>
+```c
+static void VBlankIntr(void)
+{
+    // Handle wireless/link sync
+    if (gWirelessCommType != 0)
+        RfuVSync();
+    else if (gLinkVSyncDisabled == FALSE)
+        LinkVSync();
+
+    // Increment frame counters
+    gMain.vblankCounter1++;
+
+    // Call user VBlank callback
+    if (gMain.vblankCallback)
+        gMain.vblankCallback();
+
+    gMain.vblankCounter2++;
+
+    // Safe to modify graphics now
+    CopyBufferedValuesToGpuRegs();
+    ProcessDma3Requests();
+
+    // Update sound
+    gPcmDmaCounter = gSoundInfo.pcmDmaCounter;
+    m4aSoundMain();
+
+    // Advance RNG (for fairness in battles)
+    if (!gMain.inBattle || !(gBattleTypeFlags & BATTLE_TYPE_LINK))
+        Random();
+
+    UpdateWirelessStatusIndicatorSprite();
+
+    // Signal that VBlank occurred
+    INTR_CHECK |= INTR_FLAG_VBLANK;
+    gMain.intrCheck |= INTR_FLAG_VBLANK;
+}
+```
+</CodeReference>
+
+This is where time-sensitive operations happen:
+- **GPU register updates** - Safe to change graphics settings
+- **DMA transfers** - Copy sprite/background data to VRAM
+- **Sound mixing** - Update audio buffers
+- **RNG advance** - Ensure randomness isn't deterministic
+
+<LearnMore title="Why update graphics in VBlank?" summary="Avoiding screen tearing">
+The GBA draws the screen line by line, from top to bottom. If you modify VRAM while it's being read, you get visual glitches:
+
+- **Tearing** - Part of old frame, part of new
+- **Corruption** - Garbage pixels from mid-write data
+
+VBlank is the ~4ms window between frames when the LCD isn't reading VRAM. All graphics updates happen here for clean visuals.
+</LearnMore>
+
+## Timing Analysis
+
+Each frame is approximately **16.7 milliseconds** (1/60th of a second):
+
+| Phase | Duration | Purpose |
+|-------|----------|---------|
+| Active display | ~13.8ms | LCD drawing lines 0-159 |
+| VBlank | ~2.9ms | Lines 160-227, safe for VRAM |
+| Game logic | Variable | ReadKeys through callbacks |
+
+The game logic must complete before VBlank ends, or frames will be skipped. Pokeemerald is well-optimized and rarely drops frames.
+
+## Key Macros
+
+The codebase uses macros for key checking:
+
+```c
+#define JOY_NEW(keys)       (gMain.newKeys & (keys))
+#define JOY_HELD(keys)      (gMain.heldKeys & (keys))
+#define JOY_REPT(keys)      (gMain.newAndRepeatedKeys & (keys))
+#define JOY_HELD_RAW(keys)  (gMain.heldKeysRaw & (keys))
+```
+
+Usage:
+```c
+if (JOY_NEW(A_BUTTON))
+    // A was just pressed this frame
+
+if (JOY_HELD(DPAD_ANY))
+    // Player is holding a direction
+
+if (JOY_REPT(DPAD_UP))
+    // Up pressed, with key repeat
+```
+
+## Key Takeaways
+
+1. **60 FPS lock** - WaitForVBlank() ensures consistent timing
+2. **Input first** - Keys read before any game logic
+3. **Callbacks drive logic** - All game code runs through callback functions
+4. **VBlank is sacred** - Graphics updates only happen during VBlank
+5. **Simple but effective** - This loop structure handles the entire game
+
+<DeepDiveLink
+  href="/game-flow/state-machine"
+  title="State Machine"
+  description="Learn how callback2 manages transitions between title, overworld, battle, and menus"
+/>

@@ -1,0 +1,738 @@
+---
+title: Object Events
+description: NPCs, movement types, graphics, and spawning in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Object events are the characters and interactive objects you see in the overworld - NPCs, the player, items on the ground, and scripted objects. The system manages up to **16 active objects** at once, handling their movement, animation, and interaction.
+
+## Object Event Architecture
+
+<DiagramContainer title="Object Event System">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Data["Map Event Data (ROM)"]
+        Templates["Object Event Templates<br/>(defined per map)"]
+    end
+
+    subgraph Runtime["Runtime State (RAM)"]
+        gObjectEvents["gObjectEvents[16]<br/>(active objects)"]
+        Sprites["OAM Sprites<br/>(visual representation)"]
+    end
+
+    subgraph Systems["Processing Systems"]
+        Spawner["Spawn Manager<br/>(camera-based)"]
+        Movement["Movement System<br/>(56+ types)"]
+        Animation["Animation System<br/>(walk cycles, etc.)"]
+    end
+
+    Templates --> Spawner
+    Spawner --> gObjectEvents
+    gObjectEvents --> Sprites
+    Movement --> gObjectEvents
+    Animation --> Sprites`}
+</pre>
+</DiagramContainer>
+
+## Object Event Structure
+
+Every active object uses this structure (from `include/global.fieldmap.h`):
+
+```c
+struct ObjectEvent
+{
+    // Flags (bitfields) - 32 bits
+    /*0x00*/ u32 active:1;                    // Is this slot in use?
+    /*    */ u32 singleMovementActive:1;      // Executing single movement
+    /*    */ u32 triggerGroundEffectsOnMove:1;
+    /*    */ u32 triggerGroundEffectsOnStop:1;
+    /*    */ u32 disableCoveringGroundEffects:1;
+    /*    */ u32 landingJump:1;
+    /*    */ u32 heldMovementActive:1;        // Movement locked by script
+    /*    */ u32 heldMovementFinished:1;
+    /*    */ u32 frozen:1;                    // Don't update movement
+    /*    */ u32 facingDirectionLocked:1;     // Can't turn
+    /*    */ u32 disableAnim:1;
+    /*    */ u32 enableAnim:1;
+    /*    */ u32 inanimate:1;                 // No walking animation
+    /*    */ u32 invisible:1;                 // Don't render
+    /*    */ u32 offScreen:1;
+    /*    */ u32 trackedByCamera:1;           // Camera follows this
+    /*    */ u32 isPlayer:1;                  // This is the player
+    /*    */ u32 hasReflection:1;             // Show reflection in water
+    /*    */ u32 inShortGrass:1;
+    /*    */ u32 inShallowFlowingWater:1;
+    /*    */ u32 inSandPile:1;
+    /*    */ u32 inHotSprings:1;
+    /*    */ u32 hasShadow:1;
+    /*    */ u32 spriteAnimPausedBackup:1;
+    /*    */ u32 spriteAffineAnimPausedBackup:1;
+    /*    */ u32 disableJumpLandingGroundEffect:1;
+    /*    */ u32 fixedPriority:1;
+    /*    */ u32 hideReflection:1;
+
+    // Identification
+    /*0x04*/ u8 spriteId;           // Index into gSprites[]
+    /*0x05*/ u8 graphicsId;         // Which sprite graphics to use
+    /*0x06*/ u8 movementType;       // How this NPC moves
+    /*0x07*/ u8 trainerType;        // Trainer battle type (if trainer)
+    /*0x08*/ u8 localId;            // Unique ID within this map
+    /*0x09*/ u8 mapNum;             // Map number
+    /*0x0A*/ u8 mapGroup;           // Map group
+
+    // Position
+    /*0x0B*/ u8 currentElevation:4;
+    /*0x0B*/ u8 previousElevation:4;
+    /*0x0C*/ struct Coords16 initialCoords;   // Spawn position
+    /*0x10*/ struct Coords16 currentCoords;   // Current position
+    /*0x14*/ struct Coords16 previousCoords;  // Last position
+
+    // Movement state
+    /*0x18*/ u8 facingDirection:4;      // Direction facing (1-4)
+    /*0x18*/ u8 movementDirection:4;    // Direction moving
+    /*0x19*/ u8 rangeX:4;               // Wander range X
+    /*0x19*/ u8 rangeY:4;               // Wander range Y
+    /*0x1A*/ u8 fieldEffectSpriteId;
+    /*0x1B*/ u8 warpArrowSpriteId;
+
+    // Animation
+    /*0x1C*/ u8 movementActionId;       // Current movement action
+    /*0x1D*/ u8 trainerRange_berryTreeId;
+    /*0x1E*/ u8 currentMetatileBehavior;
+    /*0x1F*/ u8 previousMetatileBehavior;
+    /*0x20*/ u8 previousMovementDirection;
+    /*0x21*/ u8 directionSequenceIndex;
+    /*0x22*/ u8 playerCopyableMovement;
+    // ... additional fields
+};
+```
+
+<LearnMore title="Why only 16 object slots?" summary="GBA hardware constraints">
+The limit of 16 active objects comes from several constraints:
+
+- **OAM limits**: GBA can display 128 sprites total, but many are used for UI
+- **CPU budget**: Each object needs movement calculations every frame
+- **RAM**: Each ObjectEvent is ~40 bytes, plus sprite data
+
+Maps can define more than 16 NPCs, but only those near the camera are active. The spawning system handles loading/unloading as the player moves.
+</LearnMore>
+
+## Object Event Templates
+
+Maps define NPCs using templates in their event data:
+
+```c
+// From data/maps/PetalburgCity/events.inc
+struct ObjectEventTemplate gObjectEventTemplates_PetalburgCity[] = {
+    {
+        .localId = 1,
+        .graphicsId = OBJ_EVENT_GFX_MAN_1,
+        .x = 15,
+        .y = 8,
+        .elevation = 3,
+        .movementType = MOVEMENT_TYPE_WANDER_AROUND,
+        .movementRangeX = 2,
+        .movementRangeY = 2,
+        .trainerType = TRAINER_TYPE_NONE,
+        .trainerRange_berryTreeId = 0,
+        .script = PetalburgCity_EventScript_Man1,
+        .flagId = 0,  // Always visible
+    },
+    {
+        .localId = 2,
+        .graphicsId = OBJ_EVENT_GFX_WOMAN_1,
+        .x = 22,
+        .y = 10,
+        .elevation = 3,
+        .movementType = MOVEMENT_TYPE_LOOK_AROUND,
+        .movementRangeX = 0,
+        .movementRangeY = 0,
+        .trainerType = TRAINER_TYPE_NONE,
+        .trainerRange_berryTreeId = 0,
+        .script = PetalburgCity_EventScript_Woman1,
+        .flagId = FLAG_HIDE_PETALBURG_WOMAN,  // Conditionally visible
+    },
+    // ... more NPCs
+};
+```
+
+### Template Fields
+
+| Field | Purpose |
+|-------|---------|
+| `localId` | Unique identifier within the map (1-255) |
+| `graphicsId` | Which sprite to use (OBJ_EVENT_GFX_*) |
+| `x`, `y` | Position in metatile coordinates |
+| `elevation` | Height level (for bridges, etc.) |
+| `movementType` | How the NPC moves autonomously |
+| `movementRangeX/Y` | How far they can wander |
+| `trainerType` | `TRAINER_TYPE_NORMAL`, `TRAINER_TYPE_BURIED`, etc. |
+| `script` | Script to run when interacted with |
+| `flagId` | If set, NPC hidden when flag is TRUE |
+
+## Graphics IDs
+
+Graphics IDs determine which sprite an NPC uses. Defined in `include/constants/event_objects.h`:
+
+```c
+// Player graphics
+#define OBJ_EVENT_GFX_BRENDAN_NORMAL        0
+#define OBJ_EVENT_GFX_BRENDAN_MACH_BIKE     1
+#define OBJ_EVENT_GFX_BRENDAN_ACRO_BIKE     2
+#define OBJ_EVENT_GFX_BRENDAN_SURFING       3
+#define OBJ_EVENT_GFX_BRENDAN_FIELD_MOVE    4
+#define OBJ_EVENT_GFX_MAY_NORMAL           10
+// ...
+
+// Generic NPCs
+#define OBJ_EVENT_GFX_NINJA_BOY            20
+#define OBJ_EVENT_GFX_TWIN                 21
+#define OBJ_EVENT_GFX_BOY_1                22
+#define OBJ_EVENT_GFX_GIRL_1               23
+#define OBJ_EVENT_GFX_BOY_2                24
+// ... 200+ graphics defined
+
+// Special objects
+#define OBJ_EVENT_GFX_ITEM_BALL           208
+#define OBJ_EVENT_GFX_BERRY_TREE          212
+#define OBJ_EVENT_GFX_SECRET_BASE_PC      216
+```
+
+<DiagramContainer title="Graphics ID to Sprite Flow">
+<pre class="mermaid">
+{`flowchart LR
+    GID[Graphics ID<br/>OBJ_EVENT_GFX_BOY_1] --> Info[gObjectEventGraphicsInfo]
+    Info --> Tiles[Tile Data<br/>gObjectEventPic_Boy1]
+    Info --> Pal[Palette<br/>gObjectEventPal_Npc1]
+    Info --> Size[Size Info<br/>16x32 pixels]
+    Tiles --> Sprite[OAM Sprite]
+    Pal --> Sprite
+    Size --> Sprite`}
+</pre>
+</DiagramContainer>
+
+### Graphics Info Structure
+
+```c
+const struct ObjectEventGraphicsInfo gObjectEventGraphicsInfo[] = {
+    [OBJ_EVENT_GFX_BRENDAN_NORMAL] = {
+        .tileTag = TAG_NONE,
+        .paletteTag = OBJ_EVENT_PAL_TAG_BRENDAN,
+        .reflectionPaletteTag = OBJ_EVENT_PAL_TAG_BRENDAN_REFLECTION,
+        .size = 512,                    // Sprite sheet size in bytes
+        .width = 16,
+        .height = 32,
+        .paletteSlot = PALSLOT_NPC_1,
+        .shadowSize = SHADOW_SIZE_M,
+        .inanimate = FALSE,
+        .disableReflectionPaletteLoad = FALSE,
+        .tracks = TRACKS_FOOT,
+        .oam = &gObjectEventBaseOam_16x32,
+        .subspriteTables = gObjectEventSpriteOamTables_16x32,
+        .anims = gObjectEventImageAnimTable_Standard,
+        .images = gObjectEventPicTable_BrendanNormal,
+        .affineAnims = gDummySpriteAffineAnimTable,
+    },
+    // ... more entries
+};
+```
+
+## Movement Types
+
+Movement types control how NPCs move autonomously. There are **56+ movement types** defined in `src/event_object_movement.c`:
+
+### Standing/Looking Types
+
+```c
+#define MOVEMENT_TYPE_NONE                      0   // No movement
+#define MOVEMENT_TYPE_LOOK_AROUND               1   // Turn randomly
+#define MOVEMENT_TYPE_WANDER_AROUND             2   // Walk randomly in range
+#define MOVEMENT_TYPE_WANDER_UP_AND_DOWN        3   // Walk vertically only
+#define MOVEMENT_TYPE_WANDER_DOWN_AND_UP        4
+#define MOVEMENT_TYPE_WANDER_LEFT_AND_RIGHT     5   // Walk horizontally only
+#define MOVEMENT_TYPE_WANDER_RIGHT_AND_LEFT     6
+#define MOVEMENT_TYPE_FACE_UP                   7   // Always face up
+#define MOVEMENT_TYPE_FACE_DOWN                 8
+#define MOVEMENT_TYPE_FACE_LEFT                 9
+#define MOVEMENT_TYPE_FACE_RIGHT               10
+```
+
+### Path Following Types
+
+```c
+#define MOVEMENT_TYPE_WALK_SEQUENCE_UP_RIGHT_LEFT_DOWN        35
+#define MOVEMENT_TYPE_WALK_SEQUENCE_RIGHT_LEFT_DOWN_UP        36
+#define MOVEMENT_TYPE_WALK_SEQUENCE_DOWN_UP_RIGHT_LEFT        37
+#define MOVEMENT_TYPE_WALK_SEQUENCE_LEFT_DOWN_UP_RIGHT        38
+#define MOVEMENT_TYPE_WALK_SEQUENCE_UP_LEFT_RIGHT_DOWN        39
+#define MOVEMENT_TYPE_WALK_SEQUENCE_LEFT_RIGHT_DOWN_UP        40
+#define MOVEMENT_TYPE_WALK_SEQUENCE_DOWN_UP_LEFT_RIGHT        41
+#define MOVEMENT_TYPE_WALK_SEQUENCE_RIGHT_DOWN_UP_LEFT        42
+```
+
+### Special Movement Types
+
+```c
+#define MOVEMENT_TYPE_COPY_PLAYER              43   // Mirror player movement
+#define MOVEMENT_TYPE_COPY_PLAYER_OPPOSITE     44   // Move opposite to player
+#define MOVEMENT_TYPE_COPY_PLAYER_COUNTERCLOCKWISE  45
+#define MOVEMENT_TYPE_COPY_PLAYER_CLOCKWISE    46
+#define MOVEMENT_TYPE_TREE_DISGUISE            47   // Sudowoodo
+#define MOVEMENT_TYPE_MOUNTAIN_DISGUISE        48   // Kecleon
+#define MOVEMENT_TYPE_HIDDEN                   49   // Invisible until triggered
+#define MOVEMENT_TYPE_WALK_IN_PLACE_DOWN       50
+#define MOVEMENT_TYPE_WALK_IN_PLACE_UP         51
+#define MOVEMENT_TYPE_WALK_IN_PLACE_LEFT       52
+#define MOVEMENT_TYPE_WALK_IN_PLACE_RIGHT      53
+#define MOVEMENT_TYPE_BURIED                   56   // Underground trainer
+#define MOVEMENT_TYPE_RAISE_HAND_AND_STOP      63   // Contest audience
+#define MOVEMENT_TYPE_RAISE_HAND_AND_JUMP      64
+#define MOVEMENT_TYPE_RAISE_HAND_AND_SWIM      65
+```
+
+<DiagramContainer title="Movement Type State Machine (Wander)">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> Idle
+    Idle --> ChooseDirection: Random timer
+    ChooseDirection --> CheckCollision: Direction chosen
+    CheckCollision --> StartWalk: No collision
+    CheckCollision --> Idle: Blocked
+    StartWalk --> Walking: Begin animation
+    Walking --> Idle: Reached destination
+
+    note right of ChooseDirection: Constrained by<br/>movementRangeX/Y`}
+</pre>
+</DiagramContainer>
+
+### Movement Callbacks
+
+Each movement type has a callback function:
+
+```c
+// Movement type function table
+static bool8 (*const sMovementTypeCallbacks[])(struct ObjectEvent *, struct Sprite *) = {
+    [MOVEMENT_TYPE_NONE]                = MovementType_None,
+    [MOVEMENT_TYPE_LOOK_AROUND]         = MovementType_LookAround,
+    [MOVEMENT_TYPE_WANDER_AROUND]       = MovementType_WanderAround,
+    [MOVEMENT_TYPE_WANDER_UP_AND_DOWN]  = MovementType_WanderUpAndDown,
+    // ... all 56+ movement types
+};
+
+// Example: Wander Around implementation
+static bool8 MovementType_WanderAround(struct ObjectEvent *objectEvent, struct Sprite *sprite)
+{
+    if (objectEvent->singleMovementActive)
+        return FALSE;
+
+    if (objectEvent->heldMovementActive)
+        return FALSE;
+
+    // Random delay between movements
+    if (--sprite->data[1] != 0)
+        return FALSE;
+
+    sprite->data[1] = gMovementDelaysMedium[Random() & 3];
+
+    // Choose random direction
+    u8 direction = gStandardDirections[Random() & 3];
+
+    // Check if within range and not blocked
+    if (ObjectEventIsInRangeOfWanderTarget(objectEvent, direction))
+        ObjectEventWalkInDirection(objectEvent, sprite, direction);
+
+    return TRUE;
+}
+```
+
+## Spawning and Despawning
+
+Objects spawn/despawn based on camera position:
+
+<DiagramContainer title="Object Spawning Zone">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Map["Map Grid"]
+        direction TB
+        SpawnZone["Spawn Zone<br/>(camera view + margin)"]
+        Camera["Camera View<br/>(visible screen)"]
+        Outside["Outside Spawn Zone<br/>(objects despawned)"]
+    end
+
+    subgraph Process["Spawn Process"]
+        P1["Player moves"]
+        P2["Update spawn zone"]
+        P3["Check all map objects"]
+        P4["Spawn objects entering zone"]
+        P5["Despawn objects leaving zone"]
+    end
+
+    P1 --> P2 --> P3 --> P4 --> P5`}
+</pre>
+</DiagramContainer>
+
+### Spawning Code
+
+```c
+// Called when camera moves
+void TrySpawnObjectEvents(s16 cameraX, s16 cameraY)
+{
+    struct ObjectEventTemplate *templates;
+    u8 objectCount;
+
+    // Get map's object event templates
+    templates = gMapHeader.events->objectEvents;
+    objectCount = gMapHeader.events->objectEventCount;
+
+    for (i = 0; i < objectCount; i++)
+    {
+        s16 npcX = templates[i].x + MAP_OFFSET;
+        s16 npcY = templates[i].y + MAP_OFFSET;
+
+        // Check if within spawn zone (screen + margin)
+        if (IsObjectEventInSpawnZone(npcX, npcY, cameraX, cameraY))
+        {
+            // Check flag - don't spawn if flagged hidden
+            if (templates[i].flagId == 0 ||
+                !FlagGet(templates[i].flagId))
+            {
+                TrySpawnObjectEventTemplate(&templates[i],
+                    gSaveBlock1Ptr->location.mapNum,
+                    gSaveBlock1Ptr->location.mapGroup,
+                    cameraX, cameraY);
+            }
+        }
+    }
+}
+
+// Spawn a single object from template
+static u8 TrySpawnObjectEventTemplate(
+    const struct ObjectEventTemplate *template,
+    u8 mapNum, u8 mapGroup,
+    s16 cameraX, s16 cameraY)
+{
+    u8 objectEventId;
+    struct ObjectEvent *objectEvent;
+
+    // Check if already spawned
+    objectEventId = GetObjectEventIdByLocalId(template->localId);
+    if (objectEventId != OBJECT_EVENTS_COUNT)
+        return objectEventId;
+
+    // Find free slot in gObjectEvents
+    objectEventId = FindAvailableObjectEventSlot();
+    if (objectEventId == OBJECT_EVENTS_COUNT)
+        return OBJECT_EVENTS_COUNT;  // No free slots
+
+    // Initialize the object event
+    objectEvent = &gObjectEvents[objectEventId];
+    ClearObjectEvent(objectEvent);
+
+    objectEvent->active = TRUE;
+    objectEvent->localId = template->localId;
+    objectEvent->mapNum = mapNum;
+    objectEvent->mapGroup = mapGroup;
+    objectEvent->graphicsId = template->graphicsId;
+    objectEvent->movementType = template->movementType;
+    // ... set other fields from template
+
+    // Create the sprite
+    objectEvent->spriteId = CreateObjectEventSprite(
+        objectEvent, template, cameraX, cameraY);
+
+    return objectEventId;
+}
+```
+
+### Despawning Code
+
+```c
+void RemoveObjectEventsOutsideView(void)
+{
+    u8 i;
+
+    for (i = 0; i < OBJECT_EVENTS_COUNT; i++)
+    {
+        if (!gObjectEvents[i].active)
+            continue;
+
+        if (gObjectEvents[i].isPlayer)
+            continue;  // Never despawn player
+
+        // Check if outside despawn zone
+        if (!IsObjectEventInDespawnZone(&gObjectEvents[i]))
+        {
+            RemoveObjectEvent(&gObjectEvents[i]);
+        }
+    }
+}
+
+static void RemoveObjectEvent(struct ObjectEvent *objectEvent)
+{
+    // Remove sprite
+    DestroySprite(&gSprites[objectEvent->spriteId]);
+
+    // Clear the object event slot
+    objectEvent->active = FALSE;
+}
+```
+
+## The Player Object
+
+The player is a special object event with index 0:
+
+```c
+#define OBJ_EVENT_ID_PLAYER  0
+
+// Player's object event is always at index 0
+struct ObjectEvent *GetPlayerObjectEvent(void)
+{
+    return &gObjectEvents[OBJ_EVENT_ID_PLAYER];
+}
+```
+
+### Player Initialization
+
+```c
+void SpawnPlayerObjectEvent(s16 x, s16 y, u8 direction)
+{
+    struct ObjectEvent *playerObj = &gObjectEvents[OBJ_EVENT_ID_PLAYER];
+
+    // Initialize player object
+    playerObj->active = TRUE;
+    playerObj->isPlayer = TRUE;
+    playerObj->trackedByCamera = TRUE;
+    playerObj->localId = OBJ_EVENT_ID_PLAYER;
+    playerObj->graphicsId = GetPlayerAvatarGraphicsIdByStateId(
+        gPlayerAvatar.flags);
+    playerObj->movementType = MOVEMENT_TYPE_PLAYER;
+
+    // Set position
+    playerObj->currentCoords.x = x;
+    playerObj->currentCoords.y = y;
+    playerObj->initialCoords.x = x;
+    playerObj->initialCoords.y = y;
+
+    // Face the right direction
+    SetPlayerAvatarFacingDirection(direction);
+
+    // Create sprite
+    playerObj->spriteId = CreatePlayerAvatarSprite(playerObj, x, y);
+
+    // Link to gPlayerAvatar
+    gPlayerAvatar.objectEventId = OBJ_EVENT_ID_PLAYER;
+    gPlayerAvatar.spriteId = playerObj->spriteId;
+}
+```
+
+## Scripted Movement
+
+Scripts can control NPC movement using movement commands:
+
+```c
+// Script example
+PetalburgCity_EventScript_OldMan::
+    lock
+    faceplayer
+    msgbox Text_OldMan, MSGBOX_DEFAULT
+    closemessage
+    applymovement OBJ_EVENT_ID_PLAYER, Movement_WalkLeft
+    applymovement 1, Movement_WalkRight  // NPC localId 1
+    waitmovement 0
+    release
+    end
+
+// Movement data
+Movement_WalkLeft:
+    walk_left
+    walk_left
+    step_end
+
+Movement_WalkRight:
+    walk_right
+    walk_right
+    step_end
+```
+
+### Movement Commands
+
+```c
+// Movement command IDs (movement_action_func_ids.h)
+#define MOVEMENT_ACTION_FACE_DOWN                   0x00
+#define MOVEMENT_ACTION_FACE_UP                     0x01
+#define MOVEMENT_ACTION_FACE_LEFT                   0x02
+#define MOVEMENT_ACTION_FACE_RIGHT                  0x03
+#define MOVEMENT_ACTION_WALK_SLOW_DOWN              0x08
+#define MOVEMENT_ACTION_WALK_SLOW_UP                0x09
+#define MOVEMENT_ACTION_WALK_SLOW_LEFT              0x0A
+#define MOVEMENT_ACTION_WALK_SLOW_RIGHT             0x0B
+#define MOVEMENT_ACTION_WALK_NORMAL_DOWN            0x10
+#define MOVEMENT_ACTION_WALK_NORMAL_UP              0x11
+#define MOVEMENT_ACTION_WALK_NORMAL_LEFT            0x12
+#define MOVEMENT_ACTION_WALK_NORMAL_RIGHT           0x13
+#define MOVEMENT_ACTION_JUMP_2_DOWN                 0x58
+#define MOVEMENT_ACTION_JUMP_2_UP                   0x59
+#define MOVEMENT_ACTION_JUMP_2_LEFT                 0x5A
+#define MOVEMENT_ACTION_JUMP_2_RIGHT                0x5B
+#define MOVEMENT_ACTION_DELAY_1                     0x68
+#define MOVEMENT_ACTION_DELAY_2                     0x69
+#define MOVEMENT_ACTION_DELAY_4                     0x6A
+#define MOVEMENT_ACTION_DELAY_8                     0x6B
+#define MOVEMENT_ACTION_STEP_END                    0xFE  // End movement
+```
+
+### applymovement Implementation
+
+```c
+bool8 ScrCmd_applymovement(struct ScriptContext *ctx)
+{
+    u16 localId = VarGet(ScriptReadHalfword(ctx));
+    const u8 *movementScript = (const u8 *)ScriptReadWord(ctx);
+
+    u8 objectEventId;
+
+    if (localId == OBJ_EVENT_ID_PLAYER)
+        objectEventId = GetPlayerObjectEventId();
+    else
+        objectEventId = GetObjectEventIdByLocalId(localId);
+
+    // Start the movement sequence
+    ObjectEventSetHeldMovement(&gObjectEvents[objectEventId],
+        movementScript);
+
+    return FALSE;
+}
+
+// Wait for movement to complete
+bool8 ScrCmd_waitmovement(struct ScriptContext *ctx)
+{
+    u16 localId = VarGet(ScriptReadHalfword(ctx));
+
+    // 0 means wait for all movements
+    if (localId == 0)
+        return !AreAllMovementsFinished();
+
+    // Wait for specific object
+    return !IsObjectEventMovementFinished(GetObjectEventIdByLocalId(localId));
+}
+```
+
+## Trainers
+
+Trainers are object events with special properties:
+
+```c
+// Trainer types
+#define TRAINER_TYPE_NONE               0   // Not a trainer
+#define TRAINER_TYPE_NORMAL             1   // Walks up to battle
+#define TRAINER_TYPE_BURIED             2   // Pops out of ground
+#define TRAINER_TYPE_SEE_ALL_DIRECTIONS 3   // Can see any direction
+#define TRAINER_TYPE_ROTATING           4   // Rotates to face player
+
+// Trainer sight range stored in trainerRange_berryTreeId
+// Range is in metatiles (16x16 pixel units)
+```
+
+<DiagramContainer title="Trainer Detection">
+<pre class="mermaid">
+{`flowchart TD
+    A[Player enters map] --> B{Any trainers on map?}
+    B -->|Yes| C[For each trainer]
+    B -->|No| Z[No battle]
+    C --> D{In sight range?}
+    D -->|No| C
+    D -->|Yes| E{Line of sight clear?}
+    E -->|No| C
+    E -->|Yes| F{Already battled?}
+    F -->|Yes| C
+    F -->|No| G[Trainer approaches!]
+    G --> H[Start battle]`}
+</pre>
+</DiagramContainer>
+
+### Trainer Detection Code
+
+```c
+bool8 CheckForTrainerInRange(void)
+{
+    u8 i;
+
+    for (i = 0; i < OBJECT_EVENTS_COUNT; i++)
+    {
+        struct ObjectEvent *obj = &gObjectEvents[i];
+
+        if (!obj->active)
+            continue;
+
+        if (obj->trainerType == TRAINER_TYPE_NONE)
+            continue;
+
+        if (IsTrainerInRangeOfPlayer(obj))
+        {
+            if (HasLineOfSightToPlayer(obj))
+            {
+                if (!HasTrainerBeenFought(obj))
+                {
+                    gApproachingTrainerId = i;
+                    return TRUE;
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+```
+
+## Ground Effects
+
+Objects can trigger visual effects based on the terrain:
+
+```c
+// Ground effect types
+#define GROUND_EFFECT_TALL_GRASS_ON_SPAWN    (1 << 0)
+#define GROUND_EFFECT_TALL_GRASS_ON_MOVE     (1 << 1)
+#define GROUND_EFFECT_RIPPLE                 (1 << 2)
+#define GROUND_EFFECT_SHORT_GRASS            (1 << 3)
+#define GROUND_EFFECT_HOT_SPRINGS            (1 << 4)
+#define GROUND_EFFECT_SEAWEED                (1 << 5)
+#define GROUND_EFFECT_SHALLOW_FLOWING_WATER  (1 << 6)
+#define GROUND_EFFECT_SAND                   (1 << 7)
+#define GROUND_EFFECT_DEEP_SAND              (1 << 8)
+#define GROUND_EFFECT_PUDDLE                 (1 << 9)
+#define GROUND_EFFECT_SAND_PILE              (1 << 10)
+#define GROUND_EFFECT_LAND_IN_TALL_GRASS     (1 << 11)
+#define GROUND_EFFECT_LAND_IN_LONG_GRASS     (1 << 12)
+#define GROUND_EFFECT_LAND_IN_SHALLOW_WATER  (1 << 13)
+#define GROUND_EFFECT_LAND_IN_DEEP_WATER     (1 << 14)
+#define GROUND_EFFECT_LAND_ON_NORMAL_GROUND  (1 << 15)
+
+// Apply ground effects after movement
+void UpdateObjectEventGroundEffects(struct ObjectEvent *objectEvent)
+{
+    u32 effects = GetGroundEffectFlagsFromMevatileBehavior(
+        objectEvent->currentMetatileBehavior);
+
+    if (effects & GROUND_EFFECT_TALL_GRASS_ON_MOVE)
+        SpawnTallGrassEffect(objectEvent);
+
+    if (effects & GROUND_EFFECT_SAND)
+        SpawnSandFootprints(objectEvent);
+
+    // ... handle other effects
+}
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `TrySpawnObjectEvents()` | event_object_movement.c | Spawn NPCs in camera view |
+| `RemoveObjectEventsOutsideView()` | event_object_movement.c | Despawn off-screen NPCs |
+| `ObjectEventSetGraphicsId()` | event_object_movement.c | Change NPC sprite |
+| `ObjectEventTurn()` | event_object_movement.c | Turn NPC to face direction |
+| `ObjectEventSetHeldMovement()` | event_object_movement.c | Start scripted movement |
+| `TryGetObjectEventIdByLocalIdAndMap()` | event_object_movement.c | Find object by local ID |
+| `GetObjectEventGraphicsInfo()` | event_object_movement.c | Get sprite info |
+| `CreateObjectEventSprite()` | event_object_movement.c | Create NPC sprite |

@@ -1,0 +1,63 @@
+---
+title: pokeemerald Documentation
+description: Learn how Pokemon Emerald works from the inside out
+template: splash
+hero:
+  tagline: A complete educational guide to the Pokemon Emerald decompilation project
+  image:
+    file: ../../assets/houston.webp
+  actions:
+    - text: Get Started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/pret/pokeemerald
+      icon: external
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What You'll Learn
+
+<CardGrid stagger>
+	<Card title="Game Flow" icon="rocket">
+		Understand how the game boots, runs its main loop, and manages state through callbacks
+	</Card>
+	<Card title="GBA Hardware" icon="laptop">
+		Learn how the code interfaces with the Game Boy Advance hardware - memory, graphics, and interrupts
+	</Card>
+	<Card title="Overworld System" icon="open-book">
+		Explore how maps load, NPCs move, and the player navigates the world
+	</Card>
+	<Card title="Battle System" icon="seti:notebook">
+		Dive into the turn-based battle state machine, damage calculations, and AI
+	</Card>
+</CardGrid>
+
+## About This Documentation
+
+This site provides a **graduated learning experience** for the [pokeemerald](https://github.com/pret/pokeemerald) codebase - a complete decompilation of Pokemon Emerald into readable C source code.
+
+**What makes this different:**
+- **Start high-level** - diagrams and overviews before diving into code
+- **Expandable depth** - click "Learn More" sections when you want details
+- **Deep dive pages** - comprehensive technical references for complex topics
+- **Real code** - all snippets link directly to the source
+
+## Prerequisites
+
+This documentation assumes you have:
+- Basic C programming knowledge (pointers, structs, functions)
+- Familiarity with general programming concepts
+- Some curiosity about how games work
+
+No prior GBA or game development experience needed - we'll explain everything!
+
+## How to Navigate
+
+1. **Start with [Getting Started](/getting-started/)** for orientation
+2. **Follow [Game Flow](/game-flow/)** to understand the big picture
+3. **Explore specific systems** (Overworld, Battle, Pokemon) as needed
+4. **Use [Deep Dives](/deep-dives/callback-pattern/)** for comprehensive coverage
+5. **Reference the [Glossary](/reference/glossary/)** for unfamiliar terms

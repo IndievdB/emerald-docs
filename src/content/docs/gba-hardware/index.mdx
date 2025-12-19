@@ -1,0 +1,236 @@
+---
+title: GBA Hardware Overview
+description: Understanding the Game Boy Advance platform
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+To understand pokeemerald, you need to understand the hardware it runs on. The **Game Boy Advance** was a 32-bit handheld console released in 2001, and its constraints shaped every design decision in the game.
+
+## Hardware Specifications
+
+| Component | Specification |
+|-----------|---------------|
+| **CPU** | ARM7TDMI @ 16.78 MHz |
+| **RAM** | 32 KB internal (IWRAM) + 256 KB external (EWRAM) |
+| **VRAM** | 96 KB |
+| **Display** | 240x160 pixels, 15-bit color (32,768 colors) |
+| **Sprites** | Up to 128 objects, 64 visible at once |
+| **Backgrounds** | Up to 4 layers, tile-based |
+| **Sound** | 4 legacy channels + 2 PCM channels |
+| **ROM** | Up to 32 MB (Pokemon Emerald uses ~16 MB) |
+
+<LearnMore title="ARM7TDMI CPU" summary="The processor architecture">
+The ARM7TDMI is a 32-bit RISC processor that supports two instruction sets:
+
+- **ARM mode** - 32-bit instructions, faster for complex operations
+- **Thumb mode** - 16-bit instructions, better code density
+
+Pokemon Emerald uses primarily Thumb mode to fit more code in the ROM. The "T" in ARM7**T**DMI stands for Thumb support.
+</LearnMore>
+
+## Memory Map
+
+<DiagramContainer title="GBA Memory Layout">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph ROM["ROM (Read-Only)"]
+        R1[0x08000000<br/>Game Code]
+        R2[0x0A000000<br/>Graphics Data]
+        R3[0x0C000000<br/>More Data]
+    end
+
+    subgraph RAM["Work RAM"]
+        I[0x03000000<br/>IWRAM 32KB<br/>Fast]
+        E[0x02000000<br/>EWRAM 256KB<br/>Slower]
+    end
+
+    subgraph Video["Video Memory"]
+        V[0x06000000<br/>VRAM 96KB]
+        P[0x05000000<br/>Palette 1KB]
+        O[0x07000000<br/>OAM 1KB]
+    end
+
+    subgraph IO["I/O"]
+        IO1[0x04000000<br/>Registers]
+    end`}
+</pre>
+</DiagramContainer>
+
+Key memory regions:
+
+| Address | Size | Name | Purpose |
+|---------|------|------|---------|
+| `0x02000000` | 256 KB | EWRAM | Main working memory |
+| `0x03000000` | 32 KB | IWRAM | Fast memory, stack |
+| `0x04000000` | 1 KB | I/O | Hardware registers |
+| `0x05000000` | 1 KB | Palette | Color definitions |
+| `0x06000000` | 96 KB | VRAM | Graphics data |
+| `0x07000000` | 1 KB | OAM | Sprite attributes |
+| `0x08000000` | 32 MB | ROM | Game code/data |
+
+<DeepDiveLink
+  href="/gba-hardware/memory-map"
+  title="Memory Map Details"
+  description="Deep dive into how pokeemerald uses each memory region"
+/>
+
+## Graphics System
+
+The GBA uses a **tile-based** graphics system optimized for 2D games:
+
+### Backgrounds (BG)
+
+- **4 background layers** (BG0-BG3)
+- **Tile-based** - 8x8 pixel tiles arranged in a grid
+- **Scrolling** - Each layer scrolls independently
+- **Priority** - Layers can overlap in configurable order
+
+### Sprites (Objects)
+
+- **128 sprite slots** (OBJ0-OBJ127)
+- **Sizes** from 8x8 to 64x64 pixels
+- **Affine transformation** - Rotation and scaling
+- **Transparency** - Alpha blending with backgrounds
+
+<DiagramContainer title="Graphics Layer Stack">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Screen["Rendered Screen"]
+        direction TB
+        S[Sprites Priority 0]
+        B0[BG0]
+        S1[Sprites Priority 1]
+        B1[BG1]
+        S2[Sprites Priority 2]
+        B2[BG2]
+        S3[Sprites Priority 3]
+        B3[BG3]
+        BD[Backdrop]
+    end
+
+    S --> B0 --> S1 --> B1 --> S2 --> B2 --> S3 --> B3 --> BD`}
+</pre>
+</DiagramContainer>
+
+<LearnMore title="Why tiles?" summary="Memory efficiency">
+A 240x160 screen with 16-bit pixels would need:
+- 240 × 160 × 2 = 76,800 bytes per frame
+
+With tiles, we store:
+- Tile graphics (shared between positions)
+- A map of which tile goes where
+
+For a typical screen:
+- 32x32 tile map = 2,048 bytes
+- 256 unique tiles × 32 bytes = 8,192 bytes
+- Total: ~10 KB vs 77 KB
+
+This 8x reduction allows smooth scrolling and multiple layers.
+</LearnMore>
+
+## Interrupts
+
+Hardware interrupts allow the game to respond to events:
+
+| Interrupt | Frequency | Purpose |
+|-----------|-----------|---------|
+| **VBlank** | 60 Hz | Frame sync, VRAM updates |
+| **HBlank** | ~15 KHz | Per-scanline effects |
+| **VCount** | Configurable | Specific scanline trigger |
+| **Timer** | Configurable | Timed events |
+| **Serial** | On transfer | Link cable communication |
+
+The most important is **VBlank** - it fires 60 times per second when the display finishes drawing, giving a safe window to update graphics.
+
+<DeepDiveLink
+  href="/gba-hardware/interrupts"
+  title="Interrupts"
+  description="How pokeemerald handles hardware interrupts"
+/>
+
+## I/O Registers
+
+The GBA is controlled through **memory-mapped I/O registers** at `0x04000000`:
+
+```c
+// Display control
+#define REG_DISPCNT  (*(vu16 *)0x04000000)
+
+// Enable sprites and BG0
+REG_DISPCNT = DISPCNT_OBJ_ON | DISPCNT_BG0_ON;
+```
+
+Key register groups:
+
+| Registers | Purpose |
+|-----------|---------|
+| `DISPCNT` | Display mode, layer enables |
+| `BGxCNT` | Background configuration |
+| `BGxHOFS/VOFS` | Background scroll position |
+| `WIN0/WIN1` | Windowing effects |
+| `BLDCNT/BLDALPHA` | Color blending |
+| `KEYINPUT` | Button state |
+| `IE/IF/IME` | Interrupt control |
+| `DMA0-3` | DMA transfer control |
+| `TM0-3` | Timer control |
+
+<DeepDiveLink
+  href="/gba-hardware/io-registers"
+  title="I/O Registers"
+  description="Complete reference for GBA hardware registers"
+/>
+
+## Sound
+
+The GBA has **6 sound channels**:
+
+| Channels | Type | Use in Pokemon |
+|----------|------|----------------|
+| 1-2 | Square wave | Legacy, rarely used |
+| 3 | Wave | Legacy, rarely used |
+| 4 | Noise | Legacy SFX |
+| A-B | PCM/DMA | Music, cries, most SFX |
+
+Pokemon Emerald uses the **M4A** (MusicPlayer2000) sound engine, which primarily uses the PCM channels for high-quality audio.
+
+## Constraints That Shaped the Game
+
+Understanding hardware limits explains design choices:
+
+| Constraint | Impact on Game Design |
+|------------|----------------------|
+| 16 MHz CPU | Efficient algorithms, precomputed data |
+| 256 KB RAM | Compressed assets, streaming |
+| 128 sprites | Sprite management, priorities |
+| 96 KB VRAM | Tile reuse, dynamic loading |
+| No floating point | Fixed-point math for damage calc |
+
+<LearnMore title="No floating point?" summary="Integer-only math">
+The ARM7TDMI has no floating-point unit. All math uses integers:
+
+```c
+// Instead of: float damage = base * 1.5;
+// Pokemon uses: int damage = base * 3 / 2;
+
+// For percentages, use fixed-point:
+// 50% = 50 * value / 100
+// Or scale: 128 = 100%, so 50% = 64 * value / 128
+```
+
+This is why damage formulas in Pokemon use seemingly arbitrary numbers - they're optimized for integer math.
+</LearnMore>
+
+## Further Reading
+
+Explore specific hardware topics:
+
+- [Memory Map](/gba-hardware/memory-map) - How memory is organized and used
+- [I/O Registers](/gba-hardware/io-registers) - Hardware control registers
+- [Interrupts](/gba-hardware/interrupts) - Event handling
+- [DMA](/gba-hardware/dma) - Fast memory transfers
+- [Graphics: Backgrounds](/gba-hardware/graphics/backgrounds) - Tile-based backgrounds
+- [Graphics: Sprites](/gba-hardware/graphics/sprites) - Object rendering
+- [Graphics: Palettes](/gba-hardware/graphics/palettes) - Color management

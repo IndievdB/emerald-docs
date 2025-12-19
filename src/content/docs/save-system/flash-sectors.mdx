@@ -1,0 +1,458 @@
+---
+title: Flash Sectors
+description: Flash memory layout, sector structure, and dual save slot system
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald uses the GBA's 128KB flash memory divided into 32 sectors of 4KB each. The save system employs a dual-slot rotation scheme to protect against data loss from power failures or corruption.
+
+## Sector Layout
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Flash["128KB Flash Memory (32 Sectors)"]
+        subgraph Slot1["Save Slot 1 (Sectors 0-13)"]
+            S0["Sector 0<br/>SaveBlock2"]
+            S1["Sectors 1-4<br/>SaveBlock1"]
+            S2["Sectors 5-13<br/>PC Storage"]
+        end
+        subgraph Slot2["Save Slot 2 (Sectors 14-27)"]
+            S14["Sector 14<br/>SaveBlock2"]
+            S15["Sectors 15-18<br/>SaveBlock1"]
+            S16["Sectors 19-27<br/>PC Storage"]
+        end
+        subgraph Special["Special Sectors (28-31)"]
+            S28["28-29: Hall of Fame"]
+            S30["30: Trainer Hill"]
+            S31["31: Recorded Battle"]
+        end
+    end
+
+    style Slot1 fill:#9f9,stroke:#333,color:#000
+    style Slot2 fill:#99f,stroke:#333,color:#000
+    style Special fill:#f99,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Sector IDs
+
+```c
+// Save slot sectors (repeated for each slot)
+#define SECTOR_ID_SAVEBLOCK2          0   // Player info, options
+#define SECTOR_ID_SAVEBLOCK1_START    1   // Game progress (4 sectors)
+#define SECTOR_ID_SAVEBLOCK1_END      4
+#define SECTOR_ID_PKMN_STORAGE_START  5   // PC boxes (9 sectors)
+#define SECTOR_ID_PKMN_STORAGE_END   13
+#define NUM_SECTORS_PER_SLOT         14
+
+// Physical sector mapping
+// Save Slot 1: Sectors 0-13
+// Save Slot 2: Sectors 14-27
+
+// Special sectors (shared, not duplicated)
+#define SECTOR_ID_HOF_1              28   // Hall of Fame part 1
+#define SECTOR_ID_HOF_2              29   // Hall of Fame part 2
+#define SECTOR_ID_TRAINER_HILL       30   // Trainer Hill e-Reader data
+#define SECTOR_ID_RECORDED_BATTLE    31   // Recorded battle data
+#define SECTORS_COUNT                32
+```
+
+## Sector Structure
+
+Each 4KB sector has a specific layout:
+
+```c
+#define SECTOR_DATA_SIZE    3968  // 0xF80 - actual data
+#define SECTOR_FOOTER_SIZE   128  // 0x80  - footer/metadata
+#define SECTOR_SIZE         4096  // 0x1000 total
+
+struct SaveSector
+{
+    u8 data[SECTOR_DATA_SIZE];    // Save data (3968 bytes)
+    u8 unused[SECTOR_FOOTER_SIZE - 12];  // Padding (116 bytes)
+    u16 id;                        // Sector ID (0-13)
+    u16 checksum;                  // Data checksum
+    u32 signature;                 // Magic number: 0x08012025
+    u32 counter;                   // Save counter (for slot selection)
+};
+```
+
+### Footer Fields
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| `id` | 0xFF4 | 2 | Logical sector ID (0-13) |
+| `checksum` | 0xFF6 | 2 | 16-bit sum of data bytes |
+| `signature` | 0xFF8 | 4 | Magic value `0x08012025` |
+| `counter` | 0xFFC | 4 | Incremented each save |
+
+The signature `0x08012025` is the release date of Ruby/Sapphire in Japan (August 1st, 2002 + 20 days = August 21st, 2002... or just a magic number).
+
+## Dual Save Slot System
+
+The game alternates between two save slots to provide backup capability:
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Game
+    participant Slot1 as Save Slot 1
+    participant Slot2 as Save Slot 2
+
+    Note over Slot1,Slot2: Initial state: Both empty
+
+    Game->>Slot1: Save #1 (counter=1)
+    Note over Slot1: Active save
+
+    Game->>Slot2: Save #2 (counter=2)
+    Note over Slot2: Active save
+    Note over Slot1: Backup
+
+    Game->>Slot1: Save #3 (counter=3)
+    Note over Slot1: Active save
+    Note over Slot2: Backup
+
+    Game->>Slot2: Save #4 (counter=4)
+    Note over Slot2: Active save
+    Note over Slot1: Backup`}
+</pre>
+</DiagramContainer>
+
+### Slot Selection
+
+```c
+// Determine which slot to use based on save counter
+u16 slot = gSaveCounter % NUM_SAVE_SLOTS;
+
+// Calculate physical sector number
+u16 physicalSector = logicalSectorId + (NUM_SECTORS_PER_SLOT * slot);
+
+// Example: Saving SaveBlock2 (sector 0) when counter is 3
+// slot = 3 % 2 = 1 (save slot 2)
+// physicalSector = 0 + (14 * 1) = 14
+```
+
+### Load Priority
+
+When loading, the game checks both slots and uses the one with:
+1. Valid signature (`0x08012025`)
+2. Correct checksum
+3. Higher save counter
+
+```c
+u8 TryLoadSaveSlot(u16 sectorId, const struct SaveSectorLocation *locations)
+{
+    // Try loading from current slot
+    status = TryLoadSaveSector(...);
+
+    if (status != SAVE_STATUS_OK)
+    {
+        // Current slot corrupt, try backup slot
+        status = TryLoadSaveSector(..., backupSlot);
+    }
+
+    return status;
+}
+```
+
+## Sector Rotation
+
+Within each slot, sectors are written in a rotating order to distribute flash wear:
+
+```c
+static u8 WriteSaveSectorOrSlot(u16 sectorId, const struct SaveSectorLocation *locations)
+{
+    // Rotate starting sector for writes
+    gLastWrittenSector++;
+    gLastWrittenSector = gLastWrittenSector % NUM_SECTORS_PER_SLOT;
+    gSaveCounter++;
+
+    // Write all 14 sectors, starting from rotated position
+    for (i = 0; i < NUM_SECTORS_PER_SLOT; i++)
+        HandleWriteSector(i, locations);
+}
+```
+
+### Physical Sector Calculation
+
+```c
+// In HandleWriteSector:
+u16 sector = sectorId + gLastWrittenSector;
+sector %= NUM_SECTORS_PER_SLOT;                    // Rotate within slot
+sector += NUM_SECTORS_PER_SLOT * (gSaveCounter % NUM_SAVE_SLOTS);  // Add slot offset
+```
+
+Example with `gLastWrittenSector = 3`, `gSaveCounter = 5`:
+- Slot = 5 % 2 = 1 (slot 2)
+- Sector 0 → (0 + 3) % 14 + 14 = sector 17
+- Sector 1 → (1 + 3) % 14 + 14 = sector 18
+- ...
+
+## Writing Process
+
+### Full Save
+
+```c
+u8 HandleSavingData(u8 saveType)
+{
+    switch (saveType)
+    {
+    case SAVE_NORMAL:
+    default:
+        // Copy RAM data to save-ready format
+        CopyPartyAndObjectsToSave();
+        // Write all 14 sectors
+        WriteSaveSectorOrSlot(FULL_SAVE_SLOT, gRamSaveSectorLocations);
+        break;
+
+    case SAVE_LINK:
+        // Partial save (Battle Frontier, link)
+        // Only save blocks 1 & 2, skip PC storage
+        CopyPartyAndObjectsToSave();
+        for(i = SECTOR_ID_SAVEBLOCK2; i <= SECTOR_ID_SAVEBLOCK1_END; i++)
+            HandleReplaceSector(i, gRamSaveSectorLocations);
+        break;
+    }
+}
+```
+
+### Single Sector Write
+
+```c
+static u8 HandleWriteSector(u16 sectorId, const struct SaveSectorLocation *locations)
+{
+    // Calculate physical sector
+    sector = sectorId + gLastWrittenSector;
+    sector %= NUM_SECTORS_PER_SLOT;
+    sector += NUM_SECTORS_PER_SLOT * (gSaveCounter % NUM_SAVE_SLOTS);
+
+    // Get source data
+    data = locations[sectorId].data;
+    size = locations[sectorId].size;
+
+    // Prepare sector buffer
+    memset(gReadWriteSector, 0, SECTOR_SIZE);
+
+    // Fill footer
+    gReadWriteSector->id = sectorId;
+    gReadWriteSector->signature = SECTOR_SIGNATURE;  // 0x08012025
+    gReadWriteSector->counter = gSaveCounter;
+
+    // Copy data
+    memcpy(gReadWriteSector->data, data, size);
+
+    // Calculate checksum
+    gReadWriteSector->checksum = CalculateChecksum(data, size);
+
+    // Write to flash
+    return TryWriteSector(sector, gReadWriteSector->data);
+}
+```
+
+### Flash Write Operation
+
+```c
+static u8 TryWriteSector(u8 sector, u8 *data)
+{
+    // ProgramFlashSectorAndVerify:
+    // 1. Erases the sector
+    // 2. Programs new data
+    // 3. Verifies written data matches
+    if (ProgramFlashSectorAndVerify(sector, data))
+    {
+        // Write failed - mark sector as damaged
+        SetDamagedSectorBits(ENABLE, sector);
+        return SAVE_STATUS_ERROR;
+    }
+    else
+    {
+        // Success
+        SetDamagedSectorBits(DISABLE, sector);
+        return SAVE_STATUS_OK;
+    }
+}
+```
+
+## Loading Process
+
+```c
+u8 LoadGameSave(u8 saveType)
+{
+    switch (saveType)
+    {
+    case SAVE_NORMAL:
+    default:
+        // Load all sectors
+        status = TryLoadSaveSlot(FULL_SAVE_SLOT, gRamSaveSectorLocations);
+        // Rebuild runtime structures
+        CopyPartyAndObjectsFromSave();
+        break;
+
+    case SAVE_HALL_OF_FAME:
+        // Load special sectors
+        status = TryLoadSaveSector(SECTOR_ID_HOF_1, buffer, SECTOR_DATA_SIZE);
+        if (status == SAVE_STATUS_OK)
+            status = TryLoadSaveSector(SECTOR_ID_HOF_2, buffer + SECTOR_DATA_SIZE, SECTOR_DATA_SIZE);
+        break;
+    }
+
+    return status;
+}
+```
+
+## Save Data Mapping
+
+The game maintains a table mapping logical sectors to RAM data:
+
+```c
+struct SaveSectorLocation
+{
+    void *data;   // Pointer to RAM data
+    u16 size;     // Size of data (max SECTOR_DATA_SIZE)
+};
+
+// Mapping table
+struct SaveSectorLocation gRamSaveSectorLocations[NUM_SECTORS_PER_SLOT] = {
+    // Sector 0: SaveBlock2 (full)
+    {gSaveBlock2Ptr, sizeof(struct SaveBlock2)},
+
+    // Sectors 1-4: SaveBlock1 (chunked)
+    {gSaveBlock1Ptr + 0*SECTOR_DATA_SIZE, SECTOR_DATA_SIZE},
+    {gSaveBlock1Ptr + 1*SECTOR_DATA_SIZE, SECTOR_DATA_SIZE},
+    {gSaveBlock1Ptr + 2*SECTOR_DATA_SIZE, SECTOR_DATA_SIZE},
+    {gSaveBlock1Ptr + 3*SECTOR_DATA_SIZE, remaining_bytes},
+
+    // Sectors 5-13: PokemonStorage (chunked)
+    {gPokemonStoragePtr + 0*SECTOR_DATA_SIZE, SECTOR_DATA_SIZE},
+    // ... continues for 9 sectors
+};
+```
+
+## Error Handling
+
+### Damaged Sector Tracking
+
+```c
+u32 gDamagedSaveSectors;  // Bitmask of failed sectors
+
+static bool32 SetDamagedSectorBits(u8 op, u8 sectorId)
+{
+    switch (op)
+    {
+    case ENABLE:
+        gDamagedSaveSectors |= (1 << sectorId);
+        break;
+    case DISABLE:
+        gDamagedSaveSectors &= ~(1 << sectorId);
+        break;
+    case CHECK:
+        return (gDamagedSaveSectors & (1 << sectorId)) != 0;
+    }
+}
+```
+
+### Save Failure Recovery
+
+```c
+// In WriteSaveSectorOrSlot:
+gLastKnownGoodSector = gLastWrittenSector;  // Backup
+gLastSaveCounter = gSaveCounter;
+
+// Write all sectors...
+
+if (gDamagedSaveSectors)
+{
+    // At least one sector failed - rollback
+    status = SAVE_STATUS_ERROR;
+    gLastWrittenSector = gLastKnownGoodSector;
+    gSaveCounter = gLastSaveCounter;
+}
+```
+
+### Save Failed Screen
+
+If saving fails, the game shows an error screen:
+
+```c
+u8 TrySavingData(u8 saveType)
+{
+    if (gFlashMemoryPresent != TRUE)
+    {
+        gSaveAttemptStatus = SAVE_STATUS_ERROR;
+        return SAVE_STATUS_ERROR;
+    }
+
+    HandleSavingData(saveType);
+
+    if (gDamagedSaveSectors)
+    {
+        DoSaveFailedScreen(saveType);  // "Save failed" message
+        gSaveAttemptStatus = SAVE_STATUS_ERROR;
+        return SAVE_STATUS_ERROR;
+    }
+
+    gSaveAttemptStatus = SAVE_STATUS_OK;
+    return SAVE_STATUS_OK;
+}
+```
+
+## Special Sectors
+
+### Hall of Fame (Sectors 28-29)
+
+Stores Pokemon League completion records:
+
+```c
+#define NUM_HOF_SECTORS 2
+#define HALL_OF_FAME_MAX_TEAMS (SECTOR_DATA_SIZE * NUM_HOF_SECTORS / sizeof(struct HallofFameTeam))
+
+// Save Hall of Fame
+HandleWriteSectorNBytes(SECTOR_ID_HOF_1, buffer, SECTOR_DATA_SIZE);
+HandleWriteSectorNBytes(SECTOR_ID_HOF_2, buffer + SECTOR_DATA_SIZE, SECTOR_DATA_SIZE);
+```
+
+### Trainer Hill (Sector 30)
+
+Stores e-Reader challenge data:
+
+```c
+TryWriteSpecialSaveSector(SECTOR_ID_TRAINER_HILL, (u8 *)challenge);
+```
+
+### Recorded Battle (Sector 31)
+
+Stores battle recordings for playback:
+
+```c
+TryWriteSpecialSaveSector(SECTOR_ID_RECORDED_BATTLE, (u8 *)battleSave);
+```
+
+## Status Codes
+
+```c
+#define SAVE_STATUS_EMPTY    0   // No save data found
+#define SAVE_STATUS_OK       1   // Save/load successful
+#define SAVE_STATUS_CORRUPT  2   // Data corrupted (bad checksum)
+#define SAVE_STATUS_NO_FLASH 4   // Flash memory not detected
+#define SAVE_STATUS_ERROR    0xFF // General error
+```
+
+## Timing Considerations
+
+Flash operations are slow and block the CPU:
+
+- Sector erase: ~100-200ms
+- Sector write: ~50-100ms per 4KB
+- Full save (14 sectors): ~2-3 seconds
+
+The game handles this with:
+- Incremental saves (one sector per frame during link)
+- "SAVING... DON'T TURN OFF THE POWER" message
+- VBlank callback suspension during saves
+
+## Related Topics
+
+- [Save Blocks](/save-system/save-blocks) - RAM structures being saved
+- [Save Validation](/save-system/save-validation) - Checksum and integrity checking

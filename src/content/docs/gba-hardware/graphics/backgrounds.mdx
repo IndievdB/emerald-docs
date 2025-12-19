@@ -1,0 +1,311 @@
+---
+title: Backgrounds
+description: Tile-based background layers on the GBA - tilemaps, scrolling, and modes
+---
+
+import DiagramContainer from '../../../../components/DiagramContainer.astro';
+
+The GBA supports up to 4 background layers using tile-based rendering. Pokemon Emerald uses video mode 0 (4 regular backgrounds) for most gameplay.
+
+## Background Layers
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Display["Display Output"]
+        subgraph Layers["Composited Layers (back to front)"]
+            BD["Backdrop Color"]
+            BG3["BG3 (lowest priority)"]
+            BG2["BG2"]
+            BG1["BG1"]
+            BG0["BG0 (highest priority)"]
+            OBJ["Sprites"]
+        end
+    end
+
+    BD --> BG3 --> BG2 --> BG1 --> BG0 --> OBJ
+
+    style BG0 fill:#f99,stroke:#333,color:#000
+    style OBJ fill:#9f9,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Video Modes
+
+| Mode | BG0 | BG1 | BG2 | BG3 | Notes |
+|------|-----|-----|-----|-----|-------|
+| 0 | Text | Text | Text | Text | Pokemon Emerald default |
+| 1 | Text | Text | Affine | - | Mixed mode |
+| 2 | - | - | Affine | Affine | Full affine |
+| 3-5 | Bitmap modes | | | | Not used |
+
+## Tile-Based Rendering
+
+### How It Works
+
+```
+VRAM Layout:
+┌──────────────────────────────────────────┐
+│ Character Base (Tile Graphics)           │
+│ 4 blocks × 16KB each                     │
+│ 0x06000000, 0x06004000, 0x06008000, ...  │
+├──────────────────────────────────────────┤
+│ Screen Base (Tilemaps)                   │
+│ 32 blocks × 2KB each                     │
+│ Indices into character data              │
+└──────────────────────────────────────────┘
+```
+
+### Tile Format (4bpp)
+
+```c
+// Each tile is 8×8 pixels, 32 bytes (4bpp)
+// Each byte = 2 pixels (4 bits each)
+
+// 4bpp tile: 32 bytes
+// 8bpp tile: 64 bytes
+
+struct Tile4bpp {
+    u8 data[32];  // 8 rows × 4 bytes
+};
+```
+
+### Tilemap Entry
+
+```c
+// Each tilemap entry is 16 bits
+struct TilemapEntry {
+    u16 tileNum:10;    // Tile index (0-1023)
+    u16 hFlip:1;       // Horizontal flip
+    u16 vFlip:1;       // Vertical flip
+    u16 palette:4;     // Palette bank (4bpp mode)
+};
+
+// Create tilemap entry
+#define TILE_ENTRY(tile, pal, hf, vf) \
+    ((tile) | ((hf) << 10) | ((vf) << 11) | ((pal) << 12))
+```
+
+## Background Control
+
+### BGxCNT Register
+
+```c
+void SetupBackground(u8 bg)
+{
+    u16 bgcnt = 0;
+
+    bgcnt |= BGCNT_PRIORITY(1);      // Priority 1
+    bgcnt |= BGCNT_CHARBASE(0);      // Tiles at 0x06000000
+    bgcnt |= BGCNT_16COLOR;          // 4bpp mode
+    bgcnt |= BGCNT_SCREENBASE(28);   // Map at 0x0600E000
+    bgcnt |= BGCNT_SCREENSIZE(0);    // 256×256 pixels
+
+    SetGpuReg(REG_OFFSET_BG0CNT + bg * 2, bgcnt);
+}
+```
+
+### Screen Sizes (Text Mode)
+
+| Size | Dimensions | Tilemap Size | Notes |
+|------|------------|--------------|-------|
+| 0 | 256×256 | 2KB | 32×32 tiles |
+| 1 | 512×256 | 4KB | 64×32 tiles |
+| 2 | 256×512 | 4KB | 32×64 tiles |
+| 3 | 512×512 | 8KB | 64×64 tiles |
+
+## Pokemon Emerald BG System
+
+### BG Initialization
+
+```c
+struct BgTemplate {
+    u32 bg:2;           // BG number (0-3)
+    u32 charBaseIndex:2; // Character base block
+    u32 mapBaseIndex:5;  // Screen base block
+    u32 screenSize:2;    // Screen size
+    u32 paletteMode:1;   // 0=16color, 1=256color
+    u32 priority:2;      // Layer priority
+    u32 baseTile:10;     // Starting tile offset
+};
+
+void InitBgFromTemplate(const struct BgTemplate *template);
+```
+
+### Tilemap Buffer
+
+```c
+// Allocate tilemap buffer
+void *tilemapBuffer = AllocZeroed(BG_SCREEN_SIZE);
+
+// Set tilemap pointer
+SetBgTilemapBuffer(bg, tilemapBuffer);
+
+// Write tiles
+FillBgTilemapBufferRect(bg, tileNum, x, y, width, height, palette);
+
+// Copy to VRAM
+CopyBgTilemapBufferToVram(bg);
+```
+
+### Common Functions
+
+```c
+// Show/hide backgrounds
+ShowBg(0);
+HideBg(0);
+
+// Scroll backgrounds
+ChangeBgX(bg, delta, BG_COORD_ADD);
+ChangeBgY(bg, delta, BG_COORD_ADD);
+SetBgPos(bg, BG_COORD_SET, x, y);
+
+// Get tilemap buffer
+void *buffer = GetBgTilemapBuffer(bg);
+```
+
+## Scrolling
+
+### Hardware Scrolling
+
+```c
+// Set scroll position (writes to BGxHOFS/VOFS)
+SetGpuReg(REG_OFFSET_BG0HOFS, xScroll);
+SetGpuReg(REG_OFFSET_BG0VOFS, yScroll);
+
+// Pokemon Emerald buffered method
+SetBgPos(0, BG_COORD_SET, xScroll, yScroll);
+```
+
+### Infinite Scrolling
+
+For seamless scrolling, update tilemap as player moves:
+
+```c
+void UpdateScrollingTilemap(void)
+{
+    // Calculate visible tile range
+    u16 startTileX = cameraX / 8;
+    u16 startTileY = cameraY / 8;
+
+    // Load new column/row as player moves
+    if (scrolledRight)
+        LoadTileColumn(startTileX + VISIBLE_WIDTH);
+    if (scrolledDown)
+        LoadTileRow(startTileY + VISIBLE_HEIGHT);
+}
+```
+
+## Metatiles
+
+Pokemon Emerald uses 16×16 metatiles (2×2 hardware tiles):
+
+```c
+struct Metatile {
+    u16 tiles[8];  // 4 tiles × 2 layers (bottom, top)
+    // tiles[0-3]: bottom layer
+    // tiles[4-7]: top layer (walkable terrain)
+};
+
+// Metatile layout:
+// ┌────┬────┐
+// │ 0  │ 1  │  Bottom layer
+// ├────┼────┤
+// │ 2  │ 3  │
+// └────┴────┘
+
+// Draw metatile at position
+void DrawMetatile(u16 metatileId, u16 x, u16 y)
+{
+    struct Metatile *mt = &gMetatiles[metatileId];
+
+    // Bottom layer (BG1/BG2)
+    SetTile(BG_BOTTOM, x,     y,     mt->tiles[0]);
+    SetTile(BG_BOTTOM, x + 1, y,     mt->tiles[1]);
+    SetTile(BG_BOTTOM, x,     y + 1, mt->tiles[2]);
+    SetTile(BG_BOTTOM, x + 1, y + 1, mt->tiles[3]);
+
+    // Top layer (BG0/BG1)
+    // ...
+}
+```
+
+## Priority System
+
+Layer drawing order:
+
+```c
+// Priority 0 = front, Priority 3 = back
+// Within same priority: lower BG number = front
+
+// Typical setup:
+SetGpuReg(REG_OFFSET_BG0CNT, BGCNT_PRIORITY(0));  // Menus, UI
+SetGpuReg(REG_OFFSET_BG1CNT, BGCNT_PRIORITY(1));  // Top map layer
+SetGpuReg(REG_OFFSET_BG2CNT, BGCNT_PRIORITY(2));  // Bottom map layer
+SetGpuReg(REG_OFFSET_BG3CNT, BGCNT_PRIORITY(3));  // Far background
+```
+
+## Tileset Loading
+
+```c
+// Load tileset graphics
+void LoadTileset(const struct Tileset *tileset)
+{
+    // Copy tiles to VRAM
+    RequestDma3Copy(tileset->tiles,
+                    (void *)(BG_CHAR_ADDR(charBase)),
+                    tileset->size,
+                    1);  // 32-bit mode
+
+    // Load palette
+    LoadPalette(tileset->palettes, 0, PALETTE_SIZE);
+}
+```
+
+## Affine Backgrounds
+
+For rotation/scaling effects (BG2/BG3 in modes 1-2):
+
+```c
+// Set affine parameters
+// PA, PB, PC, PD form a 2×2 transformation matrix
+// X, Y are reference points
+
+// Identity (no transform)
+REG_BG2PA = 0x100;  // 1.0 in 8.8 fixed point
+REG_BG2PB = 0;
+REG_BG2PC = 0;
+REG_BG2PD = 0x100;
+REG_BG2X = 0;
+REG_BG2Y = 0;
+
+// Rotation example
+s16 sin = SIN(angle);
+s16 cos = COS(angle);
+REG_BG2PA = cos;
+REG_BG2PB = sin;
+REG_BG2PC = -sin;
+REG_BG2PD = cos;
+```
+
+## Windows
+
+Restrict rendering to rectangular regions:
+
+```c
+// Enable window 0
+SetGpuReg(REG_OFFSET_DISPCNT, DISPCNT_WIN0_ON | ...);
+
+// Set window bounds
+SetGpuReg(REG_OFFSET_WIN0H, WIN_RANGE(left, right));
+SetGpuReg(REG_OFFSET_WIN0V, WIN_RANGE(top, bottom));
+
+// Set what's visible inside window
+SetGpuReg(REG_OFFSET_WININ, WININ_WIN0_BG0 | WININ_WIN0_OBJ);
+```
+
+## Related Topics
+
+- [Palettes](/gba-hardware/graphics/palettes) - Background color management
+- [Sprites](/gba-hardware/graphics/sprites) - Sprite layer interaction
+- [IO Registers](/gba-hardware/io-registers) - BGxCNT register details

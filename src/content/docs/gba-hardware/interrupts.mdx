@@ -1,0 +1,482 @@
+---
+title: Interrupts
+description: Hardware interrupt handling on the GBA - VBlank, HBlank, timers, and more
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The GBA uses hardware interrupts to notify the CPU of time-critical events like VBlank, sound updates, and serial communication. Pokemon Emerald implements a callback-based interrupt system that lets different game systems register handlers.
+
+## Interrupt Architecture
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Hardware["Hardware Events"]
+        VB["VBlank"]
+        HB["HBlank"]
+        VC["VCount"]
+        TM["Timers"]
+        SR["Serial"]
+        DM["DMA"]
+    end
+
+    subgraph ARM["ARM7TDMI"]
+        IME["IME<br/>Master Enable"]
+        IE["IE<br/>Interrupt Enable"]
+        IF["IF<br/>Interrupt Flags"]
+    end
+
+    subgraph Handler["Interrupt Handler"]
+        IntrMain["IntrMain"]
+        Table["gIntrTable[]"]
+        CB["Callbacks"]
+    end
+
+    VB --> IF
+    HB --> IF
+    VC --> IF
+    TM --> IF
+    IF --> IME
+    IME --> IntrMain
+    IntrMain --> Table
+    Table --> CB
+
+    style VB fill:#9f9,stroke:#333,color:#000
+    style IntrMain fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Interrupt Types
+
+| Interrupt | Flag | Priority | Description |
+|-----------|------|----------|-------------|
+| VBlank | `INTR_FLAG_VBLANK` | 0 | Start of vertical blank (60 Hz) |
+| HBlank | `INTR_FLAG_HBLANK` | 1 | End of each scanline (228 times/frame) |
+| VCount | `INTR_FLAG_VCOUNT` | 2 | Specific scanline reached |
+| Timer 0-3 | `INTR_FLAG_TIMERx` | 3-6 | Timer overflow |
+| Serial | `INTR_FLAG_SERIAL` | 7 | Serial transfer complete |
+| DMA 0-3 | `INTR_FLAG_DMAx` | 8-11 | DMA transfer complete |
+| Keypad | `INTR_FLAG_KEYPAD` | 12 | Key combination pressed |
+| Game Pak | `INTR_FLAG_GAMEPAK` | 13 | Game Pak removed |
+
+## Interrupt Flags
+
+```c
+// Interrupt enable/acknowledge flags
+#define INTR_FLAG_VBLANK  (1 <<  0)
+#define INTR_FLAG_HBLANK  (1 <<  1)
+#define INTR_FLAG_VCOUNT  (1 <<  2)
+#define INTR_FLAG_TIMER0  (1 <<  3)
+#define INTR_FLAG_TIMER1  (1 <<  4)
+#define INTR_FLAG_TIMER2  (1 <<  5)
+#define INTR_FLAG_TIMER3  (1 <<  6)
+#define INTR_FLAG_SERIAL  (1 <<  7)
+#define INTR_FLAG_DMA0    (1 <<  8)
+#define INTR_FLAG_DMA1    (1 <<  9)
+#define INTR_FLAG_DMA2    (1 << 10)
+#define INTR_FLAG_DMA3    (1 << 11)
+#define INTR_FLAG_KEYPAD  (1 << 12)
+#define INTR_FLAG_GAMEPAK (1 << 13)
+```
+
+## Interrupt Registers
+
+```c
+// Interrupt Master Enable - global on/off
+#define REG_IME   *(vu16 *)0x04000208  // 0 = disabled, 1 = enabled
+
+// Interrupt Enable - which interrupts are active
+#define REG_IE    *(vu16 *)0x04000200  // Bitmask of INTR_FLAG_*
+
+// Interrupt Request Flags (pending interrupts)
+#define REG_IF    *(vu16 *)0x04000202  // Write 1 to acknowledge
+
+// BIOS Interrupt Check (for VBlankIntrWait)
+#define INTR_CHECK *(vu16 *)0x03007FF8
+```
+
+## Interrupt Table
+
+Pokemon Emerald uses a function pointer table for interrupt dispatch:
+
+```c
+typedef void (*IntrFunc)(void);
+
+// Template copied to RAM at init
+const IntrFunc gIntrTableTemplate[] =
+{
+    VCountIntr,  // V-count interrupt
+    SerialIntr,  // Serial interrupt
+    Timer3Intr,  // Timer 3 interrupt
+    HBlankIntr,  // H-blank interrupt
+    VBlankIntr,  // V-blank interrupt
+    IntrDummy,   // Timer 0 interrupt
+    IntrDummy,   // Timer 1 interrupt
+    IntrDummy,   // Timer 2 interrupt
+    IntrDummy,   // DMA 0 interrupt
+    IntrDummy,   // DMA 1 interrupt
+    IntrDummy,   // DMA 2 interrupt
+    IntrDummy,   // DMA 3 interrupt
+    IntrDummy,   // Key interrupt
+    IntrDummy,   // Game Pak interrupt
+};
+
+// Working copy in EWRAM
+IntrFunc gIntrTable[INTR_COUNT];
+```
+
+## Initialization
+
+```c
+void InitIntrHandlers(void)
+{
+    int i;
+
+    // Copy interrupt table template
+    for (i = 0; i < INTR_COUNT; i++)
+        gIntrTable[i] = gIntrTableTemplate[i];
+
+    // Copy interrupt dispatcher to RAM (for speed)
+    DmaCopy32(3, IntrMain, IntrMain_Buffer, sizeof(IntrMain_Buffer));
+
+    // Set interrupt vector
+    INTR_VECTOR = IntrMain_Buffer;
+
+    // Clear all callbacks
+    SetVBlankCallback(NULL);
+    SetHBlankCallback(NULL);
+    SetSerialCallback(NULL);
+
+    // Enable interrupts
+    REG_IME = 1;
+    EnableInterrupts(INTR_FLAG_VBLANK);
+}
+```
+
+## Callback System
+
+The game uses callbacks so different systems can respond to interrupts:
+
+### Setting Callbacks
+
+```c
+void SetVBlankCallback(IntrCallback callback)
+{
+    gMain.vblankCallback = callback;
+}
+
+void SetHBlankCallback(IntrCallback callback)
+{
+    gMain.hblankCallback = callback;
+}
+
+void SetVCountCallback(IntrCallback callback)
+{
+    gMain.vcountCallback = callback;
+}
+
+void SetSerialCallback(IntrCallback callback)
+{
+    gMain.serialCallback = callback;
+}
+```
+
+### Callback Structure
+
+```c
+struct Main
+{
+    MainCallback callback1;        // Main state machine
+    MainCallback callback2;        // Secondary callback
+    IntrCallback vblankCallback;   // VBlank handler
+    IntrCallback hblankCallback;   // HBlank handler
+    IntrCallback vcountCallback;   // VCount handler
+    IntrCallback serialCallback;   // Serial handler
+    vu16 intrCheck;                // Interrupt flags mirror
+    vu32 vblankCounter1;           // Frame counter
+    vu32 vblankCounter2;           // Secondary counter
+    // ... more fields
+};
+```
+
+## VBlank Interrupt
+
+The most important interrupt - fires 60 times per second:
+
+```c
+static void VBlankIntr(void)
+{
+    // Handle wireless/link sync
+    if (gWirelessCommType != 0)
+        RfuVSync();
+    else if (gLinkVSyncDisabled == FALSE)
+        LinkVSync();
+
+    // Increment frame counters
+    gMain.vblankCounter1++;
+
+    // Trainer Hill timer
+    if (gTrainerHillVBlankCounter && *gTrainerHillVBlankCounter < 0xFFFFFFFF)
+        (*gTrainerHillVBlankCounter)++;
+
+    // Call registered callback
+    if (gMain.vblankCallback)
+        gMain.vblankCallback();
+
+    gMain.vblankCounter2++;
+
+    // Apply buffered GPU register changes
+    CopyBufferedValuesToGpuRegs();
+
+    // Process pending DMA transfers
+    ProcessDma3Requests();
+
+    // Update sound
+    m4aSoundMain();
+
+    // Try reading RTC
+    TryReceiveLinkBattleData();
+
+    // Random number generator tick
+    Random();
+
+    // Update button hold counters
+    UpdateSerialCounters();
+
+    // Acknowledge interrupt
+    INTR_CHECK |= INTR_FLAG_VBLANK;
+    gMain.intrCheck |= INTR_FLAG_VBLANK;
+}
+```
+
+### VBlank Timing
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant LCD
+    participant VBlank as VBlank Handler
+    participant Game
+
+    Note over LCD: Scanline 0-159 (Active Display)
+    LCD->>LCD: Drawing pixels
+
+    Note over LCD: Scanline 160 (VBlank starts)
+    LCD->>VBlank: VBlank interrupt
+
+    VBlank->>VBlank: Link/Wireless sync
+    VBlank->>VBlank: Call vblankCallback
+    VBlank->>VBlank: Copy GPU registers
+    VBlank->>VBlank: Process DMA3 requests
+    VBlank->>VBlank: Update sound
+    VBlank->>VBlank: Random tick
+    VBlank->>Game: Return
+
+    Note over LCD: Scanlines 160-227 (VBlank period)
+    Game->>Game: Continue processing
+
+    Note over LCD: Scanline 0 (Next frame)`}
+</pre>
+</DiagramContainer>
+
+## HBlank Interrupt
+
+Called at the end of each scanline (160 times per visible frame):
+
+```c
+static void HBlankIntr(void)
+{
+    if (gMain.hblankCallback)
+        gMain.hblankCallback();
+
+    INTR_CHECK |= INTR_FLAG_HBLANK;
+    gMain.intrCheck |= INTR_FLAG_HBLANK;
+}
+```
+
+Used for scanline effects like:
+- Water wave distortion
+- Gradient backgrounds
+- Mode 7-like effects
+
+## VCount Interrupt
+
+Triggers at a specific scanline:
+
+```c
+static void VCountIntr(void)
+{
+    if (gMain.vcountCallback)
+        gMain.vcountCallback();
+
+    // Sound VSync timing
+    m4aSoundVSync();
+
+    INTR_CHECK |= INTR_FLAG_VCOUNT;
+    gMain.intrCheck |= INTR_FLAG_VCOUNT;
+}
+
+// Enable VCount at scanline 150
+void EnableVCountIntrAtLine150(void)
+{
+    u16 dispstat = REG_DISPSTAT;
+    dispstat &= 0xFF;
+    dispstat |= (150 << 8);  // Trigger at scanline 150
+    dispstat |= DISPSTAT_VCOUNT_INTR;
+    REG_DISPSTAT = dispstat;
+}
+```
+
+## Timer Interrupt
+
+Timer 3 is used for flash memory timing:
+
+```c
+static void Timer3Intr(void)
+{
+    if (gMain.timer3Callback)
+        gMain.timer3Callback();
+
+    INTR_CHECK |= INTR_FLAG_TIMER3;
+    gMain.intrCheck |= INTR_FLAG_TIMER3;
+}
+
+void InitFlashTimer(void)
+{
+    SetFlashTimerIntr(2, gIntrTable + 0x7);
+}
+```
+
+## Serial Interrupt
+
+Handles link cable communication completion:
+
+```c
+static void SerialIntr(void)
+{
+    if (gMain.serialCallback)
+        gMain.serialCallback();
+
+    INTR_CHECK |= INTR_FLAG_SERIAL;
+    gMain.intrCheck |= INTR_FLAG_SERIAL;
+}
+```
+
+## Waiting for VBlank
+
+The game often waits for VBlank to synchronize:
+
+```c
+static void WaitForVBlank(void)
+{
+    gMain.intrCheck &= ~INTR_FLAG_VBLANK;
+
+    // Use BIOS call to halt CPU until VBlank
+    VBlankIntrWait();
+}
+
+// BIOS function - halts until VBlank interrupt
+void VBlankIntrWait(void);
+```
+
+### Main Loop VBlank Sync
+
+```c
+void DoMainLoop(void)
+{
+    while (TRUE)
+    {
+        // Read controller input
+        ReadKeys();
+
+        // Run game logic (callback2)
+        if (gMain.callback2)
+            gMain.callback2();
+
+        // Run state machine (callback1)
+        if (gMain.callback1)
+            gMain.callback1();
+
+        // Run animation system
+        AnimateSprites();
+        BuildOamBuffer();
+
+        // Wait for VBlank to complete rendering
+        WaitForVBlank();
+    }
+}
+```
+
+## Enabling/Disabling Interrupts
+
+```c
+// Enable specific interrupts
+void EnableInterrupts(u16 mask)
+{
+    REG_IE |= mask;
+}
+
+// Disable specific interrupts
+void DisableInterrupts(u16 mask)
+{
+    REG_IE &= ~mask;
+}
+
+// Example: Enable HBlank for scanline effects
+void SetupScanlineEffect(void)
+{
+    EnableInterrupts(INTR_FLAG_HBLANK);
+    REG_DISPSTAT |= DISPSTAT_HBLANK_INTR;
+    SetHBlankCallback(MyScanlineHandler);
+}
+```
+
+## Critical Sections
+
+Some operations must disable interrupts temporarily:
+
+```c
+void SafeOperation(void)
+{
+    u16 savedIME = REG_IME;
+    REG_IME = 0;  // Disable all interrupts
+
+    // Critical code here...
+
+    REG_IME = savedIME;  // Restore interrupt state
+}
+```
+
+## Typical VBlank Callback
+
+A common pattern for setting up VBlank work:
+
+```c
+void CB_VBlankBattle(void)
+{
+    // Transfer palette from buffer to hardware
+    LoadOam();
+    ProcessSpriteCopyRequests();
+    TransferPlttBuffer();
+
+    // Scroll backgrounds
+    SetGpuReg(REG_OFFSET_BG0HOFS, gBattle_BG0_X);
+    SetGpuReg(REG_OFFSET_BG0VOFS, gBattle_BG0_Y);
+    // ... more register updates
+}
+```
+
+## Interrupt Priority
+
+Lower interrupt numbers have higher priority. The hardware processes:
+1. Checks REG_IF for pending interrupts
+2. Masks against REG_IE (enabled interrupts)
+3. Calls handler for highest-priority pending interrupt
+4. Handler acknowledges by writing to REG_IF
+
+## Related Topics
+
+- [Main Loop](/game-flow/main-loop) - How interrupts integrate with gameplay
+- [DMA](/gba-hardware/dma) - DMA transfers during VBlank
+- [Task System](/deep-dives/task-system) - Game logic scheduling

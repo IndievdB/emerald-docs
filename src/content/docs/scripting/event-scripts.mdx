@@ -1,0 +1,646 @@
+---
+title: Event Scripts
+description: Writing event scripts using the pokeemerald macro system
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Event scripts are written in assembly using macros that generate bytecode for the script VM. Scripts are stored in `.inc` files within each map's `data/maps/[MapName]/` directory.
+
+## Script File Structure
+
+Each map has a `scripts.inc` file that contains:
+
+```asm
+@ data/maps/PetalburgCity/scripts.inc
+
+@ Map script header - defines when scripts run
+PetalburgCity_MapScripts::
+    map_script MAP_SCRIPT_ON_TRANSITION, PetalburgCity_OnTransition
+    map_script MAP_SCRIPT_ON_FRAME_TABLE, PetalburgCity_OnFrame
+    .byte 0  @ Terminator
+
+@ On-transition script (runs when entering map)
+PetalburgCity_OnTransition:
+    setflag FLAG_VISITED_PETALBURG_CITY
+    end
+
+@ Frame table (conditional scripts checked each frame)
+PetalburgCity_OnFrame:
+    map_script_2 VAR_PETALBURG_CITY_STATE, 2, PetalburgCity_EventScript_WallyTutorial
+    .2byte 0  @ Terminator
+
+@ Event scripts (NPC interactions, etc.)
+PetalburgCity_EventScript_Boy::
+    lock
+    faceplayer
+    msgbox PetalburgCity_Text_WaterReflection, MSGBOX_DEFAULT
+    release
+    end
+```
+
+## Map Script Types
+
+<DiagramContainer title="Map Script Execution Points">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Loading[Map Loading]
+        OnLoad[ON_LOAD<br/>Immediate context]
+        OnTransition[ON_TRANSITION<br/>Immediate context]
+        OnWarpInto[ON_WARP_INTO_MAP_TABLE<br/>Immediate, conditional]
+    end
+
+    subgraph Runtime[During Gameplay]
+        OnFrame[ON_FRAME_TABLE<br/>Checked each frame]
+        OnResume[ON_RESUME<br/>After menu close]
+        OnReturn[ON_RETURN_TO_FIELD<br/>After battle]
+        OnDive[ON_DIVE_WARP<br/>Using Dive]
+    end
+
+    LoadMap --> OnLoad
+    OnLoad --> OnTransition
+    OnTransition --> OnWarpInto
+    OnWarpInto --> Runtime
+    OnFrame -.->|VAR matches| TriggerScript[Run Script]`}
+</pre>
+</DiagramContainer>
+
+### Script Type Constants
+
+```asm
+MAP_SCRIPT_ON_LOAD = 1
+    @ Runs when map data loads, before graphics
+    @ Immediate context (runs to completion)
+
+MAP_SCRIPT_ON_FRAME_TABLE = 2
+    @ Conditional table checked each frame
+    @ Triggers when VAR1 == VAR2
+
+MAP_SCRIPT_ON_TRANSITION = 3
+    @ Runs when entering map
+    @ Immediate context
+
+MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE = 4
+    @ Conditional, runs after warp
+    @ Immediate context
+
+MAP_SCRIPT_ON_RESUME = 5
+    @ Runs when returning from menu
+
+MAP_SCRIPT_ON_RETURN_TO_FIELD = 6
+    @ Runs when returning from battle
+
+MAP_SCRIPT_ON_DIVE_WARP = 7
+    @ Runs when using Dive
+```
+
+### Map Script Header Format
+
+```asm
+@ Simple script (type + pointer)
+.macro map_script type:req, ptr:req
+    .byte \type
+    .4byte \ptr
+.endm
+
+@ Conditional script (type + condition + pointer)
+.macro map_script_2 var1:req, var2:req, script:req
+    .2byte \var1
+    .2byte \var2
+    .4byte \script
+.endm
+```
+
+## Event Types
+
+Maps define four types of events in their header:
+
+<DiagramContainer title="Event Types on a Map">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Events[Map Events]
+        Object[Object Events<br/>NPCs, items on ground]
+        Warp[Warp Events<br/>Doors, stairs]
+        Coord[Coord Events<br/>Step triggers]
+        BG[BG Events<br/>Signs, hidden items]
+    end
+
+    Player -->|Talk/A button| Object
+    Player -->|Walk onto| Warp
+    Player -->|Walk onto| Coord
+    Player -->|Face + A button| BG`}
+</pre>
+</DiagramContainer>
+
+### Object Events (NPCs)
+
+```asm
+@ In data/maps/[MapName]/map.json
+"object_events": [
+    {
+        "graphics_id": "OBJ_EVENT_GFX_MAN_1",
+        "x": 10,
+        "y": 5,
+        "elevation": 3,
+        "movement_type": "MOVEMENT_TYPE_LOOK_AROUND",
+        "movement_range_x": 0,
+        "movement_range_y": 0,
+        "trainer_type": "TRAINER_TYPE_NONE",
+        "trainer_sight_or_berry_tree_id": "0",
+        "script": "PetalburgCity_EventScript_Boy",
+        "flag": "0"
+    }
+]
+
+@ The script runs when player talks to this NPC
+PetalburgCity_EventScript_Boy::
+    lock
+    faceplayer
+    msgbox PetalburgCity_Text_WaterReflection, MSGBOX_DEFAULT
+    release
+    end
+```
+
+### Warp Events
+
+```asm
+@ Warp to another map when player steps on tile
+"warp_events": [
+    {
+        "x": 7,
+        "y": 0,
+        "elevation": 0,
+        "dest_map": "MAP_PETALBURG_CITY_GYM",
+        "dest_warp_id": 0
+    }
+]
+```
+
+### Coord Events (Triggers)
+
+```asm
+@ Script triggers when player steps on tile
+"coord_events": [
+    {
+        "type": "COORD_EVENT_TRIGGER",
+        "x": 5,
+        "y": 10,
+        "elevation": 0,
+        "var": "VAR_TEMP_1",
+        "var_value": "0",
+        "script": "Route101_EventScript_WallyAppears"
+    }
+]
+```
+
+### BG Events (Signs/Hidden Items)
+
+```asm
+@ Sign - player reads when facing and pressing A
+"bg_events": [
+    {
+        "type": "BG_EVENT_SIGN",
+        "x": 10,
+        "y": 15,
+        "elevation": 0,
+        "player_facing_dir": "BG_EVENT_PLAYER_FACING_ANY",
+        "script": "PetalburgCity_EventScript_CitySign"
+    },
+    {
+        @ Hidden item - beeps when near with Itemfinder
+        "type": "BG_EVENT_HIDDEN_ITEM",
+        "x": 12,
+        "y": 8,
+        "elevation": 0,
+        "item": "ITEM_POTION",
+        "flag": "FLAG_HIDDEN_ITEM_PETALBURG_CITY_POTION"
+    }
+]
+```
+
+## Common Script Patterns
+
+### Simple NPC Dialogue
+
+```asm
+MapName_EventScript_NpcName::
+    lock              @ Freeze NPCs and player
+    faceplayer        @ Turn NPC to face player
+    msgbox MapName_Text_NpcDialogue, MSGBOX_DEFAULT
+    release           @ Unfreeze
+    end
+
+MapName_Text_NpcDialogue:
+    .string "Hello there!\p"
+    .string "Nice weather today.$"
+```
+
+### Conditional Dialogue
+
+```asm
+MapName_EventScript_NpcConditional::
+    lock
+    faceplayer
+    goto_if_set FLAG_RECEIVED_STARTER, MapName_EventScript_NpcAfter
+    msgbox MapName_Text_Before, MSGBOX_DEFAULT
+    goto MapName_EventScript_NpcEnd
+
+MapName_EventScript_NpcAfter::
+    msgbox MapName_Text_After, MSGBOX_DEFAULT
+
+MapName_EventScript_NpcEnd::
+    release
+    end
+```
+
+### Branching on Variable
+
+```asm
+MapName_EventScript_CheckProgress::
+    lock
+    faceplayer
+    compare VAR_STORY_PROGRESS, 5
+    goto_if_lt MapName_EventScript_EarlyGame
+    goto_if_eq MapName_EventScript_MidGame
+    goto MapName_EventScript_LateGame
+
+MapName_EventScript_EarlyGame::
+    msgbox MapName_Text_Early, MSGBOX_DEFAULT
+    goto MapName_EventScript_Done
+
+MapName_EventScript_MidGame::
+    msgbox MapName_Text_Mid, MSGBOX_DEFAULT
+    goto MapName_EventScript_Done
+
+MapName_EventScript_LateGame::
+    msgbox MapName_Text_Late, MSGBOX_DEFAULT
+
+MapName_EventScript_Done::
+    release
+    end
+```
+
+### Yes/No Choice
+
+```asm
+MapName_EventScript_AskQuestion::
+    lock
+    faceplayer
+    msgbox MapName_Text_Question, MSGBOX_YESNO
+    compare VAR_RESULT, YES
+    goto_if_eq MapName_EventScript_AnsweredYes
+    msgbox MapName_Text_No, MSGBOX_DEFAULT
+    goto MapName_EventScript_QuestionEnd
+
+MapName_EventScript_AnsweredYes::
+    msgbox MapName_Text_Yes, MSGBOX_DEFAULT
+
+MapName_EventScript_QuestionEnd::
+    release
+    end
+```
+
+### Giving Items
+
+```asm
+MapName_EventScript_GiveItem::
+    lock
+    faceplayer
+    goto_if_set FLAG_RECEIVED_POTION, MapName_EventScript_AlreadyGave
+    giveitem ITEM_POTION, 1
+    compare VAR_RESULT, FALSE
+    goto_if_eq MapName_EventScript_NoRoom
+    setflag FLAG_RECEIVED_POTION
+    msgbox MapName_Text_HereYouGo, MSGBOX_DEFAULT
+    goto MapName_EventScript_GiveEnd
+
+MapName_EventScript_NoRoom::
+    msgbox MapName_Text_BagFull, MSGBOX_DEFAULT
+    goto MapName_EventScript_GiveEnd
+
+MapName_EventScript_AlreadyGave::
+    msgbox MapName_Text_AlreadyGave, MSGBOX_DEFAULT
+
+MapName_EventScript_GiveEnd::
+    release
+    end
+```
+
+### Item on Ground (Ball)
+
+```asm
+MapName_EventScript_ItemBall::
+    finditem ITEM_RARE_CANDY
+    end
+
+@ Uses standard script STD_FIND_ITEM which handles:
+@ - Playing fanfare
+@ - Showing "Found one RARE CANDY!" message
+@ - Adding to bag or showing bag full message
+@ - Hiding the object event
+```
+
+### Trainer Battle
+
+```asm
+MapName_EventScript_Trainer1::
+    trainerbattle_single TRAINER_YOUNGSTER_CALVIN, MapName_Text_Intro, MapName_Text_Defeat
+    msgbox MapName_Text_PostBattle, MSGBOX_AUTOCLOSE
+    end
+
+@ Types of trainer battles:
+@ trainerbattle_single - Normal 1v1
+@ trainerbattle_double - 2v2 battle
+@ trainerbattle_rematch - Registered for rematches
+@ trainerbattle_continue_script - Run script after battle
+
+MapName_EventScript_TrainerWithScript::
+    trainerbattle_single TRAINER_ID, MapName_Text_Intro, MapName_Text_Defeat, MapName_EventScript_AfterBattle
+    @ Falls through to after-battle script
+
+MapName_EventScript_AfterBattle::
+    msgbox MapName_Text_Thanks, MSGBOX_DEFAULT
+    release
+    end
+```
+
+### Movement Scripts
+
+```asm
+MapName_EventScript_Cutscene::
+    lockall
+    @ Move NPC down 3 tiles, then left 2 tiles
+    applymovement LOCALID_NPC, MapName_Movement_NpcWalk
+    @ Move player simultaneously
+    applymovement OBJ_EVENT_ID_PLAYER, MapName_Movement_PlayerWatch
+    waitmovement 0  @ Wait for both to finish
+    msgbox MapName_Text_Dialogue, MSGBOX_DEFAULT
+    releaseall
+    end
+
+MapName_Movement_NpcWalk:
+    walk_down
+    walk_down
+    walk_down
+    walk_left
+    walk_left
+    step_end
+
+MapName_Movement_PlayerWatch:
+    delay_16
+    walk_in_place_faster_right
+    step_end
+```
+
+### Weather Effects
+
+```asm
+MapName_EventScript_StartRain::
+    setweather WEATHER_RAIN
+    doweather
+    end
+
+MapName_EventScript_StopWeather::
+    resetweather
+    doweather
+    end
+```
+
+### Screen Fading
+
+```asm
+MapName_EventScript_FadeToBlack::
+    fadescreen FADE_TO_BLACK
+    @ Do something while screen is black
+    setobjectxy LOCALID_NPC, 10, 5
+    fadescreen FADE_FROM_BLACK
+    end
+```
+
+## Macros Reference
+
+### Convenience Macros
+
+The macro system provides high-level wrappers:
+
+```asm
+@ Display message with default settings
+.macro msgbox text:req, type=MSGBOX_DEFAULT
+    loadword 0, \text
+    callstd \type
+.endm
+
+@ Message box types
+MSGBOX_NPC = 2        @ NPC dialogue (faces player)
+MSGBOX_SIGN = 3       @ Sign reading
+MSGBOX_DEFAULT = 4    @ Standard dialogue
+MSGBOX_YESNO = 5      @ Yes/No prompt (result in VAR_RESULT)
+MSGBOX_AUTOCLOSE = 6  @ Auto-closes after display
+
+@ Give item to player
+.macro giveitem item:req, quantity=1
+    setorcopyvar VAR_0x8000, \item
+    setorcopyvar VAR_0x8001, \quantity
+    callstd STD_OBTAIN_ITEM
+.endm
+
+@ Item ball (ground pickup)
+.macro finditem item:req, quantity=1
+    setorcopyvar VAR_0x8000, \item
+    setorcopyvar VAR_0x8001, \quantity
+    callstd STD_FIND_ITEM
+.endm
+
+@ Conditional goto based on flag
+.macro goto_if_set flag:req, dest:req
+    checkflag \flag
+    goto_if TRUE, \dest
+.endm
+
+.macro goto_if_unset flag:req, dest:req
+    checkflag \flag
+    goto_if FALSE, \dest
+.endm
+```
+
+### Comparison Operators
+
+```asm
+@ Condition codes for goto_if / call_if
+TRUE = 1      @ Flag is set, or comparison was equal
+FALSE = 0     @ Flag is clear, or comparison was not equal
+
+@ Numeric comparisons
+LESS_THAN = 0
+EQUAL = 1
+GREATER_THAN = 2
+LESS_OR_EQUAL = 3
+GREATER_OR_EQUAL = 4
+NOT_EQUAL = 5
+
+@ Usage
+compare VAR_TEMP_1, 5
+goto_if_eq MapName_EventScript_IsFive
+goto_if_lt MapName_EventScript_LessThanFive
+goto_if_ge MapName_EventScript_FiveOrMore
+
+@ Shorthand macros
+.macro goto_if_eq dest:req
+    goto_if EQUAL, \dest
+.endm
+
+.macro goto_if_ne dest:req
+    goto_if NOT_EQUAL, \dest
+.endm
+
+.macro goto_if_lt dest:req
+    goto_if LESS_THAN, \dest
+.endm
+
+.macro goto_if_gt dest:req
+    goto_if GREATER_THAN, \dest
+.endm
+
+.macro goto_if_le dest:req
+    goto_if LESS_OR_EQUAL, \dest
+.endm
+
+.macro goto_if_ge dest:req
+    goto_if GREATER_OR_EQUAL, \dest
+.endm
+```
+
+## String Formatting
+
+### Text Control Codes
+
+```asm
+MapName_Text_Example:
+    .string "Line 1\n"           @ Newline
+    .string "Line 2\p"           @ New paragraph (waits for button)
+    .string "The end.$"          @ String terminator
+
+@ Dynamic text insertion
+MapName_Text_WithName:
+    .string "Hello, {PLAYER}!\p"
+    .string "You have {STR_VAR_1} badges.$"
+
+@ Buffer text before displaying
+bufferplayername STR_VAR_1
+buffernumberstring STR_VAR_2, VAR_BADGE_COUNT
+msgbox MapName_Text_WithName, MSGBOX_DEFAULT
+```
+
+### Text Placeholders
+
+| Placeholder | Description |
+|-------------|-------------|
+| `{PLAYER}` | Player's name |
+| `{RIVAL}` | Rival's name |
+| `{STR_VAR_1}` | String buffer 1 |
+| `{STR_VAR_2}` | String buffer 2 |
+| `{STR_VAR_3}` | String buffer 3 |
+| `{COLOR RED}` | Change text color |
+| `{PAUSE X}` | Pause for X frames |
+
+## Movement Commands
+
+Movement scripts use these commands:
+
+```asm
+@ Walking
+walk_down
+walk_up
+walk_left
+walk_right
+walk_fast_down   @ Running speed
+
+@ Facing without moving
+face_down
+face_up
+face_left
+face_right
+walk_in_place_faster_down  @ Quick turn
+
+@ Jumping
+jump_down_1
+jump_down_2      @ 2-tile jump
+
+@ Special
+delay_8          @ Pause 8 frames
+delay_16         @ Pause 16 frames
+set_invisible    @ Hide sprite
+set_visible      @ Show sprite
+lock_facing_direction
+step_end         @ Required terminator
+```
+
+## Special Functions
+
+Call C functions via `special`:
+
+```asm
+@ Common specials
+special HealPlayerParty
+special SaveGame
+special ShowPokedex
+special ChoosePartyMon           @ Result in VAR_0x8004
+
+@ Specials that return values
+specialvar VAR_RESULT, GetPlayerTrainerId
+specialvar VAR_TEMP_1, CountBadges
+```
+
+## Common Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `VAR_RESULT` | Return value from commands |
+| `VAR_0x8000-0x800B` | General purpose temps |
+| `VAR_TEMP_0-F` | Cleared on map change |
+| `VAR_LAST_TALKED` | Local ID of last NPC |
+| `VAR_FACING` | Player facing direction |
+
+## Script Debugging
+
+### Common Mistakes
+
+```asm
+@ WRONG: Forgetting step_end
+MapName_Movement_Walk:
+    walk_down
+    walk_down
+    @ Missing step_end causes hang!
+
+@ CORRECT:
+MapName_Movement_Walk:
+    walk_down
+    walk_down
+    step_end
+
+@ WRONG: Using setvar for variable copying
+setvar VAR_TEMP_1, VAR_TEMP_2  @ Sets to literal 0x4001!
+
+@ CORRECT:
+copyvar VAR_TEMP_1, VAR_TEMP_2
+
+@ WRONG: Missing lock/release
+MapName_EventScript_NPC::
+    faceplayer                 @ Player can still move!
+    msgbox Text, MSGBOX_DEFAULT
+    end
+
+@ CORRECT:
+MapName_EventScript_NPC::
+    lock
+    faceplayer
+    msgbox Text, MSGBOX_DEFAULT
+    release
+    end
+```
+
+<LearnMore>
+- [Script VM](/scripting/script-vm) - How scripts are executed
+- [Script Commands](/scripting/script-commands) - Full command reference
+</LearnMore>

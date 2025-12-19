@@ -1,0 +1,338 @@
+---
+title: Memory Map
+description: How Pokemon Emerald organizes and uses GBA memory
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import CodeReference from '../../../components/CodeReference.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The GBA has several distinct memory regions, each with different characteristics. Understanding these is essential for following how pokeemerald manages data.
+
+## Memory Regions Overview
+
+<DiagramContainer title="GBA Memory Architecture">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Fast["Fast Access"]
+        BIOS[BIOS ROM<br/>0x00000000<br/>16 KB]
+        IWRAM[Internal WRAM<br/>0x03000000<br/>32 KB]
+    end
+
+    subgraph Medium["Medium Access"]
+        VRAM[Video RAM<br/>0x06000000<br/>96 KB]
+        OAM[OAM<br/>0x07000000<br/>1 KB]
+        PRAM[Palette RAM<br/>0x05000000<br/>1 KB]
+    end
+
+    subgraph Slow["Slower Access"]
+        EWRAM[External WRAM<br/>0x02000000<br/>256 KB]
+        ROM[Game ROM<br/>0x08000000<br/>32 MB max]
+    end
+
+    subgraph IO["I/O"]
+        IOREG[I/O Registers<br/>0x04000000<br/>1 KB]
+    end`}
+</pre>
+</DiagramContainer>
+
+## IWRAM (Internal Work RAM)
+
+**Address:** `0x03000000` - `0x03007FFF` (32 KB)
+
+The fastest memory on the GBA. Used for:
+- **Stack** - Function call stack
+- **Critical code** - Time-sensitive routines
+- **Interrupt handlers** - Must be fast
+- **Frequently accessed data**
+
+```c
+// Place data in IWRAM
+IWRAM_DATA static u8 sCriticalBuffer[256];
+
+// Place code in IWRAM (runs from fast memory)
+IWRAM_CODE void FastFunction(void);
+```
+
+<LearnMore title="Why is IWRAM faster?" summary="Bus width and wait states">
+IWRAM is connected to the CPU via a 32-bit bus with zero wait states. This means:
+- 32 bits read/written per cycle
+- No waiting for memory
+
+EWRAM uses a 16-bit bus with wait states, making it 2-3x slower for 32-bit operations.
+</LearnMore>
+
+### IWRAM Usage in pokeemerald
+
+| What | Size | Why |
+|------|------|-----|
+| Stack | ~4 KB | Fast function calls |
+| Interrupt handler | ~2 KB | Must execute quickly |
+| Sound mixer buffer | ~1 KB | Real-time audio |
+| Critical variables | Variable | Hot data |
+
+## EWRAM (External Work RAM)
+
+**Address:** `0x02000000` - `0x0203FFFF` (256 KB)
+
+The main working memory. Used for:
+- **Heap** - Dynamic allocations
+- **Large buffers** - Map data, graphics buffers
+- **Save blocks** - Player data
+- **General variables**
+
+```c
+// Place data in EWRAM
+EWRAM_DATA static u8 sLargeBuffer[4096];
+
+// The heap lives here
+void *ptr = Alloc(size);  // Returns EWRAM address
+```
+
+### EWRAM Layout in pokeemerald
+
+<DiagramContainer title="EWRAM Organization">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph EWRAM["EWRAM 256 KB"]
+        direction TB
+        A[Global Variables<br/>~80 KB]
+        B[Save Blocks<br/>~48 KB]
+        C[Pokemon Storage<br/>~33 KB]
+        D[Graphics Buffers<br/>~32 KB]
+        E[Heap<br/>~64 KB]
+    end`}
+</pre>
+</DiagramContainer>
+
+Key EWRAM structures:
+
+```c
+// Save data (player progress)
+EWRAM_DATA struct SaveBlock1 gSaveBlock1 = {0};
+EWRAM_DATA struct SaveBlock2 gSaveBlock2 = {0};
+
+// Pokemon PC storage
+EWRAM_DATA struct PokemonStorage gPokemonStorage = {0};
+
+// Current map data
+EWRAM_DATA struct MapHeader *gMapHeader = NULL;
+```
+
+## VRAM (Video RAM)
+
+**Address:** `0x06000000` - `0x06017FFF` (96 KB)
+
+Stores graphics data that the GPU reads:
+
+<DiagramContainer title="VRAM Layout">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph VRAM["VRAM 96 KB"]
+        direction TB
+        BG["Background Tiles<br/>0x06000000<br/>64 KB"]
+        OBJ["Sprite Tiles<br/>0x06010000<br/>32 KB"]
+    end`}
+</pre>
+</DiagramContainer>
+
+### Background VRAM (64 KB)
+
+Divided into **character blocks** and **screen blocks**:
+
+| Block Type | Size | Purpose |
+|------------|------|---------|
+| Character Block | 16 KB × 4 | Tile pixel data (the actual graphics) |
+| Screen Block | 2 KB × 32 | Tile maps (which tile goes where) |
+
+```c
+// Character block base addresses
+#define BG_CHAR_ADDR(n) (void *)(VRAM + 0x4000 * (n))
+
+// Screen block base addresses
+#define BG_SCREEN_ADDR(n) (void *)(VRAM + 0x800 * (n))
+```
+
+### Object VRAM (32 KB)
+
+Stores sprite tile data. Sprites reference tiles by index:
+
+```c
+// Sprite tile data starts at 0x06010000
+#define OBJ_VRAM0 (VRAM + 0x10000)
+
+// Copy sprite tiles
+CpuCopy16(spriteData, OBJ_VRAM0 + tileNum * 32, size);
+```
+
+<LearnMore title="VRAM access restrictions" summary="Can only write during safe times">
+VRAM can only be safely modified when the GPU isn't reading it:
+- **VBlank** - Between frames (~4ms)
+- **HBlank** - Between scanlines (~1.2μs)
+- **Forced blank** - When display is off
+
+Writing during active display causes visual glitches. Pokeemerald buffers changes and applies them during VBlank.
+</LearnMore>
+
+## Palette RAM
+
+**Address:** `0x05000000` - `0x050003FF` (1 KB)
+
+Stores color definitions (512 colors total):
+
+| Range | Purpose |
+|-------|---------|
+| `0x05000000` - `0x050001FF` | Background palettes (256 colors) |
+| `0x05000200` - `0x050003FF` | Sprite palettes (256 colors) |
+
+Each palette entry is 16 bits (BGR555 format):
+
+```c
+// Color format: 0BBBBBGGGGGRRRRR
+#define RGB(r, g, b) ((r) | ((g) << 5) | ((b) << 10))
+
+// Set background palette entry
+((u16 *)PLTT)[index] = RGB(31, 0, 0);  // Bright red
+```
+
+Palettes are organized as 16 banks of 16 colors each:
+
+```c
+// Palette bank 0, color 5
+u16 color = ((u16 *)PLTT)[0 * 16 + 5];
+
+// Palette bank 3, color 10
+u16 color = ((u16 *)PLTT)[3 * 16 + 10];
+```
+
+## OAM (Object Attribute Memory)
+
+**Address:** `0x07000000` - `0x070003FF` (1 KB)
+
+Stores sprite attributes (not graphics, just properties):
+
+```c
+struct OamData {
+    // Attribute 0
+    u16 y:8;              // Y position
+    u16 affineMode:2;     // Affine transform mode
+    u16 objMode:2;        // Normal/blend/window
+    u16 mosaic:1;
+    u16 bpp:1;            // 4bpp or 8bpp
+    u16 shape:2;          // Square/horizontal/vertical
+
+    // Attribute 1
+    u16 x:9;              // X position
+    u16 affineParam:5;    // Affine matrix index
+    u16 size:2;           // Size within shape
+
+    // Attribute 2
+    u16 tileNum:10;       // Tile index in VRAM
+    u16 priority:2;       // Layer priority
+    u16 paletteNum:4;     // Palette bank
+};
+```
+
+128 entries × 8 bytes = 1 KB
+
+<LearnMore title="OAM double buffering" summary="Why use a buffer?">
+Writing directly to OAM during display can cause sprite flicker. Pokeemerald uses a buffer:
+
+```c
+// gMain.oamBuffer is in EWRAM
+struct OamData gMain.oamBuffer[128];
+
+// During VBlank, copy buffer to OAM
+CpuCopy16(gMain.oamBuffer, OAM, sizeof(gMain.oamBuffer));
+```
+
+This ensures all sprite changes appear atomically.
+</LearnMore>
+
+## ROM (Game Pak)
+
+**Address:** `0x08000000` - `0x0DFFFFFF` (32 MB max)
+
+The game cartridge, containing:
+- Compiled code
+- Graphics (compressed)
+- Music data
+- Pokemon/move/item data
+- Map data
+- Text strings
+
+ROM is **read-only** at runtime. All data modifications happen in RAM.
+
+### ROM Mirroring
+
+The ROM appears at three addresses:
+
+| Address | Wait State Setting |
+|---------|-------------------|
+| `0x08000000` | WS0 (configured at boot) |
+| `0x0A000000` | WS1 |
+| `0x0C000000` | WS2 |
+
+Pokeemerald uses `0x08000000` with optimized wait states.
+
+## I/O Registers
+
+**Address:** `0x04000000` - `0x040003FF`
+
+Hardware control registers. See [I/O Registers](/gba-hardware/io-registers) for details.
+
+## Memory Access Patterns
+
+### Placing Data
+
+The codebase uses attributes to control placement:
+
+```c
+// Fast internal RAM
+IWRAM_DATA static u8 sHotData[64];
+
+// Large external RAM
+EWRAM_DATA static u8 sBigBuffer[4096];
+
+// Read-only in ROM (default for const)
+static const u8 sRomData[] = { ... };
+```
+
+### DMA Transfers
+
+For bulk memory operations, **DMA** (Direct Memory Access) is faster than CPU copies:
+
+```c
+// DMA copy (hardware does the work)
+DmaCopy16(3, src, dest, size);
+
+// CPU copy (software loop)
+CpuCopy16(src, dest, size);
+```
+
+DMA is preferred for:
+- Graphics transfers to VRAM
+- Large buffer copies
+- OAM updates
+
+<CodeReference file="src/dma3_manager.c">
+```c
+// Queue a DMA request (processed during VBlank)
+RequestDma3Copy(src, dest, size, tag, immediate);
+```
+</CodeReference>
+
+## Key Takeaways
+
+1. **IWRAM** - Fast but small (32 KB), use for critical code/data
+2. **EWRAM** - Large but slower (256 KB), main working memory
+3. **VRAM** - Graphics only, update during VBlank
+4. **OAM** - Sprite attributes, buffered for clean updates
+5. **ROM** - Read-only game data, accessed through wait states
+6. **DMA** - Hardware-assisted transfers for efficiency
+
+## Next Steps
+
+- [I/O Registers](/gba-hardware/io-registers) - Control the hardware
+- [DMA](/gba-hardware/dma) - Fast memory transfers
+- [Graphics: Sprites](/gba-hardware/graphics/sprites) - How sprite data flows

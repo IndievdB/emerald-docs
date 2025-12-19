@@ -1,0 +1,696 @@
+---
+title: Field Callbacks
+description: State management, nested callbacks, and field control flow in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The overworld uses a **callback-driven state machine** to manage different field states like walking, interacting with NPCs, opening menus, and scripted cutscenes. This system allows nested states and clean transitions between different gameplay modes.
+
+## Callback Architecture
+
+<DiagramContainer title="Field Callback System">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph MainLoop["Main Loop (60 FPS)"]
+        CB1[gMain.callback1<br/>Per-frame housekeeping]
+        CB2[gMain.callback2<br/>Main state machine]
+    end
+
+    subgraph FieldCallbacks["Field-Specific Callbacks"]
+        FC[gFieldCallback<br/>Map load callback]
+        FC2[gFieldCallback2<br/>Field update override]
+    end
+
+    subgraph States["Field States"]
+        Normal[Normal Gameplay]
+        Menu[Menu Open]
+        Script[Script Running]
+        Cutscene[Cutscene Playing]
+        Transition[Map Transition]
+    end
+
+    CB1 --> CB2
+    CB2 --> FC2
+    FC2 --> States
+
+    FC --> Normal`}
+</pre>
+</DiagramContainer>
+
+## Main Callbacks
+
+The game's main loop calls two callbacks every frame:
+
+### gMain.callback1
+
+Per-frame housekeeping - runs first:
+
+```c
+// Called every frame for input processing
+void CB1_Overworld(void)
+{
+    DoCB1_Overworld(gMain.newKeys, gMain.heldKeys);
+}
+
+static void DoCB1_Overworld(u16 newKeys, u16 heldKeys)
+{
+    struct FieldInput inputStruct;
+
+    // Update player transition state
+    UpdatePlayerAvatarTransitionState();
+
+    // Clear and populate input struct
+    FieldClearPlayerInput(&inputStruct);
+    FieldGetPlayerInput(&inputStruct, newKeys, heldKeys);
+
+    // Process input if controls aren't locked
+    if (!ArePlayerFieldControlsLocked())
+    {
+        if (!ProcessPlayerFieldInput(&inputStruct))
+            PlayerStep(inputStruct.dpadDirection, newKeys, heldKeys);
+    }
+}
+```
+
+### gMain.callback2
+
+Main state machine - runs second:
+
+```c
+// Called every frame for world updates
+void CB2_Overworld(void)
+{
+    // Check for field callback override
+    if (gFieldCallback2 != NULL)
+    {
+        // Use override callback instead of normal update
+        gFieldCallback2();
+    }
+    else
+    {
+        // Normal overworld update
+        OverworldBasic();
+    }
+}
+
+static void OverworldBasic(void)
+{
+    ScriptContext_RunScript();          // Execute map scripts
+    RunTasks();                         // Process all tasks
+    AnimateSprites();                   // Update sprite animations
+    CameraUpdate();                     // Follow player
+    UpdateCameraPanning();              // Smooth camera movement
+    BuildOamBuffer();                   // Prepare sprites for display
+    UpdatePaletteFade();                // Handle fade effects
+    UpdateTilesetAnimations();          // Animate water, flowers
+    DoScheduledBgTilemapCopiesToVram(); // Update background tiles
+}
+```
+
+## Field Callbacks
+
+### gFieldCallback
+
+Called once when entering/loading a map:
+
+```c
+// Function pointer for map load callback
+extern void (*gFieldCallback)(void);
+
+// Called after map loads, before fade-in
+void PerformFieldCallback(void)
+{
+    if (gFieldCallback != NULL)
+    {
+        gFieldCallback();
+        gFieldCallback = NULL;  // Clear after use
+    }
+}
+```
+
+#### Common Field Callbacks
+
+```c
+// Normal map entry - fade in and resume
+void FieldCallback_ReturnToField(void)
+{
+    SetMainCallback2(CB2_Overworld);
+    BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_BLACK);
+}
+
+// Entry from door
+void FieldCallback_DoorWarp(void)
+{
+    // Player walks out of door
+    StartDoorExitAnimation();
+    SetMainCallback2(CB2_Overworld);
+}
+
+// Entry from battle
+void FieldCallback_BattleFinished(void)
+{
+    // Restore field music
+    Overworld_PlaySpecialMapMusic();
+    SetMainCallback2(CB2_Overworld);
+}
+
+// Entry for fly/teleport
+void FieldCallback_FlyIn(void)
+{
+    // Play fly landing animation
+    StartFlyLandingAnimation();
+    SetMainCallback2(CB2_Overworld);
+}
+```
+
+### gFieldCallback2
+
+Override for the main field update loop:
+
+```c
+// Function pointer for field update override
+extern void (*gFieldCallback2)(void);
+
+// Set during special states (cutscenes, menus, etc.)
+void SetFieldCallback2(void (*callback)(void))
+{
+    gFieldCallback2 = callback;
+}
+
+// Clear to return to normal gameplay
+void ClearFieldCallback2(void)
+{
+    gFieldCallback2 = NULL;
+}
+```
+
+<DiagramContainer title="Field Callback Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Main as Main Loop
+    participant CB2 as CB2_Overworld
+    participant FC2 as gFieldCallback2
+    participant Normal as OverworldBasic
+
+    loop Every Frame
+        Main->>CB2: Call callback2
+        alt gFieldCallback2 != NULL
+            CB2->>FC2: Use override
+            FC2->>FC2: Custom logic
+        else gFieldCallback2 == NULL
+            CB2->>Normal: Normal update
+            Normal->>Normal: Scripts, sprites, etc.
+        end
+    end`}
+</pre>
+</DiagramContainer>
+
+## Control Locking
+
+Player controls can be locked during various events:
+
+```c
+// Lock flags
+static u8 sFieldControls;
+
+#define PLAYER_CONTROLLER_LOCKED        (1 << 0)
+#define PLAYER_INTERACTION_LOCKED       (1 << 1)
+#define PLAYER_MOVEMENT_LOCKED          (1 << 2)
+
+// Check if controls are locked
+bool8 ArePlayerFieldControlsLocked(void)
+{
+    return (sFieldControls & PLAYER_CONTROLLER_LOCKED) != 0;
+}
+
+// Lock player controls
+void LockPlayerFieldControls(void)
+{
+    sFieldControls |= PLAYER_CONTROLLER_LOCKED;
+}
+
+// Unlock player controls
+void UnlockPlayerFieldControls(void)
+{
+    sFieldControls &= ~PLAYER_CONTROLLER_LOCKED;
+}
+```
+
+### When Controls Are Locked
+
+<DiagramContainer title="Control Lock States">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> Unlocked: Normal gameplay
+
+    Unlocked --> Locked_Menu: Open menu
+    Unlocked --> Locked_Script: Script starts
+    Unlocked --> Locked_Transition: Map transition
+    Unlocked --> Locked_Dialog: Text box opens
+
+    Locked_Menu --> Unlocked: Close menu
+    Locked_Script --> Unlocked: Script ends
+    Locked_Transition --> Unlocked: Load complete
+    Locked_Dialog --> Unlocked: Text box closes
+
+    note right of Locked_Script: Player input<br/>ignored`}
+</pre>
+</DiagramContainer>
+
+## Script Context
+
+The script system uses its own context for running map scripts:
+
+```c
+struct ScriptContext
+{
+    u8 stackDepth;                      // Call stack depth
+    u8 mode;                            // SCRIPT_MODE_*
+    u8 comparisonResult;                // Last comparison result
+    u8 waitCounter;                     // Frames to wait
+    void *scriptPtr;                    // Current instruction pointer
+    void *stack[20];                    // Call stack
+    void (*nativePtr)(void);            // Native C callback
+    TaskFunc taskCompareFunc;           // Task comparison function
+    u8 taskCompare;                     // Task result
+    u8 data[4];                         // General purpose data
+};
+
+// Script modes
+enum {
+    SCRIPT_MODE_STOPPED,        // No script running
+    SCRIPT_MODE_BYTECODE,       // Running bytecode
+    SCRIPT_MODE_NATIVE,         // Running native function
+};
+```
+
+### Running Scripts
+
+```c
+// Execute one script instruction per frame
+bool8 ScriptContext_RunScript(void)
+{
+    if (sScriptContext.mode == SCRIPT_MODE_STOPPED)
+        return FALSE;
+
+    if (sScriptContext.mode == SCRIPT_MODE_NATIVE)
+    {
+        // Execute native callback
+        if (sScriptContext.nativePtr != NULL)
+        {
+            sScriptContext.nativePtr();
+            return TRUE;
+        }
+        sScriptContext.mode = SCRIPT_MODE_STOPPED;
+        return FALSE;
+    }
+
+    // Execute bytecode
+    while (sScriptContext.mode == SCRIPT_MODE_BYTECODE)
+    {
+        u8 cmdCode = *(u8 *)sScriptContext.scriptPtr;
+        sScriptContext.scriptPtr++;
+
+        // Look up and execute command
+        sScriptCmdTable[cmdCode](&sScriptContext);
+
+        // Check if script needs to yield
+        if (sScriptContext.mode != SCRIPT_MODE_BYTECODE)
+            break;
+    }
+
+    return TRUE;
+}
+```
+
+## Tasks
+
+Tasks provide asynchronous, prioritized execution:
+
+```c
+struct Task
+{
+    TaskFunc func;              // Function to call
+    bool8 isActive;             // Is task running?
+    u8 prev;                    // Previous task in list
+    u8 next;                    // Next task in list
+    u8 priority;                // Execution priority
+    s16 data[16];               // Task-specific data
+};
+
+// Task array
+struct Task gTasks[NUM_TASKS];  // 16 tasks max
+
+// Create a new task
+u8 CreateTask(TaskFunc func, u8 priority)
+{
+    u8 taskId;
+
+    for (taskId = 0; taskId < NUM_TASKS; taskId++)
+    {
+        if (!gTasks[taskId].isActive)
+        {
+            gTasks[taskId].func = func;
+            gTasks[taskId].isActive = TRUE;
+            gTasks[taskId].priority = priority;
+            // Link into priority-sorted list
+            InsertTaskIntoList(taskId);
+            return taskId;
+        }
+    }
+
+    return 0xFF;  // No free slots
+}
+
+// Run all active tasks
+void RunTasks(void)
+{
+    u8 taskId = gFirstActiveTask;
+
+    while (taskId != 0xFF)
+    {
+        if (gTasks[taskId].isActive)
+            gTasks[taskId].func(taskId);
+
+        taskId = gTasks[taskId].next;
+    }
+}
+```
+
+### Common Field Tasks
+
+```c
+// Door opening animation task
+void Task_OpenDoor(u8 taskId)
+{
+    s16 *data = gTasks[taskId].data;
+
+    switch (data[0])  // State
+    {
+    case 0:
+        // Start animation
+        PlaySE(SE_DOOR);
+        data[0]++;
+        break;
+
+    case 1:
+        // Animate door tiles
+        if (AnimateDoorFrame(data[1]++))
+        {
+            // Animation complete
+            DestroyTask(taskId);
+        }
+        break;
+    }
+}
+
+// Fade in/out task
+void Task_HandleFade(u8 taskId)
+{
+    if (!gPaletteFade.active)
+    {
+        // Fade complete
+        DestroyTask(taskId);
+        UnlockPlayerFieldControls();
+    }
+}
+```
+
+## State Transitions
+
+### Entering a Menu
+
+```c
+void OpenStartMenu(void)
+{
+    // Lock controls
+    LockPlayerFieldControls();
+
+    // Set field callback override
+    SetFieldCallback2(FieldCallback_StartMenuUpdate);
+
+    // Create menu task
+    CreateTask(Task_StartMenu, 0);
+
+    // Play sound
+    PlaySE(SE_SELECT);
+}
+
+static void FieldCallback_StartMenuUpdate(void)
+{
+    // Custom update for menu state
+    RunTasks();
+    AnimateSprites();
+    BuildOamBuffer();
+    UpdatePaletteFade();
+}
+
+void CloseStartMenu(void)
+{
+    // Clear callback override
+    ClearFieldCallback2();
+
+    // Unlock controls
+    UnlockPlayerFieldControls();
+
+    // Destroy menu
+    DestroyTask(sStartMenuTaskId);
+}
+```
+
+### Starting a Script
+
+```c
+void StartScript(const u8 *script)
+{
+    // Lock player controls
+    LockPlayerFieldControls();
+
+    // Initialize script context
+    ScriptContext_SetupScript(&sScriptContext, script);
+    sScriptContext.mode = SCRIPT_MODE_BYTECODE;
+}
+
+void EndScript(void)
+{
+    // Stop script execution
+    sScriptContext.mode = SCRIPT_MODE_STOPPED;
+
+    // Unlock player controls
+    UnlockPlayerFieldControls();
+}
+```
+
+### Entering Battle
+
+<DiagramContainer title="Battle Transition Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Field as Field State
+    participant Trans as Transition
+    participant Battle as Battle State
+
+    Field->>Field: LockPlayerFieldControls()
+    Field->>Trans: StartBattleTransition()
+    Trans->>Trans: Play transition effect
+    Trans->>Trans: Fade to black
+
+    Trans->>Battle: SetMainCallback2(CB2_InitBattle)
+    Battle->>Battle: Initialize battle
+
+    Note over Battle: Battle runs...
+
+    Battle->>Trans: Battle ends
+    Trans->>Trans: SetMainCallback2(CB2_ReturnToField)
+    Trans->>Trans: gFieldCallback = BattleFinished
+
+    Trans->>Field: Load field state
+    Field->>Field: PerformFieldCallback()
+    Field->>Field: UnlockPlayerFieldControls()`}
+</pre>
+</DiagramContainer>
+
+```c
+void DoBattleTransition(void)
+{
+    // Lock controls
+    LockPlayerFieldControls();
+
+    // Save field state
+    SaveFieldState();
+
+    // Start transition
+    CreateTask(Task_BattleTransition, 0);
+}
+
+static void Task_BattleTransition(u8 taskId)
+{
+    s16 *data = gTasks[taskId].data;
+
+    switch (data[0])
+    {
+    case 0:
+        // Play transition animation
+        StartBattleTransitionAnim(data[1]);
+        data[0]++;
+        break;
+
+    case 1:
+        // Wait for animation
+        if (IsBattleTransitionDone())
+        {
+            DestroyTask(taskId);
+            // Switch to battle callback
+            SetMainCallback2(CB2_InitBattle);
+        }
+        break;
+    }
+}
+```
+
+## VBlank Callback
+
+The VBlank interrupt handler for the overworld:
+
+```c
+void VBlankCB_Overworld(void)
+{
+    // Transfer sprite data to OAM
+    LoadOam();
+
+    // Process DMA transfers
+    ProcessSpriteCopyRequests();
+
+    // Update scroll registers
+    SetGpuReg(REG_OFFSET_BG0HOFS, gBattle_BG0_X);
+    SetGpuReg(REG_OFFSET_BG0VOFS, gBattle_BG0_Y);
+    // ... other BG registers
+
+    // Copy palette data
+    TransferPlttBuffer();
+
+    // Increment frame counter
+    gMain.vblankCounter1++;
+}
+```
+
+<LearnMore title="Why VBlank?" summary="Safe graphics updates">
+VBlank (Vertical Blank) is the period when the display isn't drawing. During this time:
+
+- OAM (sprite) data can be safely written
+- VRAM can be updated without visual glitches
+- Palette changes take effect immediately
+
+All GBA games use VBlank for graphics updates to avoid screen tearing.
+</LearnMore>
+
+## Callback Chains
+
+Some operations use callback chains for complex sequences:
+
+```c
+// Set callback chain for warp sequence
+void SetupWarpCallbackChain(void)
+{
+    // 1. First: fade out
+    gFieldCallback2 = FieldCB_FadeOut;
+}
+
+static void FieldCB_FadeOut(void)
+{
+    if (!gPaletteFade.active)
+    {
+        // 2. Next: unload map
+        gFieldCallback2 = FieldCB_UnloadMap;
+    }
+    else
+    {
+        UpdatePaletteFade();
+    }
+}
+
+static void FieldCB_UnloadMap(void)
+{
+    UnloadCurrentMap();
+
+    // 3. Next: load new map
+    gFieldCallback2 = FieldCB_LoadMap;
+}
+
+static void FieldCB_LoadMap(void)
+{
+    LoadNewMap();
+
+    // 4. Next: fade in
+    gFieldCallback2 = FieldCB_FadeIn;
+}
+
+static void FieldCB_FadeIn(void)
+{
+    if (!gPaletteFade.active)
+    {
+        // Done - return to normal
+        ClearFieldCallback2();
+        UnlockPlayerFieldControls();
+    }
+    else
+    {
+        UpdatePaletteFade();
+    }
+}
+```
+
+<DiagramContainer title="Callback Chain Example">
+<pre class="mermaid">
+{`flowchart LR
+    Start[Start Warp] --> CB1[FieldCB_FadeOut]
+    CB1 -->|Fade done| CB2[FieldCB_UnloadMap]
+    CB2 -->|Unloaded| CB3[FieldCB_LoadMap]
+    CB3 -->|Loaded| CB4[FieldCB_FadeIn]
+    CB4 -->|Fade done| End[Clear Callback]`}
+</pre>
+</DiagramContainer>
+
+## Debug/Developer Callbacks
+
+For testing and development:
+
+```c
+#ifdef DEBUG
+// Debug menu callback
+void FieldCallback_DebugMenu(void)
+{
+    // Override normal field update
+    if (gMain.newKeys & L_BUTTON)
+    {
+        OpenDebugMenu();
+    }
+
+    // Still run normal update
+    OverworldBasic();
+}
+
+void SetDebugCallback(void)
+{
+    SetFieldCallback2(FieldCallback_DebugMenu);
+}
+#endif
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `CB1_Overworld()` | overworld.c | Per-frame input processing |
+| `CB2_Overworld()` | overworld.c | Main field state machine |
+| `OverworldBasic()` | overworld.c | Normal field update |
+| `SetFieldCallback2()` | overworld.c | Set update override |
+| `ClearFieldCallback2()` | overworld.c | Clear update override |
+| `LockPlayerFieldControls()` | field_control_avatar.c | Lock player input |
+| `UnlockPlayerFieldControls()` | field_control_avatar.c | Unlock player input |
+| `ScriptContext_RunScript()` | script.c | Execute script bytecode |
+| `CreateTask()` | task.c | Create async task |
+| `RunTasks()` | task.c | Execute all tasks |
+| `VBlankCB_Overworld()` | overworld.c | VBlank interrupt handler |

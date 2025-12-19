@@ -1,0 +1,790 @@
+---
+title: Battle Controllers
+description: The controller abstraction pattern that unifies player, AI, and multiplayer battles
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The **controller system** is one of Pokemon Emerald's most elegant architectural patterns. It abstracts away *who* is controlling a Pokemon, allowing the same battle code to work for human players, AI trainers, link cable opponents, and special battle modes like Safari Zone.
+
+## The Controller Pattern
+
+<DiagramContainer title="Controller Architecture">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph BattleEngine[Battle Engine]
+        Main[battle_main.c]
+        Script[Battle Scripts]
+    end
+
+    subgraph Interface[Controller Interface]
+        Emit[BtlController_Emit*<br/>Send commands]
+        Exec[MarkBattlerForControllerExec<br/>Queue execution]
+        Buffer[gBattleResources->bufferA/B<br/>Response data]
+    end
+
+    subgraph Controllers[Controller Implementations]
+        Player[PlayerController<br/>Human input]
+        Opponent[OpponentController<br/>AI decisions]
+        Link[LinkController<br/>Remote player]
+        Safari[SafariController<br/>Safari Zone]
+        Wally[WallyController<br/>Tutorial]
+        Recorded[RecordedController<br/>Playback]
+    end
+
+    Main -->|Commands| Interface
+    Interface -->|Route to| Controllers
+    Controllers -->|Responses| Buffer
+    Buffer -->|Read by| Main`}
+</pre>
+</DiagramContainer>
+
+## How Controllers Work
+
+### Command Flow
+
+When the battle engine needs input (like "choose a move"), it:
+1. Calls an `Emit` function to encode the request
+2. Marks the battler for controller execution
+3. The controller processes the request (show menu, calculate AI, wait for link, etc.)
+4. Response is stored in a buffer
+5. Engine reads the response and continues
+
+```c
+// Battle engine requesting an action choice
+void RequestActionChoice(u8 battler)
+{
+    // Encode the request into buffer
+    BtlController_EmitChooseAction(
+        battler,
+        BUFFER_A,
+        gChosenActionByBattler[battler],
+        gBattleResources->bufferB[battler]
+    );
+
+    // Mark for execution - controller will process this
+    MarkBattlerForControllerExec(battler);
+}
+```
+
+### Controller Function Table
+
+Each controller type has a table of 59 functions - one for each possible command:
+
+```c
+// Function pointer type for controller commands
+typedef void (*BattlerControllerFunc)(u32 battler);
+
+// Player controller function table
+static void (*const sPlayerControllerFuncs[])(u32 battler) = {
+    [CONTROLLER_GETMONDATA]         = PlayerHandleGetMonData,
+    [CONTROLLER_SETMONDATA]         = PlayerHandleSetMonData,
+    [CONTROLLER_SETRAWMONDATA]      = PlayerHandleSetRawMonData,
+    [CONTROLLER_LOADMONSPRITE]      = PlayerHandleLoadMonSprite,
+    [CONTROLLER_RETURNMONTOBALL]    = PlayerHandleReturnMonToBall,
+    [CONTROLLER_DRAWTRACKERINFO]    = PlayerHandleDrawTrackerInfo,
+    [CONTROLLER_DRAWTRAINERBALL]    = PlayerHandleDrawTrainerBall,
+    [CONTROLLER_TRAINERSLIDE]       = PlayerHandleTrainerSlide,
+    [CONTROLLER_TRAINERSLIDEBACK]   = PlayerHandleTrainerSlideBack,
+    [CONTROLLER_INTROTRAINERBALLTHROW] = PlayerHandleIntroTrainerBallThrow,
+    [CONTROLLER_CHOOSEACTION]       = PlayerHandleChooseAction,
+    [CONTROLLER_CHOOSEMOVE]         = PlayerHandleChooseMove,
+    [CONTROLLER_OPENBAG]            = PlayerHandleOpenBag,
+    [CONTROLLER_CHOOSEPOKEMON]      = PlayerHandleChoosePokemon,
+    [CONTROLLER_CHOOSEMOVE2]        = PlayerHandleChooseMove2,
+    [CONTROLLER_HEALTHBARUPDATE]    = PlayerHandleHealthBarUpdate,
+    [CONTROLLER_EXPUPDATE]          = PlayerHandleExpUpdate,
+    [CONTROLLER_STATUSANIMATION]    = PlayerHandleStatusAnimation,
+    [CONTROLLER_MOVEANIMATION]      = PlayerHandleMoveAnimation,
+    [CONTROLLER_PRINTSTRING]        = PlayerHandlePrintString,
+    [CONTROLLER_PRINTSTRINGPLAYERONLY] = PlayerHandlePrintStringPlayerOnly,
+    // ... 38 more commands
+    [CONTROLLER_ENDLINKBATTLE]      = PlayerHandleEndLinkBattle,
+    [CONTROLLER_DEBUGMENU]          = PlayerHandleDebugMenu,
+};
+```
+
+<LearnMore title="Why 59 commands?" summary="Complete battle control">
+The controller interface covers everything a battler might need to do:
+
+- **Data access**: Get/set Pokemon data (stats, HP, status, etc.)
+- **Graphics**: Load sprites, play animations, draw HP bars
+- **Input**: Choose actions, moves, items, switch targets
+- **UI**: Show messages, status effects, experience gains
+- **Special**: Handle link disconnects, battle recordings, debug
+
+This comprehensive interface means the battle engine never needs to know *how* these things happen - just that they will.
+</LearnMore>
+
+### Executing Commands
+
+```c
+// Called each frame to process pending controller commands
+void BattleControllerExec(void)
+{
+    u8 battler;
+
+    // Process each battler with pending commands
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        if (gBattleControllerExecFlags & (1 << battler))
+        {
+            // Get this battler's controller type
+            u8 controllerId = gBattlerControllerFuncs[battler];
+
+            // Read command from buffer
+            u8 cmd = gBattleResources->bufferA[battler][0];
+
+            // Execute appropriate handler
+            sControllerFuncs[controllerId][cmd](battler);
+        }
+    }
+}
+```
+
+## Controller Types
+
+### Player Controller
+
+Handles human player input through menus:
+
+<DiagramContainer title="Player Controller Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Engine as Battle Engine
+    participant Ctrl as PlayerController
+    participant Menu as Menu System
+    participant Player as Human Player
+
+    Engine->>Ctrl: EmitChooseAction()
+    Ctrl->>Menu: ShowActionMenu()
+    Menu->>Player: Display Fight/Bag/Pokemon/Run
+
+    Player->>Menu: Select "Fight"
+    Menu->>Ctrl: ACTION_USE_MOVE
+
+    Ctrl->>Menu: ShowMoveMenu()
+    Menu->>Player: Display 4 moves
+
+    Player->>Menu: Select "Thunderbolt"
+    Menu->>Ctrl: Move selected
+
+    Ctrl->>Engine: Store in bufferB
+    Ctrl->>Engine: Clear exec flag`}
+</pre>
+</DiagramContainer>
+
+```c
+// Player choosing an action
+static void PlayerHandleChooseAction(u32 battler)
+{
+    // Start the action selection menu task
+    gBattlerControllerFuncs[battler] = HandleChooseActionTask;
+
+    // Create the Fight/Bag/Pokemon/Run menu
+    BattlePutTextOnWindow(gText_BattleMenu, B_WIN_ACTION_MENU);
+
+    // Initialize menu state
+    gActionSelectionCursor[battler] = 0;
+    gMoveSelectionCursor[battler] = 0;
+}
+
+static void HandleChooseActionTask(u32 battler)
+{
+    // Process D-pad input
+    if (JOY_NEW(DPAD_UP | DPAD_DOWN | DPAD_LEFT | DPAD_RIGHT))
+    {
+        // Move cursor
+        UpdateActionMenuCursor();
+        PlaySE(SE_SELECT);
+    }
+
+    if (JOY_NEW(A_BUTTON))
+    {
+        // Action selected
+        switch (gActionSelectionCursor[battler])
+        {
+        case 0: // Fight
+            gChosenActionByBattler[battler] = B_ACTION_USE_MOVE;
+            gBattlerControllerFuncs[battler] = HandleChooseMoveTask;
+            break;
+
+        case 1: // Bag
+            gChosenActionByBattler[battler] = B_ACTION_USE_ITEM;
+            PlayerControllerSwitchToBag(battler);
+            break;
+
+        case 2: // Pokemon
+            gChosenActionByBattler[battler] = B_ACTION_SWITCH;
+            PlayerControllerSwitchToParty(battler);
+            break;
+
+        case 3: // Run
+            gChosenActionByBattler[battler] = B_ACTION_RUN;
+            PlayerControllerFinishChoice(battler);
+            break;
+        }
+    }
+
+    if (JOY_NEW(B_BUTTON))
+    {
+        // In doubles, go back to partner's choice
+        if (gBattleTypeFlags & BATTLE_TYPE_DOUBLE)
+            HandleGoBackToPartner(battler);
+    }
+}
+```
+
+### Opponent Controller
+
+The AI trainer controller - calculates best moves without showing menus:
+
+```c
+// Opponent choosing an action
+static void OpponentHandleChooseAction(u32 battler)
+{
+    // AI always chooses to use a move (trainers don't use items/run normally)
+    gChosenActionByBattler[battler] = B_ACTION_USE_MOVE;
+
+    // Let AI pick the best move
+    BtlController_EmitTwoReturnValues(
+        battler,
+        BUFFER_B,
+        10,
+        B_ACTION_USE_MOVE
+    );
+
+    OpponentBufferExecCompleted(battler);
+}
+
+// Opponent choosing which move to use
+static void OpponentHandleChooseMove(u32 battler)
+{
+    u16 chosenMove;
+
+    // Run AI scoring system
+    chosenMove = BattleAI_ChooseMoveOrAction();
+
+    // Store the decision
+    gBattleStruct->chosenMovePositions[battler] = chosenMove;
+    gChosenMoveByBattler[battler] = gBattleMons[battler].moves[chosenMove];
+
+    // Return to engine
+    BtlController_EmitTwoReturnValues(
+        battler,
+        BUFFER_B,
+        10,
+        chosenMove | (gBattleStruct->moveTarget[battler] << 8)
+    );
+
+    OpponentBufferExecCompleted(battler);
+}
+```
+
+<DiagramContainer title="AI Decision Flow">
+<pre class="mermaid">
+{`flowchart TB
+    Start[OpponentHandleChooseMove] --> AI[BattleAI_ChooseMoveOrAction]
+
+    subgraph AIScoring[AI Scoring System]
+        Score1[Score Move 1]
+        Score2[Score Move 2]
+        Score3[Score Move 3]
+        Score4[Score Move 4]
+    end
+
+    AI --> AIScoring
+    AIScoring --> Best[Select Best Score]
+    Best --> Return[Return Move Choice]
+    Return --> Engine[Back to Battle Engine]`}
+</pre>
+</DiagramContainer>
+
+### Link Controller
+
+Handles multiplayer battles over link cable:
+
+```c
+// Link controller - wait for remote player's choice
+static void LinkPartnerHandleChooseAction(u32 battler)
+{
+    // Signal that we're waiting for link data
+    gBattlerControllerFuncs[battler] = WaitForLinkActionData;
+
+    // Request link data
+    PrepareLinkBattleData(battler, LINK_REQUEST_ACTION);
+}
+
+static void WaitForLinkActionData(u32 battler)
+{
+    // Check if link data arrived
+    if (HasLinkDataArrived(battler))
+    {
+        // Extract action from link buffer
+        u8 action = gLinkBattleBuffer[battler].action;
+        gChosenActionByBattler[battler] = action;
+
+        // Signal completion
+        LinkControllerExecCompleted(battler);
+    }
+    else
+    {
+        // Still waiting - check for timeout/disconnect
+        if (HasLinkTimedOut())
+        {
+            HandleLinkDisconnect();
+        }
+    }
+}
+```
+
+<DiagramContainer title="Link Battle Communication">
+<pre class="mermaid">
+{`flowchart LR
+    GBA1[Player 1] -->|Send action| Link[Link Cable]
+    GBA2[Player 2] -->|Send action| Link
+    Link -->|P1 choice| GBA2
+    Link -->|P2 choice| GBA1`}
+</pre>
+</DiagramContainer>
+
+### Safari Controller
+
+Safari Zone has limited actions - no fighting or party access:
+
+```c
+// Safari controller command table - many are empty
+static void (*const sSafariControllerFuncs[])(u32 battler) = {
+    [CONTROLLER_CHOOSEACTION]    = SafariHandleChooseAction,
+    [CONTROLLER_CHOOSEMOVE]      = SafariHandleChooseMove,     // Empty
+    [CONTROLLER_OPENBAG]         = SafariHandleOpenBag,        // Empty
+    [CONTROLLER_CHOOSEPOKEMON]   = SafariHandleChoosePokemon,  // Empty
+    // Most handlers just call SafariBufferExecCompleted
+};
+
+static void SafariHandleChooseAction(u32 battler)
+{
+    // Show Safari-specific menu
+    // Ball / Bait / Rock / Run (no Fight or Pokemon options)
+    gBattlerControllerFuncs[battler] = HandleSafariMenuInput;
+
+    BattlePutTextOnWindow(gText_SafariMenu, B_WIN_ACTION_MENU);
+}
+
+static void HandleSafariMenuInput(u32 battler)
+{
+    if (JOY_NEW(A_BUTTON))
+    {
+        switch (gActionSelectionCursor[battler])
+        {
+        case 0: // Ball
+            gChosenActionByBattler[battler] = B_ACTION_SAFARI_BALL;
+            break;
+
+        case 1: // Bait
+            gChosenActionByBattler[battler] = B_ACTION_SAFARI_BAIT;
+            break;
+
+        case 2: // Rock
+            gChosenActionByBattler[battler] = B_ACTION_SAFARI_GO_NEAR;
+            break;
+
+        case 3: // Run
+            gChosenActionByBattler[battler] = B_ACTION_SAFARI_RUN;
+            break;
+        }
+
+        SafariBufferExecCompleted(battler);
+    }
+}
+```
+
+### Wally Controller
+
+Special controller for the Wally tutorial battle:
+
+```c
+// Wally's actions are scripted, not AI-controlled
+static void WallyHandleChooseAction(u32 battler)
+{
+    // Wally always throws a ball in the tutorial
+    gChosenActionByBattler[battler] = B_ACTION_WALLY_THROW;
+
+    WallyBufferExecCompleted(battler);
+}
+
+static void WallyHandleChooseMove(u32 battler)
+{
+    // Wally doesn't choose moves - this shouldn't be called
+    // But if it is, just use the first move
+    gChosenMoveByBattler[battler] = gBattleMons[battler].moves[0];
+
+    WallyBufferExecCompleted(battler);
+}
+```
+
+### Recorded Controller
+
+For Battle Tower recordings and playback:
+
+```c
+// Recorded battle - read actions from save data
+static void RecordedOpponentHandleChooseAction(u32 battler)
+{
+    // Get action from recording data
+    u8 recordedAction = GetRecordedAction(gBattleStruct->recordedBattleTurn);
+
+    gChosenActionByBattler[battler] = recordedAction;
+
+    RecordedBufferExecCompleted(battler);
+}
+
+static void RecordedOpponentHandleChooseMove(u32 battler)
+{
+    // Get move choice from recording
+    u8 recordedMove = GetRecordedMove(gBattleStruct->recordedBattleTurn);
+
+    gChosenMoveByBattler[battler] = gBattleMons[battler].moves[recordedMove];
+    gBattleStruct->chosenMovePositions[battler] = recordedMove;
+
+    RecordedBufferExecCompleted(battler);
+}
+```
+
+## Controller Assignment
+
+Controllers are assigned based on battle type and position:
+
+```c
+void SetBattlerControllerFuncs(void)
+{
+    u8 battler;
+
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        u8 position = GetBattlerPosition(battler);
+
+        if (gBattleTypeFlags & BATTLE_TYPE_SAFARI)
+        {
+            // Safari Zone
+            if (position == B_POSITION_PLAYER_LEFT)
+                gBattlerControllerFuncs[battler] = SetControllerToSafari;
+            else
+                gBattlerControllerFuncs[battler] = SetControllerToOpponent;
+        }
+        else if (gBattleTypeFlags & BATTLE_TYPE_WALLY_TUTORIAL)
+        {
+            // Wally catching Ralts
+            if (position == B_POSITION_PLAYER_LEFT)
+                gBattlerControllerFuncs[battler] = SetControllerToWally;
+            else
+                gBattlerControllerFuncs[battler] = SetControllerToOpponent;
+        }
+        else if (gBattleTypeFlags & BATTLE_TYPE_LINK)
+        {
+            // Link battle
+            SetControllerForLinkBattle(battler, position);
+        }
+        else if (gBattleTypeFlags & BATTLE_TYPE_RECORDED)
+        {
+            // Battle recording playback
+            SetControllerForRecordedBattle(battler, position);
+        }
+        else
+        {
+            // Normal battle
+            if (GetBattlerSide(battler) == B_SIDE_PLAYER)
+                gBattlerControllerFuncs[battler] = SetControllerToPlayer;
+            else
+                gBattlerControllerFuncs[battler] = SetControllerToOpponent;
+        }
+    }
+}
+```
+
+<DiagramContainer title="Controller Assignment">
+<pre class="mermaid">
+{`flowchart TB
+    Start[SetBattlerControllerFuncs] --> Type{Battle Type?}
+
+    Type -->|Safari| Safari[Safari Controller]
+    Type -->|Wally Tutorial| Wally[Wally Controller]
+    Type -->|Link Battle| Link{Position?}
+    Type -->|Recorded| Recorded[Recorded Controller]
+    Type -->|Normal| Normal{Side?}
+
+    Link -->|Local Player| LinkPlayer[Player Controller]
+    Link -->|Remote Player| LinkOpponent[Link Controller]
+
+    Normal -->|Player Side| Player[Player Controller]
+    Normal -->|Opponent Side| Opponent[Opponent Controller]`}
+</pre>
+</DiagramContainer>
+
+## Emit Functions
+
+The battle engine communicates with controllers through emit functions:
+
+### Core Emit Functions
+
+```c
+// Request action choice (Fight/Bag/Pokemon/Run)
+void BtlController_EmitChooseAction(
+    u8 battler,
+    u8 bufferId,
+    u8 defaultAction,
+    u8 *battleStatus)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_CHOOSEACTION;
+    gBattleResources->bufferA[battler][1] = defaultAction;
+    memcpy(&gBattleResources->bufferA[battler][2], battleStatus, sizeof(struct BattleStatus));
+}
+
+// Request move choice
+void BtlController_EmitChooseMove(
+    u8 battler,
+    u8 bufferId,
+    bool8 isDoubleBattle,
+    bool8 NoPpNumber,
+    struct ChooseMoveStruct *moveInfo)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_CHOOSEMOVE;
+    gBattleResources->bufferA[battler][1] = isDoubleBattle;
+    gBattleResources->bufferA[battler][2] = NoPpNumber;
+    memcpy(&gBattleResources->bufferA[battler][4], moveInfo, sizeof(struct ChooseMoveStruct));
+}
+
+// Request Pokemon selection (for switching)
+void BtlController_EmitChoosePokemon(
+    u8 battler,
+    u8 bufferId,
+    u8 promptType,
+    u8 abilityId,
+    u8 *disabledPokemon)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_CHOOSEPOKEMON;
+    gBattleResources->bufferA[battler][1] = promptType;
+    gBattleResources->bufferA[battler][2] = abilityId;
+    memcpy(&gBattleResources->bufferA[battler][3], disabledPokemon, PARTY_SIZE);
+}
+```
+
+### Animation Emits
+
+```c
+// Play move animation
+void BtlController_EmitMoveAnimation(
+    u8 battler,
+    u8 bufferId,
+    u16 move,
+    u8 turnOfMove,
+    u16 movePower,
+    s32 dmg,
+    u8 friendship,
+    struct DisableStruct *disableInfo,
+    u8 multihit)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_MOVEANIMATION;
+    gBattleResources->bufferA[battler][1] = move;
+    gBattleResources->bufferA[battler][2] = move >> 8;
+    gBattleResources->bufferA[battler][3] = turnOfMove;
+    gBattleResources->bufferA[battler][4] = movePower;
+    gBattleResources->bufferA[battler][5] = movePower >> 8;
+    gBattleResources->bufferA[battler][6] = dmg;
+    gBattleResources->bufferA[battler][7] = dmg >> 8;
+    gBattleResources->bufferA[battler][8] = dmg >> 16;
+    gBattleResources->bufferA[battler][9] = dmg >> 24;
+    // ... more data
+}
+
+// Update HP bar
+void BtlController_EmitHealthBarUpdate(
+    u8 battler,
+    u8 bufferId,
+    u16 hpValue)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_HEALTHBARUPDATE;
+    gBattleResources->bufferA[battler][1] = hpValue;
+    gBattleResources->bufferA[battler][2] = hpValue >> 8;
+}
+```
+
+### Status and Info Emits
+
+```c
+// Print battle message
+void BtlController_EmitPrintString(
+    u8 battler,
+    u8 bufferId,
+    u16 stringId)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_PRINTSTRING;
+    gBattleResources->bufferA[battler][1] = stringId;
+    gBattleResources->bufferA[battler][2] = stringId >> 8;
+}
+
+// Play status animation (paralysis sparks, poison bubbles, etc.)
+void BtlController_EmitStatusAnimation(
+    u8 battler,
+    u8 bufferId,
+    bool8 status2,
+    u32 status)
+{
+    gBattleResources->bufferA[battler][0] = CONTROLLER_STATUSANIMATION;
+    gBattleResources->bufferA[battler][1] = status2;
+    gBattleResources->bufferA[battler][2] = status;
+    gBattleResources->bufferA[battler][3] = status >> 8;
+    gBattleResources->bufferA[battler][4] = status >> 16;
+    gBattleResources->bufferA[battler][5] = status >> 24;
+}
+```
+
+## Execution Completion
+
+When a controller finishes processing, it signals completion:
+
+```c
+// Generic completion for player controller
+static void PlayerBufferExecCompleted(u32 battler)
+{
+    // Clear this battler's execution flag
+    gBattleControllerExecFlags &= ~(1 << battler);
+
+    // Reset to idle function
+    gBattlerControllerFuncs[battler] = PlayerBufferRunCommand;
+}
+
+// Generic completion for opponent controller
+static void OpponentBufferExecCompleted(u32 battler)
+{
+    gBattleControllerExecFlags &= ~(1 << battler);
+    gBattlerControllerFuncs[battler] = OpponentBufferRunCommand;
+}
+
+// Check if all controllers are done
+bool8 AllControllersFinished(void)
+{
+    return (gBattleControllerExecFlags == 0);
+}
+```
+
+## Controller Data Buffers
+
+Each battler has two buffers for communication:
+
+```c
+// In gBattleResources
+struct BattleResources
+{
+    u8 *bufferA[MAX_BATTLERS_COUNT];  // Commands TO controller
+    u8 *bufferB[MAX_BATTLERS_COUNT];  // Responses FROM controller
+    // ... other resources
+};
+
+// Buffer sizes
+#define BATTLE_BUFFER_SIZE 0x200  // 512 bytes each
+```
+
+<DiagramContainer title="Buffer Communication">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Engine[Battle Engine]
+        Write[Write Command]
+        Read[Read Response]
+    end
+
+    subgraph BufferA[Buffer A]
+        Cmd[Command Data]
+        Args[Arguments]
+    end
+
+    subgraph Controller[Controller]
+        Process[Process Command]
+        Decide[Make Decision]
+    end
+
+    subgraph BufferB[Buffer B]
+        Response[Response Data]
+        Choice[Choice Made]
+    end
+
+    Write --> Cmd
+    Cmd --> Process
+    Process --> Decide
+    Decide --> Response
+    Response --> Read`}
+</pre>
+</DiagramContainer>
+
+## Complete Controller Commands
+
+| Command ID | Name | Purpose |
+|------------|------|---------|
+| 0 | CONTROLLER_GETMONDATA | Read Pokemon data |
+| 1 | CONTROLLER_SETMONDATA | Write Pokemon data |
+| 2 | CONTROLLER_SETRAWMONDATA | Write raw bytes |
+| 3 | CONTROLLER_LOADMONSPRITE | Load Pokemon sprite |
+| 4 | CONTROLLER_RETURNMONTOBALL | Return animation |
+| 5 | CONTROLLER_DRAWTRACKERINFO | Draw tracker info |
+| 6 | CONTROLLER_DRAWTRAINERBALL | Draw trainer's ball |
+| 10 | CONTROLLER_INTROTRAINERBALLTHROW | Ball throw intro |
+| 12 | CONTROLLER_CHOOSEACTION | Choose Fight/Bag/etc. |
+| 13 | CONTROLLER_CHOOSEMOVE | Choose which move |
+| 14 | CONTROLLER_OPENBAG | Open bag menu |
+| 15 | CONTROLLER_CHOOSEPOKEMON | Choose Pokemon to switch |
+| 17 | CONTROLLER_HEALTHBARUPDATE | Animate HP change |
+| 18 | CONTROLLER_EXPUPDATE | Animate EXP gain |
+| 19 | CONTROLLER_STATUSANIMATION | Status effect anim |
+| 21 | CONTROLLER_MOVEANIMATION | Play move animation |
+| 22 | CONTROLLER_PRINTSTRING | Show message |
+| 42 | CONTROLLER_FAINTANIMATION | Faint animation |
+| 45 | CONTROLLER_PLAYFANFAREORBGM | Play victory music |
+| 50 | CONTROLLER_LINKSTANDBYMSG | "Waiting for link..." |
+| 52 | CONTROLLER_ENDLINKBATTLE | End link battle |
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `SetBattlerControllerFuncs()` | battle_controllers.c | Assign controllers |
+| `BattleControllerExec()` | battle_controllers.c | Process commands |
+| `MarkBattlerForControllerExec()` | battle_controllers.c | Queue execution |
+| `BtlController_EmitChooseAction()` | battle_controllers.c | Request action |
+| `BtlController_EmitChooseMove()` | battle_controllers.c | Request move choice |
+| `BtlController_EmitMoveAnimation()` | battle_controllers.c | Play animation |
+| `PlayerHandleChooseAction()` | battle_controller_player.c | Player menu |
+| `OpponentHandleChooseAction()` | battle_controller_opponent.c | AI decision |
+
+## Extending the System
+
+Adding a new controller type requires:
+
+1. Create new file `battle_controller_mytype.c`
+2. Define function table with 59 handlers
+3. Add assignment logic in `SetBattlerControllerFuncs()`
+
+```c
+// Example: Custom controller skeleton
+static void MyTypeBufferRunCommand(u32 battler)
+{
+    // Called each frame when idle
+    if (gBattleControllerExecFlags & (1 << battler))
+    {
+        u8 cmd = gBattleResources->bufferA[battler][0];
+        sMyTypeControllerFuncs[cmd](battler);
+    }
+}
+
+static void MyTypeHandleChooseAction(u32 battler)
+{
+    // Custom action selection logic
+    gChosenActionByBattler[battler] = DecideMyAction(battler);
+    MyTypeBufferExecCompleted(battler);
+}
+
+static void (*const sMyTypeControllerFuncs[])(u32 battler) = {
+    [CONTROLLER_CHOOSEACTION] = MyTypeHandleChooseAction,
+    // ... fill in all 59 handlers
+};
+```

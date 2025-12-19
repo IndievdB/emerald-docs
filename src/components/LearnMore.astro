@@ -1,0 +1,31 @@
+---
+interface Props {
+	title: string;
+	summary?: string;
+}
+
+const { title, summary } = Astro.props;
+---
+
+<details class="learn-more">
+	<summary>
+		<span class="learn-more-icon">+</span>
+		<span class="learn-more-title">{title}</span>
+		{summary && <span class="learn-more-summary">- {summary}</span>}
+	</summary>
+	<div class="learn-more-content">
+		<slot />
+	</div>
+</details>
+
+<script>
+	// Update icon on toggle
+	document.querySelectorAll('.learn-more').forEach(details => {
+		details.addEventListener('toggle', () => {
+			const icon = details.querySelector('.learn-more-icon');
+			if (icon) {
+				icon.textContent = details.open ? '-' : '+';
+			}
+		});
+	});
+</script>

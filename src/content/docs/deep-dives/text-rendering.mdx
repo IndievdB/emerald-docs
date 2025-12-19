@@ -1,0 +1,586 @@
+---
+title: "Deep Dive: Text Rendering"
+description: Text and font system in pokeemerald - printers, fonts, and control codes
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald's text system handles rendering variable-width fonts, text boxes, scrolling, and special effects. It supports multiple fonts, colors, and control codes for dynamic text behavior.
+
+## Architecture Overview
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Input["Text Input"]
+        String["Raw String<br/>with control codes"]
+        Script["Script Command"]
+    end
+
+    subgraph System["Text System"]
+        Printer["Text Printer"]
+        Font["Font Handler"]
+        Window["Window System"]
+    end
+
+    subgraph Output["Rendering"]
+        Tilemap["BG Tilemap"]
+        VRAM["Character VRAM"]
+    end
+
+    String --> Printer
+    Script --> Printer
+    Printer --> Font
+    Font --> Window
+    Window --> Tilemap
+    Window --> VRAM
+
+    style Printer fill:#9f9,stroke:#333,color:#000
+    style Font fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Text Printer Structure
+
+```c
+struct TextPrinter
+{
+    struct TextPrinterTemplate printerTemplate;
+
+    // State
+    u8 state;                    // Printer state machine
+    u8 textSpeed;                // Characters per frame
+    u8 delayCounter;             // Delay timer
+    u8 scrollDistance;           // Scroll animation progress
+
+    // Current position
+    u8 fontId;                   // Active font
+    u8 *currentChar;             // Pointer into text string
+
+    // Rendering state
+    u8 fgColor;                  // Foreground color
+    u8 bgColor;                  // Background color
+    u8 shadowColor;              // Shadow color
+
+    // Substate data
+    u8 subState;
+    u8 subStructSize;
+    struct SubPrinter subPrinter;
+};
+
+struct TextPrinterTemplate
+{
+    const u8 *currentChar;       // Text to print
+    u8 windowId;                 // Target window
+    u8 fontId;                   // Font to use
+    u8 x;                        // Start X position
+    u8 y;                        // Start Y position
+    u8 letterSpacing;            // Extra spacing between chars
+    u8 lineSpacing;              // Extra spacing between lines
+    u8 fgColor;                  // Foreground palette index
+    u8 bgColor;                  // Background palette index
+    u8 shadowColor;              // Shadow palette index
+};
+```
+
+## Window System
+
+Text renders into windows, which are regions of a background layer:
+
+```c
+struct Window
+{
+    u8 bg;                       // Background layer (0-3)
+    u8 tilemapLeft;              // X position in tiles
+    u8 tilemapTop;               // Y position in tiles
+    u8 width;                    // Width in tiles
+    u8 height;                   // Height in tiles
+    u8 paletteNum;               // Palette bank
+    u16 baseBlock;               // Starting tile index
+    u8 *tileData;                // Pixel buffer
+};
+
+// Global window array
+struct Window gWindows[32];
+
+// Initialize window
+void InitWindow(const struct WindowTemplate *template, u8 windowId)
+{
+    gWindows[windowId] = (struct Window){
+        .bg = template->bg,
+        .tilemapLeft = template->tilemapLeft,
+        .tilemapTop = template->tilemapTop,
+        .width = template->width,
+        .height = template->height,
+        .paletteNum = template->paletteNum,
+        .baseBlock = template->baseBlock,
+        .tileData = AllocZeroed(template->width * template->height * 32),
+    };
+}
+```
+
+## Font System
+
+### Font Data Structure
+
+```c
+struct Font
+{
+    FontDrawGlyphFunc drawGlyph;  // Glyph rendering function
+    u8 maxLetterWidth;            // Maximum character width
+    u8 maxLetterHeight;           // Character height
+    u8 letterSpacing;             // Default spacing
+    u8 lineSpacing;               // Default line spacing
+    u8 shadowType;                // Shadow style
+};
+
+// Font table
+const struct Font gFonts[] = {
+    [FONT_SMALL] = {
+        .drawGlyph = DrawGlyphSmall,
+        .maxLetterWidth = 8,
+        .maxLetterHeight = 8,
+        .letterSpacing = 0,
+        .lineSpacing = 0,
+        .shadowType = SHADOW_NONE,
+    },
+    [FONT_NORMAL] = {
+        .drawGlyph = DrawGlyphNormal,
+        .maxLetterWidth = 8,
+        .maxLetterHeight = 16,
+        .letterSpacing = 0,
+        .lineSpacing = 0,
+        .shadowType = SHADOW_NORMAL,
+    },
+    // ... more fonts
+};
+```
+
+### Glyph Structure
+
+```c
+// Variable-width glyph
+struct Glyph
+{
+    u8 width;                     // Pixel width (1-8)
+    u8 height;                    // Pixel height
+    const u8 *pixels;             // 4bpp pixel data
+};
+
+// Lookup glyph for character
+const struct Glyph *GetGlyph(u8 fontId, u16 charCode)
+{
+    return &gFonts[fontId].glyphs[charCode];
+}
+```
+
+## Rendering Pipeline
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant String as Text String
+    participant Parser as Control Parser
+    participant Printer as Text Printer
+    participant Font as Font Renderer
+    participant Window as Window Buffer
+    participant BG as Background
+
+    String->>Parser: Read character
+    alt Control Code
+        Parser->>Printer: Execute control code
+        Printer->>Printer: Update state
+    else Printable Character
+        Parser->>Printer: Print character
+        Printer->>Font: GetGlyph(char)
+        Font-->>Printer: Glyph data
+        Printer->>Window: Draw glyph at (x, y)
+        Printer->>Printer: Advance x position
+    end
+
+    Note over Window,BG: On window update
+    Window->>BG: Copy to VRAM`}
+</pre>
+</DiagramContainer>
+
+## Control Codes
+
+### Basic Control Codes
+
+```c
+// Control code byte values
+#define CHAR_NEWLINE        0xFE    // Line break
+#define CHAR_PROMPT_SCROLL  0xFA    // Wait, then scroll
+#define CHAR_PROMPT_CLEAR   0xFB    // Wait, then clear
+#define CHAR_EXT_CTRL_CODE  0xFC    // Extended control code follows
+#define CHAR_DYNAMIC        0xFD    // Dynamic text placeholder
+#define EOS                 0xFF    // End of string
+
+// Extended control codes (follow 0xFC)
+enum {
+    EXT_CTRL_COLOR_HIGHLIGHT_SHADOW = 1,  // Set all 3 colors
+    EXT_CTRL_COLOR,                       // Set foreground color
+    EXT_CTRL_HIGHLIGHT,                   // Set background color
+    EXT_CTRL_SHADOW,                      // Set shadow color
+    EXT_CTRL_COLOR_FILL,                  // Fill with color
+    EXT_CTRL_FONT,                        // Change font
+    EXT_CTRL_CLEAR,                       // Clear window
+    EXT_CTRL_SKIP,                        // Skip pixels
+    EXT_CTRL_SPEED,                       // Set text speed
+    EXT_CTRL_PLAYTIME,                    // Insert play time
+    // ... more
+};
+```
+
+### Control Code Parsing
+
+```c
+u8 ParseControlCode(struct TextPrinter *printer)
+{
+    u8 code = *printer->currentChar++;
+
+    switch (code)
+    {
+    case CHAR_NEWLINE:
+        printer->x = printer->printerTemplate.x;
+        printer->y += GetLineHeight(printer->fontId);
+        break;
+
+    case CHAR_EXT_CTRL_CODE:
+        return ParseExtendedControlCode(printer);
+
+    case CHAR_DYNAMIC:
+        return ExpandDynamicText(printer);
+
+    case CHAR_PROMPT_SCROLL:
+        printer->state = STATE_WAIT_SCROLL;
+        return PRINTER_CONTINUE;
+
+    case EOS:
+        return PRINTER_FINISHED;
+    }
+
+    return PRINTER_PRINTING;
+}
+```
+
+### Color Control Codes
+
+```c
+// Example: {COLOR RED}Hello{COLOR WHITE}
+// Bytes: 0xFC 0x02 0x03  H e l l o  0xFC 0x02 0x01
+
+u8 ParseColorCode(struct TextPrinter *printer)
+{
+    u8 colorId = *printer->currentChar++;
+    printer->fgColor = colorId;
+    return PRINTER_PRINTING;
+}
+```
+
+## Dynamic Text Expansion
+
+Placeholders for runtime values:
+
+```c
+// String: "You caught {STR_VAR_1}!"
+// STR_VAR_1 might be "PIKACHU"
+
+const u8 *gStringVars[4];  // Dynamic text pointers
+
+u8 ExpandDynamicText(struct TextPrinter *printer)
+{
+    u8 varId = *printer->currentChar++;
+
+    switch (varId)
+    {
+    case 0:
+        InsertText(gStringVars[0]);
+        break;
+    case 1:
+        InsertText(gStringVars[1]);
+        break;
+    case 2:
+        InsertText(gStringVars[2]);
+        break;
+    case 3:
+        InsertText(gStringVars[3]);
+        break;
+    case 4:
+        InsertPlayerName();
+        break;
+    case 5:
+        InsertRivalName();
+        break;
+    // ... more
+    }
+
+    return PRINTER_PRINTING;
+}
+
+// Set dynamic text
+void StringExpandPlaceholders(u8 *dest, const u8 *src)
+{
+    // Copy src to dest, expanding placeholders
+    // using gStringVars[]
+}
+```
+
+## Text Printer States
+
+<DiagramContainer>
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> RENDERING: AddTextPrinter()
+    RENDERING --> WAIT_BUTTON: Reached PROMPT
+    RENDERING --> RENDERING: Print character
+    WAIT_BUTTON --> SCROLLING: Button pressed
+    WAIT_BUTTON --> CLEARING: Button pressed (clear)
+    SCROLLING --> RENDERING: Scroll complete
+    CLEARING --> RENDERING: Clear complete
+    RENDERING --> [*]: EOS reached`}
+</pre>
+</DiagramContainer>
+
+```c
+enum PrinterState {
+    STATE_IDLE,
+    STATE_RENDERING,
+    STATE_WAIT_BUTTON,
+    STATE_SCROLLING,
+    STATE_CLEARING,
+    STATE_FINISHED,
+};
+
+u8 RunTextPrinter(struct TextPrinter *printer)
+{
+    switch (printer->state)
+    {
+    case STATE_RENDERING:
+        return RenderTextStep(printer);
+
+    case STATE_WAIT_BUTTON:
+        if (JOY_NEW(A_BUTTON | B_BUTTON))
+        {
+            printer->state = STATE_SCROLLING;
+            PlaySE(SE_SELECT);
+        }
+        return PRINTER_CONTINUE;
+
+    case STATE_SCROLLING:
+        return ScrollText(printer);
+
+    case STATE_FINISHED:
+        return PRINTER_FINISHED;
+    }
+
+    return PRINTER_CONTINUE;
+}
+```
+
+## Glyph Rendering
+
+```c
+void DrawGlyph(struct Window *window, struct Glyph *glyph,
+               u8 x, u8 y, u8 fgColor, u8 bgColor, u8 shadowColor)
+{
+    // Get pointer into window tile data
+    u8 *dst = window->tileData + (y * window->width * 8 + x);
+
+    // Draw each row
+    for (u8 row = 0; row < glyph->height; row++)
+    {
+        for (u8 col = 0; col < glyph->width; col++)
+        {
+            u8 pixel = GetGlyphPixel(glyph, col, row);
+
+            if (pixel == 1)  // Foreground
+                SetPixel(dst, col, fgColor);
+            else if (pixel == 2)  // Shadow
+                SetPixel(dst, col, shadowColor);
+            else if (pixel == 3)  // Background (if not transparent)
+                SetPixel(dst, col, bgColor);
+        }
+
+        dst += window->width * 8;
+    }
+}
+```
+
+## Text Speed
+
+```c
+// Speed settings (frames per character)
+enum TextSpeed {
+    TEXT_SPEED_FAST = 0,    // Instant
+    TEXT_SPEED_MID = 1,     // 1 frame delay
+    TEXT_SPEED_SLOW = 4,    // 4 frame delay
+};
+
+u8 RenderTextStep(struct TextPrinter *printer)
+{
+    // Check speed delay
+    if (printer->delayCounter > 0)
+    {
+        printer->delayCounter--;
+        return PRINTER_CONTINUE;
+    }
+
+    // Print next character
+    u8 result = PrintNextChar(printer);
+
+    // Set delay for next character
+    if (result == PRINTER_PRINTING)
+    {
+        printer->delayCounter = printer->textSpeed;
+    }
+
+    return result;
+}
+```
+
+## Common Text Functions
+
+### Adding Text to Window
+
+```c
+void AddTextPrinterForMessage(bool8 allowSkip)
+{
+    gTextPrinter.printerTemplate.currentChar = gStringVar4;
+    gTextPrinter.printerTemplate.windowId = WIN_DIALOGUE;
+    gTextPrinter.printerTemplate.fontId = FONT_NORMAL;
+    gTextPrinter.printerTemplate.x = 0;
+    gTextPrinter.printerTemplate.y = 1;
+    gTextPrinter.textSpeed = GetPlayerTextSpeed();
+
+    AddTextPrinter(&gTextPrinter, allowSkip);
+}
+```
+
+### Clearing Windows
+
+```c
+void FillWindowPixelBuffer(u8 windowId, u8 fillValue)
+{
+    struct Window *win = &gWindows[windowId];
+    u32 size = win->width * win->height * 32;
+
+    memset(win->tileData, fillValue, size);
+}
+
+void ClearWindowTilemap(u8 windowId)
+{
+    struct Window *win = &gWindows[windowId];
+
+    for (u8 y = 0; y < win->height; y++)
+    {
+        for (u8 x = 0; x < win->width; x++)
+        {
+            FillBgTilemapBufferRect_Palette0(
+                win->bg,
+                win->baseBlock + y * win->width + x,
+                win->tilemapLeft + x,
+                win->tilemapTop + y,
+                1, 1
+            );
+        }
+    }
+}
+```
+
+### Copying to VRAM
+
+```c
+void CopyWindowToVram(u8 windowId, u8 mode)
+{
+    struct Window *win = &gWindows[windowId];
+
+    // Copy pixel data to VRAM
+    if (mode & COPYWIN_GFX)
+    {
+        RequestDma3Copy(
+            win->tileData,
+            (void *)(BG_CHAR_ADDR(GetBgTileMap(win->bg)) +
+                     win->baseBlock * 32),
+            win->width * win->height * 32,
+            DMA3_16BIT
+        );
+    }
+
+    // Copy tilemap
+    if (mode & COPYWIN_MAP)
+    {
+        CopyBgTilemapBufferToVram(win->bg);
+    }
+}
+```
+
+## Character Encoding
+
+Pokemon uses custom character encoding, not ASCII:
+
+```c
+// Character code mapping (partial)
+// 0x00-0x0F: Extended characters
+// 0xA1-0xAA: 0-9 (digits)
+// 0xBB-0xD4: A-Z (uppercase)
+// 0xD5-0xEE: a-z (lowercase)
+// 0xEF: Space
+// 0xF0-0xF9: Symbols
+// 0xFA-0xFF: Control codes
+
+#define CHAR_SPACE      0xEF
+#define CHAR_A          0xBB
+#define CHAR_a          0xD5
+#define CHAR_0          0xA1
+
+// Convert ASCII to Pokemon encoding
+u8 CharToPokemon(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return CHAR_A + (c - 'A');
+    if (c >= 'a' && c <= 'z')
+        return CHAR_a + (c - 'a');
+    if (c >= '0' && c <= '9')
+        return CHAR_0 + (c - '0');
+    if (c == ' ')
+        return CHAR_SPACE;
+    return CHAR_SPACE;
+}
+```
+
+## Message Boxes
+
+```c
+// Draw standard message box border
+void DrawStdWindowFrame(u8 windowId)
+{
+    struct Window *win = &gWindows[windowId];
+
+    // Draw corners
+    DrawTile(win->tilemapLeft - 1, win->tilemapTop - 1, TILE_CORNER_TL);
+    DrawTile(win->tilemapLeft + win->width, win->tilemapTop - 1, TILE_CORNER_TR);
+    DrawTile(win->tilemapLeft - 1, win->tilemapTop + win->height, TILE_CORNER_BL);
+    DrawTile(win->tilemapLeft + win->width, win->tilemapTop + win->height, TILE_CORNER_BR);
+
+    // Draw edges
+    for (u8 x = 0; x < win->width; x++)
+    {
+        DrawTile(win->tilemapLeft + x, win->tilemapTop - 1, TILE_EDGE_TOP);
+        DrawTile(win->tilemapLeft + x, win->tilemapTop + win->height, TILE_EDGE_BOTTOM);
+    }
+
+    for (u8 y = 0; y < win->height; y++)
+    {
+        DrawTile(win->tilemapLeft - 1, win->tilemapTop + y, TILE_EDGE_LEFT);
+        DrawTile(win->tilemapLeft + win->width, win->tilemapTop + y, TILE_EDGE_RIGHT);
+    }
+}
+```
+
+## Related Topics
+
+- [Script Commands](/scripting/script-commands) - How scripts display text
+- [Sprite System](/deep-dives/sprite-system) - Text in sprite form
+- [Backgrounds](/gba-hardware/graphics/backgrounds) - BG layer usage

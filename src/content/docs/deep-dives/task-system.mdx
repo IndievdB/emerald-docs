@@ -1,0 +1,520 @@
+---
+title: "Deep Dive: Task System"
+description: Cooperative multitasking in pokeemerald - task scheduling, priority, and state machines
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The task system provides cooperative multitasking without OS support. It allows multiple independent operations (animations, timers, AI, effects) to run concurrently within the game's single-threaded environment.
+
+## Architecture Overview
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph MainLoop["Main Loop (60 Hz)"]
+        CB1["callback1"]
+        CB2["callback2"]
+        RunTasks["RunTasks()"]
+        Anim["AnimateSprites()"]
+    end
+
+    subgraph TaskSystem["Task System"]
+        gTasks["gTasks[16]"]
+        Active["Active Task List"]
+        Free["Free Task Pool"]
+    end
+
+    subgraph Tasks["Running Tasks"]
+        T1["Task: Fade Effect"]
+        T2["Task: Menu Animation"]
+        T3["Task: Sound Delay"]
+        T4["Task: Object Movement"]
+    end
+
+    RunTasks --> gTasks
+    gTasks --> Active
+    Active --> T1 --> T2 --> T3 --> T4
+
+    style RunTasks fill:#9f9,stroke:#333,color:#000
+    style Active fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Task Structure
+
+```c
+#define NUM_TASKS 16
+#define NUM_TASK_DATA 16
+#define TAIL_SENTINEL 0xFE
+#define HEAD_SENTINEL 0xFF
+
+typedef void (*TaskFunc)(u8 taskId);
+
+struct Task
+{
+    TaskFunc func;       // Function to call each frame
+    bool8 isActive;      // Whether task is in use
+    u8 prev;             // Previous task in priority list
+    u8 next;             // Next task in priority list
+    u8 priority;         // Lower = runs first (0-255)
+    s16 data[16];        // 16 slots for task-specific data
+};
+
+// Global task array
+struct Task gTasks[NUM_TASKS];
+
+// Head of priority-sorted linked list
+u8 gTaskListHead;
+```
+
+## Linked List Organization
+
+Tasks are organized in a doubly-linked list sorted by priority:
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    HEAD["HEAD_SENTINEL<br/>(0xFF)"]
+    T0["Task 0<br/>Priority 0"]
+    T3["Task 3<br/>Priority 1"]
+    T1["Task 1<br/>Priority 2"]
+    T2["Task 2<br/>Priority 5"]
+    TAIL["TAIL_SENTINEL<br/>(0xFE)"]
+
+    HEAD --> T0
+    T0 --> T3
+    T3 --> T1
+    T1 --> T2
+    T2 --> TAIL
+
+    T0 -.-> HEAD
+    T3 -.-> T0
+    T1 -.-> T3
+    T2 -.-> T1
+
+    style HEAD fill:#f99,stroke:#333,color:#000
+    style TAIL fill:#f99,stroke:#333,color:#000
+    style T0 fill:#9f9,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Task Lifecycle
+
+### Creating a Task
+
+```c
+u8 CreateTask(TaskFunc func, u8 priority)
+{
+    u8 i;
+
+    // Find free slot
+    for (i = 0; i < NUM_TASKS; i++)
+    {
+        if (!gTasks[i].isActive)
+        {
+            gTasks[i].func = func;
+            gTasks[i].priority = priority;
+            gTasks[i].isActive = TRUE;
+
+            // Clear data fields
+            for (int j = 0; j < NUM_TASK_DATA; j++)
+                gTasks[i].data[j] = 0;
+
+            // Insert into sorted list
+            InsertTask(i);
+            return i;
+        }
+    }
+
+    return TAIL_SENTINEL;  // No free slots
+}
+```
+
+### Inserting by Priority
+
+```c
+static void InsertTask(u8 newTaskId)
+{
+    u8 taskId = gTaskListHead;
+    u8 newPriority = gTasks[newTaskId].priority;
+
+    // Find insertion point (first task with higher priority value)
+    while (taskId != TAIL_SENTINEL)
+    {
+        if (gTasks[taskId].priority > newPriority)
+            break;
+        taskId = gTasks[taskId].next;
+    }
+
+    // Insert before taskId
+    if (taskId == gTaskListHead)
+    {
+        // Insert at head
+        gTasks[newTaskId].prev = HEAD_SENTINEL;
+        gTasks[newTaskId].next = gTaskListHead;
+
+        if (gTaskListHead != TAIL_SENTINEL)
+            gTasks[gTaskListHead].prev = newTaskId;
+
+        gTaskListHead = newTaskId;
+    }
+    else
+    {
+        // Insert in middle or end
+        u8 prevId = gTasks[taskId].prev;
+
+        gTasks[newTaskId].prev = prevId;
+        gTasks[newTaskId].next = taskId;
+
+        gTasks[prevId].next = newTaskId;
+
+        if (taskId != TAIL_SENTINEL)
+            gTasks[taskId].prev = newTaskId;
+    }
+}
+```
+
+### Destroying a Task
+
+```c
+void DestroyTask(u8 taskId)
+{
+    if (taskId >= NUM_TASKS || !gTasks[taskId].isActive)
+        return;
+
+    // Unlink from list
+    u8 prev = gTasks[taskId].prev;
+    u8 next = gTasks[taskId].next;
+
+    if (prev == HEAD_SENTINEL)
+        gTaskListHead = next;
+    else
+        gTasks[prev].next = next;
+
+    if (next != TAIL_SENTINEL)
+        gTasks[next].prev = prev;
+
+    gTasks[taskId].isActive = FALSE;
+}
+```
+
+## Running Tasks
+
+Each frame, `RunTasks()` iterates through the priority-sorted list:
+
+```c
+void RunTasks(void)
+{
+    u8 taskId = gTaskListHead;
+
+    while (taskId != TAIL_SENTINEL)
+    {
+        // Cache next pointer (task might destroy itself)
+        u8 next = gTasks[taskId].next;
+
+        // Run task function
+        gTasks[taskId].func(taskId);
+
+        taskId = next;
+    }
+}
+```
+
+### Execution Flow
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Main as Main Loop
+    participant RT as RunTasks()
+    participant T0 as Task 0 (pri 0)
+    participant T1 as Task 1 (pri 1)
+    participant T2 as Task 2 (pri 2)
+
+    Main->>RT: Call RunTasks()
+    RT->>T0: Execute func(0)
+    T0-->>RT: Return
+    RT->>T1: Execute func(1)
+    T1->>T1: DestroyTask(1)
+    T1-->>RT: Return
+    RT->>T2: Execute func(2)
+    T2-->>RT: Return
+    RT-->>Main: All tasks complete`}
+</pre>
+</DiagramContainer>
+
+## Task Data Fields
+
+Each task has 16 signed 16-bit data fields for storing state:
+
+```c
+// Common data field conventions
+#define tState      data[0]   // State machine counter
+#define tTimer      data[1]   // General timer
+#define tX          data[2]   // X position/coordinate
+#define tY          data[3]   // Y position/coordinate
+
+// Access task data
+gTasks[taskId].data[0] = 5;
+s16 value = gTasks[taskId].data[1];
+
+// Or use the macros
+gTasks[taskId].tState++;
+```
+
+## State Machine Pattern
+
+Most tasks implement internal state machines:
+
+```c
+static void Task_FadeScreen(u8 taskId)
+{
+    switch (gTasks[taskId].tState)
+    {
+    case 0:
+        // Initialize fade
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
+        gTasks[taskId].tState++;
+        break;
+
+    case 1:
+        // Wait for fade to complete
+        if (!gPaletteFade.active)
+            gTasks[taskId].tState++;
+        break;
+
+    case 2:
+        // Do something after fade
+        DoNextAction();
+        gTasks[taskId].tState++;
+        break;
+
+    case 3:
+        // Fade back in
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_BLACK);
+        gTasks[taskId].tState++;
+        break;
+
+    case 4:
+        // Wait and cleanup
+        if (!gPaletteFade.active)
+        {
+            DestroyTask(taskId);
+        }
+        break;
+    }
+}
+```
+
+## Priority Guidelines
+
+| Priority | Usage | Examples |
+|----------|-------|----------|
+| 0 | Critical system tasks | Input handling, fade control |
+| 1-5 | High priority | Menu state machines, battle flow |
+| 10-50 | Normal | Animations, visual effects |
+| 80-100 | Low priority | Background effects, ambient |
+| 200+ | Lowest | Cleanup tasks, delayed actions |
+
+## Common Patterns
+
+### Delayed Action
+
+```c
+static void Task_DelayedAction(u8 taskId)
+{
+    if (--gTasks[taskId].data[0] == 0)
+    {
+        PerformAction();
+        DestroyTask(taskId);
+    }
+}
+
+void StartDelayedAction(u8 frames)
+{
+    u8 taskId = CreateTask(Task_DelayedAction, 50);
+    gTasks[taskId].data[0] = frames;
+}
+```
+
+### Repeating Timer
+
+```c
+static void Task_RepeatingEffect(u8 taskId)
+{
+    if (++gTasks[taskId].data[0] >= 30)  // Every 30 frames
+    {
+        gTasks[taskId].data[0] = 0;
+        PlayEffect();
+    }
+
+    // Continue until cancelled externally
+}
+```
+
+### Chained Tasks
+
+```c
+static void Task_Step1(u8 taskId)
+{
+    if (Step1Complete())
+    {
+        // Start next task
+        CreateTask(Task_Step2, gTasks[taskId].priority);
+        DestroyTask(taskId);
+    }
+}
+
+static void Task_Step2(u8 taskId)
+{
+    if (Step2Complete())
+    {
+        CreateTask(Task_Step3, gTasks[taskId].priority);
+        DestroyTask(taskId);
+    }
+}
+```
+
+### Finding Tasks
+
+```c
+// Find task by function
+u8 FindTaskIdByFunc(TaskFunc func)
+{
+    for (u8 i = 0; i < NUM_TASKS; i++)
+    {
+        if (gTasks[i].isActive && gTasks[i].func == func)
+            return i;
+    }
+    return TAIL_SENTINEL;
+}
+
+// Check if task exists
+bool8 FuncIsActiveTask(TaskFunc func)
+{
+    return FindTaskIdByFunc(func) != TAIL_SENTINEL;
+}
+```
+
+## Utility Functions
+
+```c
+// Get number of active tasks
+u8 GetTaskCount(void)
+{
+    u8 count = 0;
+    for (u8 i = 0; i < NUM_TASKS; i++)
+    {
+        if (gTasks[i].isActive)
+            count++;
+    }
+    return count;
+}
+
+// Reset all tasks
+void ResetTasks(void)
+{
+    for (u8 i = 0; i < NUM_TASKS; i++)
+    {
+        gTasks[i].isActive = FALSE;
+        gTasks[i].prev = TAIL_SENTINEL;
+        gTasks[i].next = TAIL_SENTINEL;
+    }
+    gTaskListHead = TAIL_SENTINEL;
+}
+```
+
+## Integration with Main Loop
+
+```c
+void DoMainLoop(void)
+{
+    while (TRUE)
+    {
+        ReadKeys();
+
+        if (gMain.callback2)
+            gMain.callback2();  // State machine logic
+
+        if (gMain.callback1)
+            gMain.callback1();  // Additional processing
+
+        RunTasks();           // Execute all active tasks
+
+        AnimateSprites();
+        BuildOamBuffer();
+
+        WaitForVBlank();
+    }
+}
+```
+
+## Debugging Tasks
+
+```c
+// Debug: Print all active tasks
+void DebugPrintTasks(void)
+{
+    u8 taskId = gTaskListHead;
+
+    mgba_printf("Active tasks:");
+    while (taskId != TAIL_SENTINEL)
+    {
+        mgba_printf("  Task %d: pri=%d func=%p state=%d",
+            taskId,
+            gTasks[taskId].priority,
+            gTasks[taskId].func,
+            gTasks[taskId].data[0]);
+        taskId = gTasks[taskId].next;
+    }
+}
+```
+
+## Common Pitfalls
+
+### Self-Destruction Safety
+
+```c
+// SAFE: Next pointer cached before execution
+void RunTasks(void)
+{
+    u8 taskId = gTaskListHead;
+    while (taskId != TAIL_SENTINEL)
+    {
+        u8 next = gTasks[taskId].next;  // Cache BEFORE call
+        gTasks[taskId].func(taskId);
+        taskId = next;  // Safe even if task destroyed itself
+    }
+}
+```
+
+### Priority Inversion
+
+```c
+// BAD: High-priority task waiting on low-priority task
+static void Task_HighPriority(u8 taskId)
+{
+    // This waits forever if low-priority task never runs
+    if (gLowPriorityComplete)
+        DestroyTask(taskId);
+}
+
+// GOOD: Use same priority or explicit synchronization
+```
+
+### Data Field Overflow
+
+```c
+// BAD: Timer can overflow
+gTasks[taskId].data[0]++;  // Wraps at 32767 -> -32768
+
+// GOOD: Use modulo or reset
+gTasks[taskId].data[0] = (gTasks[taskId].data[0] + 1) % 1000;
+```
+
+## Related Topics
+
+- [Callback Pattern](/deep-dives/callback-pattern) - Higher-level state management
+- [Main Loop](/game-flow/main-loop) - Where tasks execute
+- [Sprite System](/deep-dives/sprite-system) - Sprite callbacks (different system)

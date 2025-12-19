@@ -1,0 +1,415 @@
+---
+title: Save Blocks
+description: SaveBlock1 and SaveBlock2 structures - the primary game state storage
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald stores all persistent game state in two primary structures: `SaveBlock1` for game progress and `SaveBlock2` for player identity and settings. These structures are loaded into RAM at game start and written back to flash memory when saving.
+
+## Architecture Overview
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph RAM["RAM Storage"]
+        SB1["SaveBlock1<br/>(~15,752 bytes)<br/>Game Progress"]
+        SB2["SaveBlock2<br/>(~3,884 bytes)<br/>Player & Settings"]
+        PS["PokemonStorage<br/>(~33,744 bytes)<br/>PC Boxes"]
+    end
+
+    subgraph Flash["Flash Memory"]
+        S0["Sector 0<br/>SaveBlock2"]
+        S1["Sectors 1-4<br/>SaveBlock1"]
+        S2["Sectors 5-13<br/>PokemonStorage"]
+    end
+
+    SB2 --> S0
+    SB1 --> S1
+    PS --> S2
+
+    style SB1 fill:#9f9,stroke:#333,color:#000
+    style SB2 fill:#99f,stroke:#333,color:#000
+    style PS fill:#f99,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## SaveBlock2 Structure
+
+`SaveBlock2` contains player identity, options, and Battle Frontier data. It fits in a single sector (0).
+
+```c
+struct SaveBlock2
+{
+    /*0x00*/ u8 playerName[PLAYER_NAME_LENGTH + 1];  // 8 bytes
+    /*0x08*/ u8 playerGender;                        // MALE or FEMALE
+    /*0x09*/ u8 specialSaveWarpFlags;
+    /*0x0A*/ u8 playerTrainerId[TRAINER_ID_LENGTH];  // 4 bytes
+    /*0x0E*/ u16 playTimeHours;
+    /*0x10*/ u8 playTimeMinutes;
+    /*0x11*/ u8 playTimeSeconds;
+    /*0x12*/ u8 playTimeVBlanks;                     // 1/60 second frames
+    /*0x13*/ u8 optionsButtonMode;
+    /*0x14*/ u16 optionsTextSpeed:3;
+             u16 optionsWindowFrameType:5;
+             u16 optionsSound:1;
+             u16 optionsBattleStyle:1;
+             u16 optionsBattleSceneOff:1;
+             u16 regionMapZoom:1;
+    /*0x18*/ struct Pokedex pokedex;                 // 120 bytes
+    /*0x98*/ struct Time localTimeOffset;
+    /*0xA0*/ struct Time lastBerryTreeUpdate;
+    /*0xA8*/ u32 gcnLinkFlags;
+    /*0xAC*/ u32 encryptionKey;                      // For bag encryption
+    /*0xB0*/ struct PlayersApprentice playerApprentice;
+    /*0xDC*/ struct Apprentice apprentices[APPRENTICE_COUNT];
+    /*0x1EC*/ struct BerryCrush berryCrush;
+    /*0x1FC*/ struct PokemonJumpRecords pokeJump;
+    /*0x20C*/ struct BerryPickingResults berryPick;
+    /*0x21C*/ struct RankingHall1P hallRecords1P[...];
+    /*0x57C*/ struct RankingHall2P hallRecords2P[...];
+    /*0x624*/ u16 contestLinkResults[...];
+    /*0x64C*/ struct BattleFrontier frontier;        // ~2,272 bytes
+}; // Total: ~3,884 bytes (0xF2C)
+```
+
+### Key Components
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `playerName` | 8 | Player's name (7 chars + terminator) |
+| `playerTrainerId` | 4 | Visible ID + Secret ID |
+| `playTime*` | 5 | Hours, minutes, seconds, frames |
+| `options*` | 3 | Game options (text speed, sound, etc.) |
+| `pokedex` | 120 | Seen/caught Pokemon flags |
+| `encryptionKey` | 4 | Key for bag item encryption |
+| `frontier` | ~2,272 | Battle Frontier records and state |
+
+### Options Bitfields
+
+```c
+// Text speed (3 bits)
+#define OPTIONS_TEXT_SPEED_SLOW  0
+#define OPTIONS_TEXT_SPEED_MID   1
+#define OPTIONS_TEXT_SPEED_FAST  2
+
+// Button mode
+#define OPTIONS_BUTTON_MODE_NORMAL   0
+#define OPTIONS_BUTTON_MODE_LR       1
+#define OPTIONS_BUTTON_MODE_L_EQUALS_A 2
+
+// Sound
+#define OPTIONS_SOUND_MONO   0
+#define OPTIONS_SOUND_STEREO 1
+
+// Battle style
+#define OPTIONS_BATTLE_STYLE_SHIFT 0
+#define OPTIONS_BATTLE_STYLE_SET   1
+```
+
+## SaveBlock1 Structure
+
+`SaveBlock1` contains all game progress data. It spans sectors 1-4 (~15,752 bytes).
+
+```c
+struct SaveBlock1
+{
+    // Position and warps
+    /*0x00*/ struct Coords16 pos;                    // Current X/Y
+    /*0x04*/ struct WarpData location;               // Current map
+    /*0x0C*/ struct WarpData continueGameWarp;       // Continue point
+    /*0x14*/ struct WarpData dynamicWarp;            // Script-set warp
+    /*0x1C*/ struct WarpData lastHealLocation;       // Whiteout/teleport
+    /*0x24*/ struct WarpData escapeWarp;             // Dig/Escape Rope
+
+    // Map state
+    /*0x2C*/ u16 savedMusic;
+    /*0x2E*/ u8 weather;
+    /*0x2F*/ u8 weatherCycleStage;
+    /*0x30*/ u8 flashLevel;
+    /*0x32*/ u16 mapLayoutId;
+    /*0x34*/ u16 mapView[0x100];                     // Map tile cache
+
+    // Party
+    /*0x234*/ u8 playerPartyCount;
+    /*0x238*/ struct Pokemon playerParty[PARTY_SIZE]; // 600 bytes
+
+    // Money and items
+    /*0x490*/ u32 money;                             // Encrypted
+    /*0x494*/ u16 coins;                             // Game Corner
+    /*0x496*/ u16 registeredItem;
+    /*0x498*/ struct ItemSlot pcItems[PC_ITEMS_COUNT];
+    /*0x560*/ struct ItemSlot bagPocket_Items[BAG_ITEMS_COUNT];
+    /*0x5D8*/ struct ItemSlot bagPocket_KeyItems[BAG_KEYITEMS_COUNT];
+    /*0x650*/ struct ItemSlot bagPocket_PokeBalls[BAG_POKEBALLS_COUNT];
+    /*0x690*/ struct ItemSlot bagPocket_TMHM[BAG_TMHM_COUNT];
+    /*0x790*/ struct ItemSlot bagPocket_Berries[BAG_BERRIES_COUNT];
+    /*0x848*/ struct Pokeblock pokeblocks[POKEBLOCKS_COUNT];
+
+    // Pokedex seen flags (duplicate for safety)
+    /*0x988*/ u8 seen1[NUM_DEX_FLAG_BYTES];
+
+    // Game progress
+    /*0xA30*/ struct ObjectEvent objectEvents[OBJECT_EVENTS_COUNT];
+    /*0xC70*/ struct ObjectEventTemplate objectEventTemplates[...];
+    /*0x1270*/ u8 flags[NUM_FLAG_BYTES];             // ~300 bytes
+    /*0x139C*/ u16 vars[VARS_COUNT];                 // ~256 vars
+    /*0x159C*/ u32 gameStats[NUM_GAME_STATS];        // ~256 bytes
+
+    // Berry trees
+    /*0x169C*/ struct BerryTree berryTrees[BERRY_TREES_COUNT];
+
+    // Secret bases
+    /*0x1A9C*/ struct SecretBase secretBases[SECRET_BASES_COUNT];
+
+    // Decorations
+    /*0x271C*/ u8 playerRoomDecorations[...];
+    /*0x2734*/ u8 decoration*[...];                  // Multiple arrays
+
+    // TV and news
+    /*0x27CC*/ TVShow tvShows[TV_SHOWS_COUNT];
+    /*0x2B50*/ PokeNews pokeNews[POKE_NEWS_COUNT];
+
+    // Pokemon outbreak
+    /*0x2B90*/ u16 outbreakPokemonSpecies;
+    /*0x2B92*/ u8 outbreakLocationMapNum;
+    /*0x2B93*/ u8 outbreakLocationMapGroup;
+    // ... more outbreak data
+
+    // Misc
+    /*0x2BE0*/ struct Mail mail[MAIL_COUNT];
+    /*0x2E28*/ OldMan oldMan;
+    /*0x2E64*/ struct DewfordTrend dewfordTrends[...];
+    /*0x2E90*/ struct ContestWinner contestWinners[...];
+    /*0x3030*/ struct DayCare daycare;
+    /*0x3150*/ struct LinkBattleRecords linkBattleRecords;
+    /*0x31DC*/ struct Roamer roamer;                 // Latios/Latias
+    /*0x31F8*/ struct EnigmaBerry enigmaBerry;
+    /*0x322C*/ struct MysteryGiftSave mysteryGift;
+    /*0x3718*/ u32 trainerHillTimes[...];
+    /*0x3728*/ struct RamScript ramScript;           // ~1000 bytes
+    /*0x3B24*/ u8 seen2[NUM_DEX_FLAG_BYTES];         // Backup seen flags
+    /*0x3B58*/ LilycoveLady lilycoveLady;
+    /*0x3D64*/ struct TrainerHillSave trainerHill;
+    /*0x3D70*/ struct WaldaPhrase waldaPhrase;
+}; // Total: ~15,752 bytes (0x3D88)
+```
+
+### Warp Data Structure
+
+```c
+struct WarpData
+{
+    s8 mapGroup;    // Map group ID
+    s8 mapNum;      // Map number within group
+    s8 warpId;      // Warp point ID (-1 for coordinate warp)
+    s16 x, y;       // Coordinates (if warpId is -1)
+};
+```
+
+### Item Slot Structure
+
+```c
+struct ItemSlot
+{
+    u16 itemId;     // Item ID
+    u16 quantity;   // How many (encrypted in bag)
+};
+```
+
+## Pokemon Storage
+
+PC box storage is separate from SaveBlock1 for size reasons. It spans sectors 5-13.
+
+```c
+struct PokemonStorage
+{
+    u8 currentBox;                                      // Active box
+    struct BoxPokemon boxes[TOTAL_BOXES_COUNT][IN_BOX_COUNT]; // 33,600 bytes
+    u8 boxNames[TOTAL_BOXES_COUNT][BOX_NAME_LENGTH + 1];
+    u8 boxWallpapers[TOTAL_BOXES_COUNT];
+};
+
+// Constants
+#define TOTAL_BOXES_COUNT  14
+#define IN_BOX_COUNT       30
+#define BOX_NAME_LENGTH    8
+```
+
+**Storage calculation:**
+- 14 boxes × 30 Pokemon × 80 bytes = 33,600 bytes
+- Plus box names and wallpapers = ~33,744 bytes total
+- Spans 9 sectors (5-13)
+
+## Memory Pointers
+
+The save blocks are accessed via pointers that get randomized for anti-cheat:
+
+```c
+// Global pointers (randomized location in RAM)
+extern struct SaveBlock1 *gSaveBlock1Ptr;
+extern struct SaveBlock2 *gSaveBlock2Ptr;
+extern struct PokemonStorage *gPokemonStoragePtr;
+
+// Example usage
+u32 money = gSaveBlock1Ptr->money;
+u8 gender = gSaveBlock2Ptr->playerGender;
+struct BoxPokemon *pokemon = &gPokemonStoragePtr->boxes[0][0];
+```
+
+### ASLR (Address Space Layout Randomization)
+
+The save blocks have random padding for security:
+
+```c
+struct SaveBlock1ASLR {
+    struct SaveBlock1 block;
+    u8 aslr[SAVEBLOCK_MOVE_RANGE];  // Random offset applied
+};
+
+// Pointers are set with random offset at game start
+void SetSaveBlocksPointers(u16 offset)
+{
+    gSaveBlock1Ptr = (void *)&gSaveblock1 + offset;
+    gSaveBlock2Ptr = (void *)&gSaveblock2 + offset;
+    gPokemonStoragePtr = (void *)&gPokemonStorage + offset;
+}
+```
+
+## Encryption
+
+### Money Encryption
+
+Money is XOR-encrypted with a random key:
+
+```c
+// In SaveBlock2
+u32 encryptionKey;  // Random value set at new game
+
+// Money storage (encrypted)
+u32 GetMoney(void)
+{
+    return gSaveBlock1Ptr->money ^ gSaveBlock2Ptr->encryptionKey;
+}
+
+void SetMoney(u32 amount)
+{
+    gSaveBlock1Ptr->money = amount ^ gSaveBlock2Ptr->encryptionKey;
+}
+```
+
+### Bag Item Encryption
+
+Item quantities in the bag are similarly encrypted:
+
+```c
+void ApplyNewEncryptionKeyToWord(u32 *word, u32 newKey)
+{
+    u32 oldKey = gSaveBlock2Ptr->encryptionKey;
+    *word ^= oldKey;       // Decrypt with old key
+    *word ^= newKey;       // Re-encrypt with new key
+}
+```
+
+## Flags and Variables
+
+### Flags
+
+Flags are single-bit values for tracking events:
+
+```c
+// Flag array: ~300 bytes = 2400+ flags
+u8 flags[NUM_FLAG_BYTES];
+
+// Access functions
+bool8 FlagGet(u16 flagId)
+{
+    return gSaveBlock1Ptr->flags[flagId / 8] & (1 << (flagId % 8));
+}
+
+void FlagSet(u16 flagId)
+{
+    gSaveBlock1Ptr->flags[flagId / 8] |= (1 << (flagId % 8));
+}
+
+void FlagClear(u16 flagId)
+{
+    gSaveBlock1Ptr->flags[flagId / 8] &= ~(1 << (flagId % 8));
+}
+```
+
+Common flag categories:
+- `FLAG_BADGE*` - Gym badge acquired
+- `FLAG_VISITED_*` - Location visited
+- `FLAG_DEFEATED_*` - Trainer defeated
+- `FLAG_GOT_*` - Item/Pokemon received
+- `FLAG_HIDE_*` - NPC hidden
+
+### Variables
+
+Variables are 16-bit values for storing numbers:
+
+```c
+// Variable array: ~256 variables
+u16 vars[VARS_COUNT];
+
+// Access functions
+u16 VarGet(u16 varId)
+{
+    if (varId < VARS_START)
+        return varId;  // Constants 0-0x3FFF
+    return gSaveBlock1Ptr->vars[varId - VARS_START];
+}
+
+void VarSet(u16 varId, u16 value)
+{
+    gSaveBlock1Ptr->vars[varId - VARS_START] = value;
+}
+```
+
+Common variable uses:
+- `VAR_TEMP_*` - Temporary script values
+- `VAR_RESULT` - Script return value
+- `VAR_FACING` - Player direction
+- `VAR_POKEMON_PARTY_*` - Party slot references
+
+## Save Block Sizes
+
+| Block | Size | Sectors |
+|-------|------|---------|
+| SaveBlock2 | ~3,884 bytes | 1 (Sector 0) |
+| SaveBlock1 | ~15,752 bytes | 4 (Sectors 1-4) |
+| PokemonStorage | ~33,744 bytes | 9 (Sectors 5-13) |
+| **Total per slot** | ~53,380 bytes | 14 sectors |
+
+With two save slots plus special sectors, the total flash usage is 32 sectors (128 KB).
+
+## Initialization
+
+When starting a new game:
+
+```c
+void ClearSav1(void)
+{
+    CpuFill16(0, gSaveBlock1Ptr, sizeof(struct SaveBlock1));
+}
+
+void ClearSav2(void)
+{
+    CpuFill16(0, gSaveBlock2Ptr, sizeof(struct SaveBlock2));
+}
+
+void NewGameInitData(void)
+{
+    // Set up new game defaults
+    gSaveBlock2Ptr->encryptionKey = Random32();
+    SetMoney(3000);  // Starting money
+    AddBagItem(ITEM_POTION, 1);  // Starter item
+    // Initialize flags, vars, etc.
+}
+```
+
+## Related Topics
+
+- [Flash Sectors](/save-system/flash-sectors) - How save data is written to flash
+- [Save Validation](/save-system/save-validation) - Checksums and corruption detection

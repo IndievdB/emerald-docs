@@ -1,0 +1,101 @@
+---
+title: Introduction
+description: Getting started with the pokeemerald codebase
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+Welcome to the pokeemerald documentation! This guide will help you understand how Pokemon Emerald works from the source code level.
+
+## What is pokeemerald?
+
+**pokeemerald** is a complete decompilation of Pokemon Emerald for the Game Boy Advance. The [pret](https://github.com/pret) (Pokemon Reverse Engineering Tools) community has reverse-engineered the original game ROM back into human-readable C source code.
+
+The decompiled code:
+- **Compiles back** to a byte-perfect match of the original ROM
+- **Is fully readable** - variable names, function names, and structure are all meaningful
+- **Contains 314 C source files** covering every aspect of the game
+- **Is actively maintained** with documentation and improvements
+
+<LearnMore title="Why decompile a game?" summary="Academic and modding purposes">
+Decompilation serves several purposes:
+
+1. **Education** - Understanding how professional games are built
+2. **Preservation** - Documenting game mechanics for posterity
+3. **Modding** - Creating ROM hacks and fan modifications
+4. **Research** - Studying game design patterns and optimization techniques
+
+The pokeemerald project is purely academic and does not distribute copyrighted assets.
+</LearnMore>
+
+## Codebase Statistics
+
+| Category | Count |
+|----------|-------|
+| C Source Files | 314 |
+| Header Files | 514 |
+| Lines of Code | ~420,000 |
+| Maps | 385+ |
+| Graphics Assets | 5,700+ |
+
+## Target Audience
+
+This documentation is designed for **intermediate developers** who:
+- Know C basics (or can learn as they go)
+- Want to understand game architecture
+- Are curious about embedded systems / retro game dev
+- May want to create ROM hacks
+
+We explain GBA-specific concepts as we encounter them - no prior hardware knowledge required.
+
+## Documentation Structure
+
+The documentation follows the **game's execution flow**:
+
+```
+Boot Sequence → Main Loop → Game State (Overworld/Battle/Menu)
+```
+
+Each section builds on previous ones:
+
+1. **Game Flow** - How the game starts and runs
+2. **GBA Hardware** - The platform it runs on
+3. **Overworld** - Field gameplay
+4. **Battle System** - Combat mechanics
+5. **Pokemon Data** - Data structures
+6. **Scripting** - Event system
+7. **Save System** - Persistence
+
+## Quick Orientation
+
+Here's a mental model for the codebase:
+
+```
+pokeemerald/
+├── src/           # 314 C source files (the game logic)
+├── include/       # 514 header files (interfaces & constants)
+├── data/          # Game data (maps, scripts, trainers)
+├── graphics/      # Image assets (sprites, tiles, UI)
+├── sound/         # Music and sound effects
+└── tools/         # Build utilities
+```
+
+The **src/** directory contains most of what you'll study:
+- `main.c` - Entry point and main loop
+- `overworld.c` - Field gameplay controller
+- `battle_main.c` - Battle state machine
+- `pokemon.c` - Pokemon data handling
+- `script.c` - Event scripting VM
+
+## Next Steps
+
+Ready to dive in? Start with understanding how the game actually runs:
+
+<DeepDiveLink
+  href="/game-flow/"
+  title="Game Flow Overview"
+  description="Learn how Pokemon Emerald boots up, runs its main loop, and manages game state"
+/>
+
+Or continue to [Prerequisites](/getting-started/prerequisites/) to set up a build environment.

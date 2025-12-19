@@ -1,0 +1,127 @@
+---
+title: Prerequisites
+description: Setting up your environment to explore pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+
+To fully explore the pokeemerald codebase, you'll want to set up a development environment. This page covers what you need.
+
+## Required Knowledge
+
+You should be comfortable with:
+
+- **C programming basics** - variables, functions, structs, pointers
+- **Reading code** - following control flow, understanding function calls
+- **Command line** - navigating directories, running build commands
+
+<LearnMore title="New to C?" summary="Resources for learning">
+If you're coming from another language, here are key C concepts you'll encounter:
+
+- **Pointers** (`*` and `&`) - Direct memory access
+- **Structs** - Custom data types grouping related data
+- **Macros** (`#define`) - Preprocessor text replacement
+- **Bitwise operations** (`&`, `|`, `<<`, `>>`) - Hardware register manipulation
+
+The [Learn C](https://www.learn-c.org/) interactive tutorial is a good starting point.
+</LearnMore>
+
+## Optional: Build Environment
+
+While you can read the code without building it, having a working build environment helps:
+
+### Linux / WSL (Recommended)
+
+```bash
+# Install dependencies (Ubuntu/Debian)
+sudo apt install build-essential binutils-arm-none-eabi gcc-arm-none-eabi \
+    libpng-dev gdebi-core git
+
+# Clone the repository
+git clone https://github.com/pret/pokeemerald.git
+cd pokeemerald
+
+# Build the ROM
+make -j$(nproc)
+```
+
+### macOS
+
+```bash
+# Install Homebrew if needed
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install dependencies
+brew install libpng arm-none-eabi-gcc
+
+# Clone and build
+git clone https://github.com/pret/pokeemerald.git
+cd pokeemerald
+make -j$(sysctl -n hw.ncpu)
+```
+
+### Windows
+
+Windows users should use WSL (Windows Subsystem for Linux) and follow the Linux instructions. Native Windows builds are more complex.
+
+<LearnMore title="Build output" summary="What you get after building">
+After a successful build, you'll have:
+
+- `pokeemerald.gba` - The compiled ROM (identical to original)
+- `pokeemerald.elf` - Debug symbol information
+- `pokeemerald.map` - Memory layout
+
+You can run the ROM in any GBA emulator (mGBA recommended).
+</LearnMore>
+
+## Recommended Tools
+
+### Code Navigation
+
+- **VS Code** with C/C++ extension - syntax highlighting, go-to-definition
+- **ctags** - Generate tags for function/variable lookup
+- **grep/ripgrep** - Search across the codebase
+
+### Debugging & Testing
+
+- **mGBA** - Accurate GBA emulator with debugging features
+- **NO$GBA** - Emulator with advanced debugging tools
+
+### Understanding Assembly
+
+Some low-level code remains in assembly. Useful references:
+- [GBATEK](https://problemkaputt.de/gbatek.htm) - Comprehensive GBA hardware documentation
+- [Tonc](https://www.coranac.com/tonc/text/) - GBA programming tutorial
+
+## Project Structure Deep Dive
+
+Here's what each directory contains:
+
+| Directory | Contents | Files |
+|-----------|----------|-------|
+| `src/` | Game logic in C | 314 .c files |
+| `include/` | Header files | 514 .h files |
+| `include/constants/` | Game constants | Species IDs, move IDs, flags |
+| `include/gba/` | Hardware definitions | I/O registers, memory addresses |
+| `data/` | Game data | Maps, scripts, trainer data |
+| `graphics/` | Visual assets | Sprites, tiles, UI elements |
+| `sound/` | Audio | Music (MIDI), sound effects |
+| `asm/` | Assembly code | Macros, data definitions |
+| `tools/` | Build tools | Graphics converters, etc. |
+
+## Where to Start Reading
+
+If you want to jump straight into code, start here:
+
+1. **`src/main.c`** - The entry point (`AgbMain`)
+2. **`include/main.h`** - The `Main` struct definition
+3. **`src/overworld.c`** - How field gameplay works
+
+These three files will introduce you to the core patterns used throughout the codebase.
+
+## Next Steps
+
+With your environment ready, let's understand how the game actually runs:
+
+- [Codebase Overview](/getting-started/codebase-overview/) - High-level architecture
+- [Game Flow](/game-flow/) - Boot sequence and main loop

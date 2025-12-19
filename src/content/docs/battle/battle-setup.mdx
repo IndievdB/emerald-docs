@@ -1,0 +1,665 @@
+---
+title: Battle Setup
+description: How battles are initialized in pokeemerald - from wild encounters to trainer battles
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Battle setup handles everything that happens before the actual battle begins - determining the battle type, initializing data structures, loading trainer and Pokemon data, and transitioning from the overworld to the battle scene.
+
+## Setup Flow Overview
+
+<DiagramContainer title="Battle Initialization Sequence">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Trigger["Battle Trigger"]
+        Wild[Wild Encounter]
+        Trainer[Trainer Battle]
+        Link[Link Battle]
+        Special[Special Battle<br/>Safari, Tower, etc.]
+    end
+
+    subgraph Setup["Setup Phase"]
+        SetFlags[Set gBattleTypeFlags]
+        SaveField[Save Field State]
+        Allocate[Allocate Battle Memory]
+        LoadData[Load Trainer/Pokemon Data]
+    end
+
+    subgraph Transition["Transition Phase"]
+        Fade[Fade to Black]
+        TransAnim[Transition Animation]
+        LoadGfx[Load Battle Graphics]
+    end
+
+    subgraph Init["Battle Init"]
+        CB2Init[CB2_InitBattle]
+        ClearVRAM[Clear VRAM]
+        SetupBG[Setup Backgrounds]
+        InitState[Initialize State Machine]
+    end
+
+    Trigger --> Setup
+    Setup --> Transition
+    Transition --> Init
+    Init --> BattleStart[Battle Begins]`}
+</pre>
+</DiagramContainer>
+
+## Battle Trigger Functions
+
+Different scenarios call different setup functions:
+
+### Wild Encounter
+
+```c
+// Called when stepping in grass triggers a wild encounter
+void BattleSetup_StartWildBattle(void)
+{
+    // No trainer - this is a wild battle
+    gBattleTypeFlags = 0;
+
+    // Check for special wild battle types
+    if (IsSpecialWildEncounter())
+    {
+        gBattleTypeFlags |= BATTLE_TYPE_ROAMER;  // Roaming legendary
+    }
+
+    // Store the wild Pokemon data
+    CreateWildMon(species, level);
+
+    // Save current location for fleeing
+    gBattleScripting.specialVar = 0;
+
+    // Start transition
+    DoWildBattleTransition();
+}
+
+// Create wild Pokemon
+static void CreateWildMon(u16 species, u8 level)
+{
+    // Clear enemy party slot 0
+    ZeroEnemyPartyMons();
+
+    // Generate wild Pokemon
+    CreateMonWithNature(&gEnemyParty[0], species, level, 32, GetRandomNature());
+
+    // For roaming Pokemon, restore their data
+    if (gBattleTypeFlags & BATTLE_TYPE_ROAMER)
+    {
+        TryRestoreRoamerMon();
+    }
+}
+```
+
+### Trainer Battle
+
+```c
+// Called when a trainer spots the player or player talks to trainer
+void BattleSetup_StartTrainerBattle(void)
+{
+    // This is a trainer battle
+    gBattleTypeFlags = BATTLE_TYPE_TRAINER;
+
+    // Get trainer data
+    u16 trainerId = GetTrainerId();
+    gTrainerBattleOpponent_A = trainerId;
+
+    // Check for double battle
+    if (IsTrainerDoubleBattle(trainerId))
+    {
+        gBattleTypeFlags |= BATTLE_TYPE_DOUBLE;
+    }
+
+    // Load trainer's party
+    CreateTrainerParty(trainerId);
+
+    // Determine battle music
+    gBattleScripting.trainerId = trainerId;
+
+    // Start transition
+    DoTrainerBattleTransition();
+}
+
+// Create trainer's Pokemon party
+static void CreateTrainerParty(u16 trainerId)
+{
+    const struct Trainer *trainer = &gTrainers[trainerId];
+    u8 i;
+
+    // Clear enemy party
+    ZeroEnemyPartyMons();
+
+    // Create each Pokemon from trainer data
+    for (i = 0; i < trainer->partySize; i++)
+    {
+        if (trainer->partyFlags & F_TRAINER_PARTY_CUSTOM_MOVESET)
+        {
+            // Trainer has custom moves defined
+            CreateMonWithCustomMoves(&gEnemyParty[i],
+                trainer->party[i].species,
+                trainer->party[i].level,
+                trainer->party[i].moves);
+        }
+        else
+        {
+            // Use default level-up moveset
+            CreateMon(&gEnemyParty[i],
+                trainer->party[i].species,
+                trainer->party[i].level,
+                32, TRUE, 0, OT_ID_RANDOM_NO_SHINY, 0);
+        }
+
+        // Set held item if specified
+        if (trainer->partyFlags & F_TRAINER_PARTY_HELD_ITEM)
+        {
+            SetMonData(&gEnemyParty[i], MON_DATA_HELD_ITEM, &trainer->party[i].heldItem);
+        }
+    }
+}
+```
+
+### Link Battle
+
+```c
+void BattleSetup_StartLinkBattle(void)
+{
+    gBattleTypeFlags = BATTLE_TYPE_LINK;
+
+    // Determine who is master (controls RNG, etc.)
+    if (IsLinkMaster())
+    {
+        gBattleTypeFlags |= BATTLE_TYPE_IS_MASTER;
+    }
+
+    // For multi battles
+    if (IsMultiBattle())
+    {
+        gBattleTypeFlags |= BATTLE_TYPE_MULTI | BATTLE_TYPE_DOUBLE;
+    }
+
+    // Partner's party is received over link
+    ReceivedLinkPartyData();
+
+    DoLinkBattleTransition();
+}
+```
+
+### Special Battle Types
+
+```c
+// Safari Zone battle
+void BattleSetup_StartSafariBattle(void)
+{
+    gBattleTypeFlags = BATTLE_TYPE_SAFARI;
+    CreateWildMon(species, level);
+    DoSafariBattleTransition();
+}
+
+// Battle Tower battle
+void BattleSetup_StartBattleTowerBattle(void)
+{
+    gBattleTypeFlags = BATTLE_TYPE_TRAINER | BATTLE_TYPE_BATTLE_TOWER;
+
+    // Get tower trainer from current round
+    gTrainerBattleOpponent_A = GetBattleTowerTrainerId();
+
+    // Load rental or player's own Pokemon
+    if (IsBattleFactoryChallenge())
+        LoadRentalParty();
+    else
+        LoadBattleTowerParty();
+
+    DoBattleTowerTransition();
+}
+
+// First battle (Birch tutorial)
+void BattleSetup_StartFirstBattle(void)
+{
+    gBattleTypeFlags = BATTLE_TYPE_FIRST_BATTLE;
+    CreateWildMon(SPECIES_ZIGZAGOON, 2);
+    DoFirstBattleTransition();
+}
+
+// Wally tutorial battle
+void BattleSetup_StartWallyTutorialBattle(void)
+{
+    gBattleTypeFlags = BATTLE_TYPE_WALLY_TUTORIAL;
+    CreateWildMon(SPECIES_RALTS, 5);
+    DoWallyTutorialTransition();
+}
+```
+
+## Memory Allocation
+
+Before the battle can start, memory must be allocated for battle data:
+
+```c
+static void AllocateBattleResources(void)
+{
+    // Main battle state structure (~0x200 bytes)
+    gBattleStruct = AllocZeroed(sizeof(struct BattleStruct));
+
+    // Battle resources container
+    gBattleResources = AllocZeroed(sizeof(struct BattleResources));
+
+    // Sub-allocate resources
+    gBattleResources->secretBase = AllocZeroed(sizeof(struct SecretBase));
+    gBattleResources->flags = AllocZeroed(sizeof(struct ResourceFlags));
+    gBattleResources->battleScriptsStack = AllocZeroed(sizeof(struct BattleScriptsStack));
+    gBattleResources->battleCallbackStack = AllocZeroed(sizeof(struct BattleCallbacksStack));
+    gBattleResources->beforeLvlUp = AllocZeroed(sizeof(struct StatsArray));
+    gBattleResources->ai = AllocZeroed(sizeof(struct AI_ThinkingStruct));
+    gBattleResources->battleHistory = AllocZeroed(sizeof(struct BattleHistory));
+    gBattleResources->AI_ScriptsStack = AllocZeroed(sizeof(struct BattleScriptsStack));
+
+    // Link battle buffers (4KB each for sending/receiving data)
+    if (gBattleTypeFlags & BATTLE_TYPE_LINK)
+    {
+        gLinkBattleSendBuffer = AllocZeroed(LINK_BUFF_SIZE);
+        gLinkBattleRecvBuffer = AllocZeroed(LINK_BUFF_SIZE);
+    }
+}
+
+// Also allocate sprite data
+static void AllocateBattleSpritesData(void)
+{
+    gBattleSpritesDataPtr = AllocZeroed(sizeof(struct BattleSpriteData));
+    gBattleSpritesDataPtr->battlerData = AllocZeroed(sizeof(struct BattleSpriteInfo) * MAX_BATTLERS_COUNT);
+    gBattleSpritesDataPtr->healthBoxesData = AllocZeroed(sizeof(struct BattleHealthboxInfo) * MAX_BATTLERS_COUNT);
+    gBattleSpritesDataPtr->animationData = AllocZeroed(sizeof(struct BattleAnimationInfo));
+    gBattleSpritesDataPtr->battleBars = AllocZeroed(sizeof(struct BattleBarInfo) * MAX_BATTLERS_COUNT);
+}
+```
+
+<LearnMore title="Why so much allocation?" summary="GBA memory constraints">
+The GBA has limited RAM (~256KB EWRAM + 32KB IWRAM). Battle data is allocated dynamically so it can be freed when returning to the overworld, leaving more memory for field gameplay.
+
+This also allows the same memory to be reused for different battle types that need different amounts of data.
+</LearnMore>
+
+## Battle Transitions
+
+The visual transition from overworld to battle:
+
+<DiagramContainer title="Transition Animation Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Overworld
+    participant Trans as Transition
+    participant Battle
+
+    Overworld->>Trans: StartBattleTransition()
+    Trans->>Trans: Freeze overworld
+    Trans->>Trans: Play transition effect
+    Note right of Trans: Swirl, flash,<br/>trainer slide, etc.
+    Trans->>Trans: Fade to black
+    Trans->>Battle: CB2_InitBattle()
+    Battle->>Battle: Clear VRAM
+    Battle->>Battle: Load battle BG
+    Battle->>Battle: Load sprites
+    Battle->>Battle: Fade in`}
+</pre>
+</DiagramContainer>
+
+### Transition Types
+
+```c
+// Different transition effects based on battle type
+void DoWildBattleTransition(void)
+{
+    // Get a random transition animation
+    u8 transitionId = GetWildBattleTransitionId();
+
+    // Common transitions:
+    // - Screen swirl
+    // - Horizontal bars
+    // - Pokeball opening
+    // - Flash effect
+
+    LaunchBattleTransition(transitionId);
+}
+
+void DoTrainerBattleTransition(void)
+{
+    // Trainer class determines transition
+    u8 trainerClass = gTrainers[gTrainerBattleOpponent_A].trainerClass;
+    u8 transitionId = GetTrainerBattleTransitionId(trainerClass);
+
+    // Gym leaders, E4, Champion get special transitions
+    LaunchBattleTransition(transitionId);
+}
+
+// Launch the selected transition
+static void LaunchBattleTransition(u8 transitionId)
+{
+    // Store transition ID
+    gBattleTransitionData.transitionId = transitionId;
+
+    // Set callback to transition handler
+    SetMainCallback2(CB2_BattleTransition);
+
+    // Lock player controls
+    LockPlayerFieldControls();
+}
+```
+
+### Transition Effect Example
+
+```c
+// One transition type: horizontal sliding bars
+static void BattleTransition_Bars(void)
+{
+    switch (gBattleTransitionData.state)
+    {
+    case 0:
+        // Setup bars
+        SetupBarsGfx();
+        gBattleTransitionData.state++;
+        break;
+
+    case 1:
+        // Animate bars sliding in from sides
+        if (AnimateBarsSlide())
+        {
+            gBattleTransitionData.state++;
+        }
+        break;
+
+    case 2:
+        // Bars cover screen - start fade
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
+        gBattleTransitionData.state++;
+        break;
+
+    case 3:
+        // Wait for fade, then go to battle
+        if (!gPaletteFade.active)
+        {
+            SetMainCallback2(CB2_InitBattle);
+        }
+        break;
+    }
+}
+```
+
+## CB2_InitBattle
+
+The main battle initialization callback:
+
+```c
+void CB2_InitBattle(void)
+{
+    // First-time setup
+    if (gBattleCommunication[MULTIUSE_STATE] == 0)
+    {
+        // Clear all battle-related memory
+        ClearBattleData();
+
+        // Allocate resources
+        AllocateBattleResources();
+        AllocateBattleSpritesData();
+        AllocateMonSpritesGfx();
+
+        gBattleCommunication[MULTIUSE_STATE]++;
+    }
+
+    // Continue internal initialization
+    CB2_InitBattleInternal();
+}
+
+static void CB2_InitBattleInternal(void)
+{
+    switch (gBattleCommunication[MULTIUSE_STATE])
+    {
+    case 1:
+        // Clear VRAM and registers
+        SetGpuReg(REG_OFFSET_DISPCNT, 0);
+        ClearVideoMemory();
+        ResetBgsAndClearDma3BusyFlags(0);
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 2:
+        // Initialize backgrounds
+        InitBattleBgsVideo();
+        LoadBattleMenuBg();
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 3:
+        // Load battle background based on terrain
+        LoadBattleBackground();
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 4:
+        // Load trainer sprites (or wild mon sprite)
+        if (gBattleTypeFlags & BATTLE_TYPE_TRAINER)
+            LoadTrainerSprite();
+        LoadBattlerSprites();
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 5:
+        // Initialize health bars and UI
+        InitBattleHealthBars();
+        InitBattleMessages();
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 6:
+        // Final initialization
+        BattleStartClearSetData();
+        gBattleCommunication[MULTIUSE_STATE]++;
+        break;
+
+    case 7:
+        // Start the battle
+        SetMainCallback2(BattleMainCB2);
+        gBattleMainFunc = BattleIntroGetMonsData;
+        break;
+    }
+}
+```
+
+## BattleStartClearSetData
+
+Initializes all battle state to starting values:
+
+```c
+static void BattleStartClearSetData(void)
+{
+    u8 i;
+
+    // Clear turn order
+    for (i = 0; i < MAX_BATTLERS_COUNT; i++)
+    {
+        gBattlerByTurnOrder[i] = i;
+        gActionsByTurnOrder[i] = 0xFF;
+        gCurrentTurnActionNumber = 0;
+    }
+
+    // Initialize per-battler data
+    for (i = 0; i < MAX_BATTLERS_COUNT; i++)
+    {
+        gBattleMons[i].status2 = 0;
+        gStatuses3[i] = 0;
+        gDisableStructs[i] = (struct DisableStruct){0};
+        gProtectStructs[i] = (struct ProtectStruct){0};
+        gSpecialStatuses[i] = (struct SpecialStatus){0};
+    }
+
+    // Initialize side timers
+    gSideTimers[B_SIDE_PLAYER] = (struct SideTimer){0};
+    gSideTimers[B_SIDE_OPPONENT] = (struct SideTimer){0};
+
+    // Initialize field conditions
+    gFieldTimers = (struct FieldTimer){0};
+    gBattleWeather = 0;
+
+    // Set outcome to undecided
+    gBattleOutcome = 0;
+
+    // Initialize turn counter
+    gBattleResults.battleTurnCounter = 0;
+
+    // Copy party data to battle structures
+    for (i = 0; i < gBattlersCount; i++)
+    {
+        CopyPartyMonToBattleMon(i);
+    }
+
+    // Record pokemon for Pokedex
+    for (i = 0; i < gEnemyPartyCount; i++)
+    {
+        RecordPokemonAsSeen(&gEnemyParty[i]);
+    }
+}
+```
+
+## Trainer Data Structure
+
+```c
+struct Trainer
+{
+    /*0x00*/ u8 partyFlags;          // F_TRAINER_PARTY_* flags
+    /*0x01*/ u8 trainerClass;        // Determines sprite, AI, rewards
+    /*0x02*/ u8 encounterMusic_gender; // Music and trainer gender
+    /*0x03*/ u8 trainerPic;          // Sprite ID for VS screen
+    /*0x04*/ u8 trainerName[TRAINER_NAME_LENGTH + 1];
+    /*0x0D*/ u16 items[MAX_TRAINER_ITEMS]; // Items trainer can use
+    /*0x15*/ bool8 doubleBattle;     // Is this a double battle?
+    /*0x18*/ u32 aiFlags;            // AI behavior flags
+    /*0x1C*/ u8 partySize;           // Number of Pokemon
+    /*0x20*/ const void *party;      // Pointer to party data
+};
+
+// Party flags
+#define F_TRAINER_PARTY_CUSTOM_MOVESET (1 << 0)  // Custom moves defined
+#define F_TRAINER_PARTY_HELD_ITEM      (1 << 1)  // Held items defined
+
+// AI flags for battle AI behavior
+#define AI_FLAG_CHECK_BAD_MOVE     (1 << 0)
+#define AI_FLAG_TRY_TO_FAINT       (1 << 1)
+#define AI_FLAG_CHECK_VIABILITY    (1 << 2)
+#define AI_FLAG_SETUP_FIRST_TURN   (1 << 3)
+#define AI_FLAG_RISKY              (1 << 4)
+#define AI_FLAG_PREFER_STRONGEST_MOVE (1 << 5)
+// ... more flags
+```
+
+## Battle Background Selection
+
+```c
+static void LoadBattleBackground(void)
+{
+    u8 bgId;
+
+    if (gBattleTypeFlags & BATTLE_TYPE_TRAINER)
+    {
+        // Trainer battles use the map's terrain
+        bgId = GetBattleTerrainFromMapHeader();
+    }
+    else
+    {
+        // Wild battles check special terrains first
+        if (MetatileBehavior_IsTallGrass(gBattleTerrain))
+            bgId = BATTLE_TERRAIN_GRASS;
+        else if (MetatileBehavior_IsLongGrass(gBattleTerrain))
+            bgId = BATTLE_TERRAIN_LONG_GRASS;
+        else if (MetatileBehavior_IsSurfing(gBattleTerrain))
+            bgId = BATTLE_TERRAIN_POND;
+        else
+            bgId = GetBattleTerrainFromMapHeader();
+    }
+
+    LoadBattleBackgroundGfx(bgId);
+}
+
+// Battle terrain types
+enum {
+    BATTLE_TERRAIN_GRASS,
+    BATTLE_TERRAIN_LONG_GRASS,
+    BATTLE_TERRAIN_SAND,
+    BATTLE_TERRAIN_UNDERWATER,
+    BATTLE_TERRAIN_WATER,
+    BATTLE_TERRAIN_POND,
+    BATTLE_TERRAIN_MOUNTAIN,
+    BATTLE_TERRAIN_CAVE,
+    BATTLE_TERRAIN_BUILDING,
+    BATTLE_TERRAIN_PLAIN,
+    // ... more terrains
+};
+```
+
+## Returning from Battle
+
+When the battle ends, cleanup happens:
+
+```c
+void CB2_QuitBattle(void)
+{
+    // Free battle memory
+    FreeBattleResources();
+    FreeBattleSpritesData();
+    FreeMonSpritesGfx();
+
+    // Clear VRAM
+    ResetAllBgsAndClearDma3BusyFlags();
+
+    // Update trainer defeated flags
+    if (gBattleOutcome == B_OUTCOME_WON && (gBattleTypeFlags & BATTLE_TYPE_TRAINER))
+    {
+        SetTrainerDefeatedFlag(gTrainerBattleOpponent_A);
+    }
+
+    // Update roamer data if needed
+    if (gBattleTypeFlags & BATTLE_TYPE_ROAMER)
+    {
+        UpdateRoamerData();
+    }
+
+    // Handle experience and leveling
+    if (gBattleOutcome == B_OUTCOME_WON)
+    {
+        ApplyExperienceToParty();
+    }
+
+    // Return to overworld
+    gFieldCallback = FieldCallback_BattleFinished;
+    SetMainCallback2(CB2_ReturnToField);
+}
+
+static void FreeBattleResources(void)
+{
+    FREE_AND_SET_NULL(gBattleStruct);
+    FREE_AND_SET_NULL(gBattleResources->secretBase);
+    FREE_AND_SET_NULL(gBattleResources->flags);
+    FREE_AND_SET_NULL(gBattleResources->battleScriptsStack);
+    FREE_AND_SET_NULL(gBattleResources->battleCallbackStack);
+    FREE_AND_SET_NULL(gBattleResources->beforeLvlUp);
+    FREE_AND_SET_NULL(gBattleResources->ai);
+    FREE_AND_SET_NULL(gBattleResources->battleHistory);
+    FREE_AND_SET_NULL(gBattleResources->AI_ScriptsStack);
+    FREE_AND_SET_NULL(gBattleResources);
+    FREE_AND_SET_NULL(gLinkBattleSendBuffer);
+    FREE_AND_SET_NULL(gLinkBattleRecvBuffer);
+}
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `BattleSetup_StartWildBattle()` | battle_setup.c | Start wild encounter |
+| `BattleSetup_StartTrainerBattle()` | battle_setup.c | Start trainer battle |
+| `CB2_InitBattle()` | battle_main.c | Main battle initialization |
+| `CB2_InitBattleInternal()` | battle_main.c | Internal init steps |
+| `BattleStartClearSetData()` | battle_main.c | Clear/init battle data |
+| `AllocateBattleResources()` | battle_main.c | Allocate battle memory |
+| `CreateTrainerParty()` | battle_setup.c | Create trainer's Pokemon |
+| `LaunchBattleTransition()` | battle_transition.c | Start transition effect |
+| `LoadBattleBackground()` | battle_bg.c | Load terrain background |
+| `CB2_QuitBattle()` | battle_main.c | Cleanup and return |

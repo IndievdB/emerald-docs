@@ -1,0 +1,331 @@
+---
+title: State Machine
+description: How pokeemerald manages game state through callbacks
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import CodeReference from '../../../components/CodeReference.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+The pokeemerald codebase uses **callback-based state machines** to manage game flow. Understanding this pattern is key to navigating the code.
+
+## The Callback Pattern
+
+Instead of one massive switch statement, the game uses **function pointers** that change based on state:
+
+```c
+// The callback type
+typedef void (*MainCallback)(void);
+
+// In gMain structure
+MainCallback callback2;  // Current state function
+
+// Changing state
+void SetMainCallback2(MainCallback callback)
+{
+    gMain.callback2 = callback;
+    gMain.state = 0;  // Reset state variable
+}
+```
+
+Each frame, the main loop calls `gMain.callback2()`. By changing this pointer, we change what code runs.
+
+<DiagramContainer title="State Transitions">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> Copyright: Boot
+    Copyright --> TitleScreen: Animation done
+    TitleScreen --> MainMenu: Press Start
+    MainMenu --> Overworld: Continue/New Game
+    MainMenu --> Options: Select Options
+    Options --> MainMenu: Back
+    Overworld --> Battle: Wild/Trainer encounter
+    Overworld --> Menu: Press Start
+    Battle --> Overworld: Battle ends
+    Menu --> Overworld: Close menu`}
+</pre>
+</DiagramContainer>
+
+## Example: Title Screen Flow
+
+Let's trace how the title screen works:
+
+### 1. Initial Callback (After Boot)
+
+```c
+// Set in InitMainCallbacks()
+SetMainCallback2(CB2_InitCopyrightScreenAfterBootup);
+```
+
+### 2. Copyright Screen
+
+The copyright callback initializes graphics, shows the Game Freak logo, then transitions:
+
+```c
+static void CB2_InitCopyrightScreenAfterBootup(void)
+{
+    // ... setup code ...
+
+    SetMainCallback2(CB2_CopyrightScreen);
+}
+
+static void CB2_CopyrightScreen(void)
+{
+    // Wait for animation/timer
+    if (animationDone)
+        SetMainCallback2(CB2_InitTitleScreen);
+}
+```
+
+### 3. Title Screen
+
+```c
+static void CB2_InitTitleScreen(void)
+{
+    // Load title graphics, music
+    // ... initialization ...
+
+    SetMainCallback2(CB2_TitleScreen);
+}
+
+static void CB2_TitleScreen(void)
+{
+    // Handle input
+    if (JOY_NEW(START_BUTTON | A_BUTTON))
+        SetMainCallback2(CB2_InitMainMenu);
+
+    // Animate title screen
+    RunTasks();
+    AnimateSprites();
+    BuildOamBuffer();
+}
+```
+
+## The State Variable
+
+Many callbacks use `gMain.state` for sub-states within a single callback:
+
+```c
+static void CB2_InitBattle(void)
+{
+    switch (gMain.state)
+    {
+        case 0:
+            // Initialize battle graphics
+            gMain.state++;
+            break;
+        case 1:
+            // Load Pokemon sprites
+            gMain.state++;
+            break;
+        case 2:
+            // Setup battle UI
+            gMain.state++;
+            break;
+        case 3:
+            // Transition complete
+            SetMainCallback2(BattleMainCB2);
+            break;
+    }
+}
+```
+
+<LearnMore title="Why use sub-states?" summary="Spreading work across frames">
+Heavy initialization (loading graphics, decompressing data) can't finish in one frame without causing lag. Sub-states let us:
+
+1. Do a little work each frame
+2. Keep the game responsive
+3. Show loading progress if needed
+
+Each `case` runs in one frame, then we increment and continue next frame.
+</LearnMore>
+
+## Major Callbacks
+
+Here are the key `callback2` functions in the game:
+
+### Title & Menu
+
+| Callback | File | Purpose |
+|----------|------|---------|
+| `CB2_InitCopyrightScreenAfterBootup` | `intro.c` | Game Freak logo |
+| `CB2_TitleScreen` | `title_screen.c` | Title animation |
+| `CB2_InitMainMenu` | `main_menu.c` | New/Continue selection |
+| `CB2_ContinueSavedGame` | `main_menu.c` | Load save file |
+
+### Overworld
+
+| Callback | File | Purpose |
+|----------|------|---------|
+| `CB2_Overworld` | `overworld.c` | Field gameplay |
+| `CB2_LoadMap` | `overworld.c` | Map transitions |
+| `CB2_ReturnToField` | `overworld.c` | Return from menu/battle |
+
+### Battle
+
+| Callback | File | Purpose |
+|----------|------|---------|
+| `CB2_InitBattle` | `battle_main.c` | Setup battle |
+| `BattleMainCB2` | `battle_main.c` | Battle state machine |
+| `CB2_EndBattle` | `battle_main.c` | Cleanup after battle |
+
+### Menus
+
+| Callback | File | Purpose |
+|----------|------|---------|
+| `CB2_PartyMenu` | `party_menu.c` | Pokemon team |
+| `CB2_Bag` | `item_menu.c` | Bag/items |
+| `CB2_PokedexScreen` | `pokedex.c` | Pokedex |
+
+## Callback1 vs Callback2
+
+The game has two main callbacks, though `callback2` does most work:
+
+| Callback | Purpose | When Used |
+|----------|---------|-----------|
+| `callback1` | Always-run per-frame logic | Rarely (special animations) |
+| `callback2` | Main game state | Always |
+
+```c
+static void CallCallbacks(void)
+{
+    if (gMain.callback1)
+        gMain.callback1();  // Runs first (usually NULL)
+
+    if (gMain.callback2)
+        gMain.callback2();  // Main game logic
+}
+```
+
+<LearnMore title="When is callback1 used?" summary="Persistent animations">
+`callback1` is used when something needs to run regardless of `callback2`:
+
+- **Screen transitions** - Fade effects during state changes
+- **Certain animations** - Effects that span multiple states
+- **Debug features** - Always-active developer tools
+
+In normal gameplay, `callback1` is usually NULL.
+</LearnMore>
+
+## Interrupt Callbacks
+
+Beyond main callbacks, there are **interrupt callbacks** for hardware events:
+
+```c
+// Set VBlank callback
+SetVBlankCallback(MyVBlankHandler);
+
+// The handler runs during VBlank interrupt
+static void MyVBlankHandler(void)
+{
+    // Copy sprites, do time-critical work
+    LoadOam();
+    ProcessSpriteCopyRequests();
+    TransferPlttBuffer();
+}
+```
+
+Common VBlank callbacks:
+- Copy OAM (sprites) to hardware
+- Transfer palettes
+- Handle DMA requests
+
+## Overworld Callback Deep Dive
+
+The overworld callback is one of the most complex:
+
+<CodeReference file="src/overworld.c">
+```c
+static void CB2_Overworld(void)
+{
+    // Run the current field callback
+    if (gFieldCallback2)
+        gFieldCallback2();
+
+    // Process tasks (NPCs, animations, etc.)
+    RunTasks();
+
+    // Handle map scripts
+    ScriptContext_RunScript();
+
+    // Update sprites
+    AnimateSprites();
+
+    // Prepare sprite buffer for VBlank
+    BuildOamBuffer();
+
+    // Handle palette effects
+    UpdatePaletteFade();
+}
+```
+</CodeReference>
+
+The overworld has its **own nested callbacks** (`gFieldCallback`, `gFieldCallback2`) for sub-states like:
+- Normal movement
+- Scripted events
+- Trainer battles starting
+- Map transitions
+
+<DiagramContainer title="Overworld Nested Callbacks">
+<pre class="mermaid">
+{`flowchart TD
+    A[CB2_Overworld] --> B{gFieldCallback2?}
+    B -->|Yes| C[Run Field Callback]
+    B -->|No| D[Default behavior]
+    C --> E[RunTasks]
+    D --> E
+    E --> F[ScriptContext_RunScript]
+    F --> G[AnimateSprites]
+    G --> H[BuildOamBuffer]
+
+    subgraph FieldCallbacks["Field Callback Examples"]
+        I[FieldCB_WaitFadeIn]
+        J[FieldCB_DefaultStepUpdate]
+        K[FieldCB_MapTransition]
+    end`}
+</pre>
+</DiagramContainer>
+
+## Pattern Summary
+
+The callback pattern provides:
+
+1. **Modularity** - Each state is a separate function
+2. **Clean transitions** - Just change the function pointer
+3. **State isolation** - Each callback manages its own data
+4. **Extensibility** - Easy to add new states
+
+```c
+// The universal pattern:
+void SetMainCallback2(MainCallback callback)
+{
+    gMain.callback2 = callback;
+    gMain.state = 0;
+}
+
+// In your callback:
+static void MyCallback(void)
+{
+    switch (gMain.state)
+    {
+        case 0: /* init */ break;
+        case 1: /* work */ break;
+        case 2: SetMainCallback2(NextCallback); break;
+    }
+}
+```
+
+<DeepDiveLink
+  href="/deep-dives/callback-pattern"
+  title="Callback Pattern Deep Dive"
+  description="Comprehensive guide to callbacks, including task integration and common patterns"
+/>
+
+## Next Steps
+
+Now that you understand how the game flows, explore specific systems:
+
+- [GBA Hardware](/gba-hardware/) - The platform underneath
+- [Overworld](/overworld/) - Field gameplay in detail
+- [Battle System](/battle/) - Combat mechanics

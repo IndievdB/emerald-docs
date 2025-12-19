@@ -1,0 +1,604 @@
+---
+title: Species Data
+description: Base stats, types, abilities, and other species-specific information
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Every Pokemon species has a set of inherent properties defined in the `gSpeciesInfo` array. This data determines base stats, typing, abilities, catch rates, and many other characteristics that remain constant for all Pokemon of that species.
+
+## SpeciesInfo Structure
+
+The core structure containing all species-specific data:
+
+```c
+struct SpeciesInfo
+{
+    /* 0x00 */ u8 baseHP;
+    /* 0x01 */ u8 baseAttack;
+    /* 0x02 */ u8 baseDefense;
+    /* 0x03 */ u8 baseSpeed;
+    /* 0x04 */ u8 baseSpAttack;
+    /* 0x05 */ u8 baseSpDefense;
+    /* 0x06 */ u8 types[2];
+    /* 0x08 */ u8 catchRate;
+    /* 0x09 */ u8 expYield;
+    /* 0x0A */ u16 evYield_HP:2;
+    /* 0x0A */ u16 evYield_Attack:2;
+    /* 0x0A */ u16 evYield_Defense:2;
+    /* 0x0A */ u16 evYield_Speed:2;
+    /* 0x0B */ u16 evYield_SpAttack:2;
+    /* 0x0B */ u16 evYield_SpDefense:2;
+    /* 0x0C */ u16 itemCommon;
+    /* 0x0E */ u16 itemRare;
+    /* 0x10 */ u8 genderRatio;
+    /* 0x11 */ u8 eggCycles;
+    /* 0x12 */ u8 friendship;
+    /* 0x13 */ u8 growthRate;
+    /* 0x14 */ u8 eggGroups[2];
+    /* 0x16 */ u8 abilities[2];
+    /* 0x18 */ u8 safariZoneFleeRate;
+    /* 0x19 */ u8 bodyColor : 7;
+              u8 noFlip : 1;
+};
+```
+
+**Total size:** 26 bytes per species
+
+## Accessing Species Data
+
+Species data is accessed through the global `gSpeciesInfo` array:
+
+```c
+// Get base stats for Pikachu
+u8 baseHP = gSpeciesInfo[SPECIES_PIKACHU].baseHP;      // 35
+u8 baseAtk = gSpeciesInfo[SPECIES_PIKACHU].baseAttack; // 55
+u8 type1 = gSpeciesInfo[SPECIES_PIKACHU].types[0];     // TYPE_ELECTRIC
+u8 type2 = gSpeciesInfo[SPECIES_PIKACHU].types[1];     // TYPE_ELECTRIC
+
+// Get ability
+u8 abilityNum = GetMonData(mon, MON_DATA_ABILITY_NUM); // 0 or 1
+u8 ability = gSpeciesInfo[species].abilities[abilityNum];
+```
+
+## Base Stats
+
+Base stats determine a Pokemon's potential in each stat category. The actual stat is calculated using base stats, IVs, EVs, level, and nature.
+
+```c
+// Example: Bulbasaur
+[SPECIES_BULBASAUR] = {
+    .baseHP        = 45,
+    .baseAttack    = 49,
+    .baseDefense   = 49,
+    .baseSpeed     = 45,
+    .baseSpAttack  = 65,
+    .baseSpDefense = 65,
+    // ...
+},
+```
+
+### Base Stat Total (BST)
+
+A species' power is often measured by its Base Stat Total:
+
+```c
+u16 GetBaseStatTotal(u16 species)
+{
+    return gSpeciesInfo[species].baseHP
+         + gSpeciesInfo[species].baseAttack
+         + gSpeciesInfo[species].baseDefense
+         + gSpeciesInfo[species].baseSpeed
+         + gSpeciesInfo[species].baseSpAttack
+         + gSpeciesInfo[species].baseSpDefense;
+}
+
+// Bulbasaur BST = 45 + 49 + 49 + 45 + 65 + 65 = 318
+```
+
+## Types
+
+Each species has one or two types stored in a 2-element array:
+
+```c
+// Single type: both elements are the same
+[SPECIES_CHARMANDER] = {
+    .types = { TYPE_FIRE, TYPE_FIRE },  // Fire type only
+},
+
+// Dual type: different elements
+[SPECIES_BULBASAUR] = {
+    .types = { TYPE_GRASS, TYPE_POISON },  // Grass/Poison
+},
+```
+
+### Type Constants
+
+```c
+#define TYPE_NORMAL     0
+#define TYPE_FIGHTING   1
+#define TYPE_FLYING     2
+#define TYPE_POISON     3
+#define TYPE_GROUND     4
+#define TYPE_ROCK       5
+#define TYPE_BUG        6
+#define TYPE_GHOST      7
+#define TYPE_STEEL      8
+#define TYPE_MYSTERY    9   // ??? type (Curse in Gen 2-4)
+#define TYPE_FIRE      10
+#define TYPE_WATER     11
+#define TYPE_GRASS     12
+#define TYPE_ELECTRIC  13
+#define TYPE_PSYCHIC   14
+#define TYPE_ICE       15
+#define TYPE_DRAGON    16
+#define TYPE_DARK      17
+```
+
+### Type Checking
+
+```c
+bool8 IsMonOfType(struct Pokemon *mon, u8 type)
+{
+    u16 species = GetMonData(mon, MON_DATA_SPECIES);
+    return gSpeciesInfo[species].types[0] == type
+        || gSpeciesInfo[species].types[1] == type;
+}
+```
+
+## Abilities
+
+Each species has two ability slots (slot 0 and slot 1):
+
+```c
+[SPECIES_PIKACHU] = {
+    .abilities = {ABILITY_STATIC, ABILITY_NONE},
+},
+
+[SPECIES_RALTS] = {
+    .abilities = {ABILITY_SYNCHRONIZE, ABILITY_TRACE},
+},
+```
+
+If a slot contains `ABILITY_NONE`, only the other ability is available.
+
+### Getting a Pokemon's Ability
+
+```c
+u8 GetMonAbility(struct Pokemon *mon)
+{
+    u16 species = GetMonData(mon, MON_DATA_SPECIES);
+    u8 abilityNum = GetMonData(mon, MON_DATA_ABILITY_NUM);
+
+    return GetAbilityBySpecies(species, abilityNum);
+}
+
+u8 GetAbilityBySpecies(u16 species, u8 abilityNum)
+{
+    // If slot 1 is NONE, always use slot 0
+    if (gSpeciesInfo[species].abilities[1] == ABILITY_NONE)
+        return gSpeciesInfo[species].abilities[0];
+
+    return gSpeciesInfo[species].abilities[abilityNum];
+}
+```
+
+## Gender Ratio
+
+The `genderRatio` field determines the likelihood of each gender:
+
+```c
+// Gender ratio constants
+#define MON_MALE       0x00   // Always male
+#define MON_FEMALE     0xFE   // Always female
+#define MON_GENDERLESS 0xFF   // No gender
+
+// Common ratios
+0x1F  // 87.5% male, 12.5% female (starters)
+0x3F  // 75% male, 25% female
+0x7F  // 50% male, 50% female
+0xBF  // 25% male, 75% female
+0xE1  // 12.5% male, 87.5% female
+```
+
+### Gender Determination
+
+Gender is determined by the lower 8 bits of personality:
+
+```c
+u8 GetGenderFromSpeciesAndPersonality(u16 species, u32 personality)
+{
+    u8 genderRatio = gSpeciesInfo[species].genderRatio;
+
+    // Special cases
+    if (genderRatio == MON_MALE)
+        return MON_MALE;
+    if (genderRatio == MON_FEMALE)
+        return MON_FEMALE;
+    if (genderRatio == MON_GENDERLESS)
+        return MON_GENDERLESS;
+
+    // Compare personality byte to threshold
+    if ((personality & 0xFF) < genderRatio)
+        return MON_FEMALE;
+    else
+        return MON_MALE;
+}
+```
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph Gender["Gender Determination"]
+        P["Personality & 0xFF<br/>(0-255)"]
+        R["Gender Ratio<br/>Threshold"]
+        C{"Compare"}
+        M["Male"]
+        F["Female"]
+    end
+
+    P --> C
+    R --> C
+    C -->|"P >= R"| M
+    C -->|"P < R"| F
+
+    style M fill:#9bf,stroke:#333
+    style F fill:#f9b,stroke:#333`}
+</pre>
+</DiagramContainer>
+
+## Experience and Growth
+
+### Catch Rate
+
+Determines how easy a Pokemon is to catch (higher = easier):
+
+```c
+[SPECIES_BULBASAUR] = {
+    .catchRate = 45,    // Starter difficulty
+},
+[SPECIES_RATTATA] = {
+    .catchRate = 255,   // Very easy
+},
+[SPECIES_MEWTWO] = {
+    .catchRate = 3,     // Legendary difficulty
+},
+```
+
+### Experience Yield
+
+Base EXP given when this Pokemon is defeated:
+
+```c
+[SPECIES_BLISSEY] = {
+    .expYield = 255,    // Highest in Gen 3
+},
+[SPECIES_MAGIKARP] = {
+    .expYield = 20,     // Very low
+},
+```
+
+### Growth Rate
+
+Determines the EXP curve to reach each level:
+
+```c
+#define GROWTH_MEDIUM_FAST  0   // 1,000,000 EXP to level 100
+#define GROWTH_ERRATIC      1   // 600,000 EXP (uneven distribution)
+#define GROWTH_FLUCTUATING  2   // 1,640,000 EXP (uneven distribution)
+#define GROWTH_MEDIUM_SLOW  3   // 1,059,860 EXP
+#define GROWTH_FAST         4   // 800,000 EXP
+#define GROWTH_SLOW         5   // 1,250,000 EXP
+
+// Example assignments
+[SPECIES_BULBASAUR] = { .growthRate = GROWTH_MEDIUM_SLOW },
+[SPECIES_CHARMANDER] = { .growthRate = GROWTH_MEDIUM_SLOW },
+[SPECIES_SQUIRTLE] = { .growthRate = GROWTH_MEDIUM_SLOW },
+[SPECIES_MAGIKARP] = { .growthRate = GROWTH_SLOW },
+```
+
+### Experience Tables
+
+The `gExperienceTables` array stores cumulative EXP for each level:
+
+```c
+// Get EXP required to reach level 50 for a medium-slow Pokemon
+u32 expNeeded = gExperienceTables[GROWTH_MEDIUM_SLOW][50];
+
+// Get current level from EXP
+u8 GetLevelFromMonExp(struct Pokemon *mon)
+{
+    u32 exp = GetMonData(mon, MON_DATA_EXPERIENCE);
+    u16 species = GetMonData(mon, MON_DATA_SPECIES);
+    u8 growthRate = gSpeciesInfo[species].growthRate;
+
+    for (u8 level = 1; level <= MAX_LEVEL; level++)
+    {
+        if (gExperienceTables[growthRate][level] > exp)
+            return level - 1;
+    }
+    return MAX_LEVEL;
+}
+```
+
+## EV Yields
+
+When defeated, Pokemon grant EVs based on their `evYield_*` fields:
+
+```c
+// Each field is 2 bits: 0, 1, 2, or 3 EVs
+[SPECIES_GEODUDE] = {
+    .evYield_HP      = 0,
+    .evYield_Attack  = 0,
+    .evYield_Defense = 1,  // Grants 1 Defense EV
+    .evYield_Speed   = 0,
+    .evYield_SpAttack = 0,
+    .evYield_SpDefense = 0,
+},
+[SPECIES_ALAKAZAM] = {
+    .evYield_SpAttack = 3,  // Grants 3 Sp. Attack EVs
+},
+```
+
+### EV Yield Retrieval
+
+```c
+void AddEVsToParty(struct Pokemon *defeatedMon)
+{
+    u16 species = GetMonData(defeatedMon, MON_DATA_SPECIES);
+
+    u8 hpEV = gSpeciesInfo[species].evYield_HP;
+    u8 atkEV = gSpeciesInfo[species].evYield_Attack;
+    u8 defEV = gSpeciesInfo[species].evYield_Defense;
+    u8 spdEV = gSpeciesInfo[species].evYield_Speed;
+    u8 spAtkEV = gSpeciesInfo[species].evYield_SpAttack;
+    u8 spDefEV = gSpeciesInfo[species].evYield_SpDefense;
+
+    // Apply to party Pokemon that participated in battle
+    // (with Macho Brace doubling, Pokerus doubling, etc.)
+}
+```
+
+## Wild Held Items
+
+Pokemon can hold items when encountered in the wild:
+
+```c
+[SPECIES_PIKACHU] = {
+    .itemCommon = ITEM_NONE,           // No common item
+    .itemRare   = ITEM_LIGHT_BALL,     // 5% chance
+},
+[SPECIES_CHANSEY] = {
+    .itemCommon = ITEM_NONE,
+    .itemRare   = ITEM_LUCKY_EGG,
+},
+```
+
+**Probabilities:**
+- `itemCommon`: 50% chance if not `ITEM_NONE`
+- `itemRare`: 5% chance if not `ITEM_NONE`
+- If both are set, common has priority
+
+## Breeding Data
+
+### Egg Cycles
+
+Number of 256-step cycles to hatch an egg:
+
+```c
+[SPECIES_MAGIKARP] = {
+    .eggCycles = 5,     // 1,280 steps (fast)
+},
+[SPECIES_DRATINI] = {
+    .eggCycles = 40,    // 10,240 steps (slow)
+},
+[SPECIES_EEVEE] = {
+    .eggCycles = 35,    // 8,960 steps
+},
+```
+
+**Steps to hatch** = `(eggCycles + 1) * 256`
+
+### Egg Groups
+
+Determines breeding compatibility:
+
+```c
+#define EGG_GROUP_MONSTER       1
+#define EGG_GROUP_WATER_1       2
+#define EGG_GROUP_BUG           3
+#define EGG_GROUP_FLYING        4
+#define EGG_GROUP_FIELD         5
+#define EGG_GROUP_FAIRY         6
+#define EGG_GROUP_GRASS         7
+#define EGG_GROUP_HUMAN_LIKE    8
+#define EGG_GROUP_WATER_3       9
+#define EGG_GROUP_MINERAL      10
+#define EGG_GROUP_AMORPHOUS    11
+#define EGG_GROUP_WATER_2      12
+#define EGG_GROUP_DITTO        13
+#define EGG_GROUP_DRAGON       14
+#define EGG_GROUP_UNDISCOVERED 15  // Cannot breed
+
+[SPECIES_PIKACHU] = {
+    .eggGroups = {EGG_GROUP_FIELD, EGG_GROUP_FAIRY},
+},
+[SPECIES_DITTO] = {
+    .eggGroups = {EGG_GROUP_DITTO, EGG_GROUP_DITTO},
+},
+```
+
+### Base Friendship
+
+Starting happiness when caught or hatched:
+
+```c
+[SPECIES_CHANSEY] = {
+    .friendship = 140,  // High base happiness
+},
+[SPECIES_MEWTWO] = {
+    .friendship = 0,    // Legendaries start unfriendly
+},
+[SPECIES_PIKACHU] = {
+    .friendship = 70,   // Standard
+},
+```
+
+## Visual Properties
+
+### Body Color
+
+Used in Pokedex search:
+
+```c
+#define BODY_COLOR_RED      0
+#define BODY_COLOR_BLUE     1
+#define BODY_COLOR_YELLOW   2
+#define BODY_COLOR_GREEN    3
+#define BODY_COLOR_BLACK    4
+#define BODY_COLOR_BROWN    5
+#define BODY_COLOR_PURPLE   6
+#define BODY_COLOR_GRAY     7
+#define BODY_COLOR_WHITE    8
+#define BODY_COLOR_PINK     9
+
+[SPECIES_PIKACHU] = {
+    .bodyColor = BODY_COLOR_YELLOW,
+},
+```
+
+### Sprite Flip
+
+Controls whether the sprite can be horizontally flipped:
+
+```c
+[SPECIES_PIKACHU] = {
+    .noFlip = FALSE,    // Sprite can be flipped
+},
+// Some Pokemon have asymmetric designs that shouldn't flip
+```
+
+## Safari Zone
+
+```c
+[SPECIES_TAUROS] = {
+    .safariZoneFleeRate = 75,  // High flee tendency
+},
+[SPECIES_CHANSEY] = {
+    .safariZoneFleeRate = 125, // Very likely to flee
+},
+```
+
+## Complete Example
+
+Here's a complete species definition:
+
+```c
+[SPECIES_PIKACHU] = {
+    .baseHP        = 35,
+    .baseAttack    = 55,
+    .baseDefense   = 30,
+    .baseSpeed     = 90,
+    .baseSpAttack  = 50,
+    .baseSpDefense = 40,
+    .types = { TYPE_ELECTRIC, TYPE_ELECTRIC },
+    .catchRate = 190,
+    .expYield = 82,
+    .evYield_HP        = 0,
+    .evYield_Attack    = 0,
+    .evYield_Defense   = 0,
+    .evYield_Speed     = 2,
+    .evYield_SpAttack  = 0,
+    .evYield_SpDefense = 0,
+    .itemCommon = ITEM_NONE,
+    .itemRare   = ITEM_LIGHT_BALL,
+    .genderRatio = 0x7F,  // 50% male
+    .eggCycles = 10,
+    .friendship = 70,
+    .growthRate = GROWTH_MEDIUM_FAST,
+    .eggGroups = {EGG_GROUP_FIELD, EGG_GROUP_FAIRY},
+    .abilities = {ABILITY_STATIC, ABILITY_NONE},
+    .safariZoneFleeRate = 0,
+    .bodyColor = BODY_COLOR_YELLOW,
+    .noFlip = FALSE,
+},
+```
+
+## Related Data Tables
+
+### Level-Up Learnsets
+
+```c
+// What moves each species learns by level-up
+extern const u16 *const gLevelUpLearnsets[];
+
+// Format: LEVEL_UP_MOVE(move, level)
+static const struct LevelUpMove sPikachuLevelUpLearnset[] = {
+    LEVEL_UP_MOVE(MOVE_THUNDER_SHOCK, 1),
+    LEVEL_UP_MOVE(MOVE_GROWL, 1),
+    LEVEL_UP_MOVE(MOVE_TAIL_WHIP, 6),
+    LEVEL_UP_MOVE(MOVE_THUNDER_WAVE, 8),
+    // ...
+    LEVEL_UP_END
+};
+```
+
+### TM/HM Compatibility
+
+```c
+// Which TMs/HMs each species can learn
+extern const struct TMHMLearnset gTMHMLearnsets[];
+
+[SPECIES_PIKACHU] = { .learnset = {
+    .FOCUS_PUNCH = TRUE,
+    .TOXIC = TRUE,
+    .HIDDEN_POWER = TRUE,
+    .THUNDER = TRUE,
+    .THUNDERBOLT = TRUE,
+    .FLASH = TRUE,
+    // ...
+}},
+```
+
+### Evolution Data
+
+```c
+extern const struct Evolution gEvolutionTable[][EVOS_PER_MON];
+
+[SPECIES_PIKACHU] = {
+    {EVO_ITEM, ITEM_THUNDER_STONE, SPECIES_RAICHU},
+},
+[SPECIES_PICHU] = {
+    {EVO_FRIENDSHIP, 0, SPECIES_PIKACHU},
+},
+```
+
+### Tutor Move Learnsets
+
+```c
+extern const u32 gTutorLearnsets[];
+
+[SPECIES_PIKACHU] = (TUTOR(MOVE_MEGA_PUNCH)
+                   | TUTOR(MOVE_MEGA_KICK)
+                   | TUTOR(MOVE_BODY_SLAM)
+                   | TUTOR(MOVE_DOUBLE_EDGE)
+                   | TUTOR(MOVE_THUNDER_WAVE)
+                   | TUTOR(MOVE_SUBSTITUTE)),
+```
+
+## File Locations
+
+| Data | File |
+|------|------|
+| SpeciesInfo definitions | `src/data/pokemon/species_info.h` |
+| Level-up learnsets | `src/data/pokemon/level_up_learnsets.h` |
+| TM/HM compatibility | `src/data/pokemon/tmhm_learnsets.h` |
+| Evolution data | `src/data/pokemon/evolution.h` |
+| Tutor learnsets | `src/data/pokemon/tutor_learnsets.h` |
+| Experience tables | `src/data/pokemon/experience_tables.h` |
+
+## Related Topics
+
+- [Pokemon Data Structures](/pokemon/data-structures) - How individual Pokemon store data
+- [Stats Calculation](/pokemon/stats-calculation) - How base stats become actual stats
+- [Encryption](/pokemon/encryption) - How Pokemon data is protected

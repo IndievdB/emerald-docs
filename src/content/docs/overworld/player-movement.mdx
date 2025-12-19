@@ -1,0 +1,884 @@
+---
+title: Player Movement
+description: Walking, running, biking, surfing, and collision in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Player movement is handled by `src/field_player_avatar.c` and processes input every frame. The system supports multiple movement modes (walking, running, biking, surfing, diving) and handles collision detection, terrain effects, and state transitions.
+
+## Player Avatar Architecture
+
+<DiagramContainer title="Player Movement System">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Input["Input Processing (CB1)"]
+        Keys[D-Pad Input]
+        FieldInput[FieldGetPlayerInput]
+    end
+
+    subgraph Avatar["gPlayerAvatar"]
+        Flags[Avatar Flags<br/>ON_FOOT, MACH_BIKE, etc.]
+        State[Running State<br/>NOT_MOVING, MOVING, etc.]
+        TileState[Tile Transition State]
+    end
+
+    subgraph Movement["Movement Processing"]
+        PlayerStep[PlayerStep]
+        Collision[Collision Check]
+        Execute[Execute Movement]
+    end
+
+    subgraph Effects["Side Effects"]
+        Camera[Camera Follow]
+        Ground[Ground Effects]
+        Encounters[Wild Encounters]
+    end
+
+    Keys --> FieldInput
+    FieldInput --> PlayerStep
+    PlayerStep --> Collision
+    Collision --> Execute
+    Execute --> Avatar
+    Execute --> Camera
+    Execute --> Ground
+    Ground --> Encounters`}
+</pre>
+</DiagramContainer>
+
+## The gPlayerAvatar Structure
+
+All player state lives in a global structure:
+
+```c
+struct PlayerAvatar
+{
+    /*0x00*/ u8 flags;              // PLAYER_AVATAR_FLAG_* bitfield
+    /*0x01*/ u8 transitionFlags;    // State transition in progress
+    /*0x02*/ u8 runningState;       // NOT_MOVING, TURN_DIRECTION, MOVING
+    /*0x03*/ u8 tileTransitionState;// Movement progress within tile
+    /*0x04*/ u8 spriteId;           // OAM sprite index
+    /*0x05*/ u8 objectEventId;      // Index into gObjectEvents[]
+    /*0x06*/ bool8 preventStep;     // Lock movement temporarily
+    /*0x07*/ u8 gender;             // MALE or FEMALE
+    /*0x08*/ u8 acroBikeState;      // Wheelie/bunny hop state
+    /*0x09*/ u8 newDirBackup;       // Direction backup for transitions
+    /*0x0A*/ u8 bikeFrameCounter;   // Frame counter for bike speed
+    /*0x0B*/ u8 bikeSpeed;          // Current bike speed level
+    /*0x0C*/ u32 directionHistory;  // Recent directions (for tricks)
+    /*0x10*/ u32 abStartSelectHistory; // Button history for tricks
+    /*0x14*/ u8 unk14;
+    /*0x15*/ u8 unk15;
+    /*0x16*/ u8 unk16;
+    /*0x17*/ u8 unk17;
+};
+
+extern struct PlayerAvatar gPlayerAvatar;
+```
+
+### Avatar Flags
+
+The `flags` field determines the player's current movement mode:
+
+```c
+#define PLAYER_AVATAR_FLAG_ON_FOOT          (1 << 0)  // Walking/running
+#define PLAYER_AVATAR_FLAG_MACH_BIKE        (1 << 1)  // Mach Bike
+#define PLAYER_AVATAR_FLAG_ACRO_BIKE        (1 << 2)  // Acro Bike
+#define PLAYER_AVATAR_FLAG_SURFING          (1 << 3)  // On water
+#define PLAYER_AVATAR_FLAG_UNDERWATER       (1 << 4)  // Diving
+#define PLAYER_AVATAR_FLAG_CONTROLLABLE     (1 << 5)  // Can accept input
+#define PLAYER_AVATAR_FLAG_FORCED_MOVE      (1 << 6)  // Script controlling
+#define PLAYER_AVATAR_FLAG_DASH             (1 << 7)  // Running (B held)
+
+// Check current mode
+#define TestPlayerAvatarFlags(flags) (gPlayerAvatar.flags & (flags))
+```
+
+### Running States
+
+```c
+enum {
+    NOT_MOVING,         // Standing still
+    TURN_DIRECTION,     // Turning to face new direction
+    MOVING,             // Walking/running
+};
+
+// Tile transition states (sub-states of movement)
+enum {
+    T_NOT_MOVING,       // Centered on tile, stationary
+    T_TILE_TRANSITION,  // Moving between tiles
+    T_TILE_CENTER,      // Just reached center of new tile
+};
+```
+
+## Input Processing
+
+Every frame, CB1_Overworld processes player input:
+
+<DiagramContainer title="Input to Movement Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant CB1 as CB1_Overworld
+    participant Input as FieldInput
+    participant Avatar as PlayerAvatar
+    participant Obj as ObjectEvent
+
+    CB1->>Input: FieldGetPlayerInput(keys)
+    Input->>Input: Check D-pad direction
+    Input->>Input: Check B button (run)
+    Input->>Avatar: PlayerStep(direction)
+    Avatar->>Avatar: Check if can move
+    Avatar->>Avatar: CheckCollision()
+    alt No Collision
+        Avatar->>Obj: Start movement animation
+        Avatar->>Avatar: Update position
+    else Collision
+        Avatar->>Avatar: Handle collision type
+    end`}
+</pre>
+</DiagramContainer>
+
+### FieldInput Structure
+
+```c
+struct FieldInput
+{
+    bool8 pressedAButton:1;
+    bool8 checkStandardWildEncounter:1;
+    bool8 pressedStartButton:1;
+    bool8 pressedSelectButton:1;
+    bool8 heldDirection:1;      // D-pad held
+    bool8 heldDirection2:1;     // (duplicate for double speed)
+    bool8 tookStep:1;           // Player moved this frame
+    bool8 pressedBButton:1;
+    bool8 pressedLButton:1;
+    bool8 pressedRButton:1;
+    bool8 input_field_1_0:1;
+    bool8 input_field_1_1:1;
+    bool8 input_field_1_2:1;
+    bool8 input_field_1_3:1;
+    bool8 input_field_1_4:1;
+    bool8 input_field_1_5:1;
+    u8 dpadDirection;           // DIR_NORTH, DIR_SOUTH, etc.
+};
+```
+
+### Input Processing Code
+
+```c
+static void FieldGetPlayerInput(struct FieldInput *input, u16 newKeys, u16 heldKeys)
+{
+    // Check D-pad
+    input->dpadDirection = GetPlayerMovementDirection();
+
+    if (input->dpadDirection != DIR_NONE)
+        input->heldDirection = TRUE;
+
+    // Check buttons
+    if (newKeys & A_BUTTON)
+        input->pressedAButton = TRUE;
+
+    if (newKeys & B_BUTTON)
+        input->pressedBButton = TRUE;
+
+    if (newKeys & START_BUTTON)
+        input->pressedStartButton = TRUE;
+
+    if (newKeys & SELECT_BUTTON)
+        input->pressedSelectButton = TRUE;
+}
+
+static u8 GetPlayerMovementDirection(void)
+{
+    // Priority: Up > Down > Left > Right
+    if (gMain.heldKeys & DPAD_UP)
+        return DIR_NORTH;
+    if (gMain.heldKeys & DPAD_DOWN)
+        return DIR_SOUTH;
+    if (gMain.heldKeys & DPAD_LEFT)
+        return DIR_WEST;
+    if (gMain.heldKeys & DPAD_RIGHT)
+        return DIR_EAST;
+
+    return DIR_NONE;
+}
+```
+
+## PlayerStep - The Core Movement Function
+
+`PlayerStep()` is called every frame when the player can move:
+
+```c
+void PlayerStep(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    struct ObjectEvent *playerObjEvent = &gObjectEvents[gPlayerAvatar.objectEventId];
+
+    // Handle current movement mode
+    if (gPlayerAvatar.flags & PLAYER_AVATAR_FLAG_MACH_BIKE)
+    {
+        MachBikeMovement(direction, newKeys, heldKeys);
+    }
+    else if (gPlayerAvatar.flags & PLAYER_AVATAR_FLAG_ACRO_BIKE)
+    {
+        AcroBikeMovement(direction, newKeys, heldKeys);
+    }
+    else if (gPlayerAvatar.flags & PLAYER_AVATAR_FLAG_SURFING)
+    {
+        SurfingMovement(direction, newKeys, heldKeys);
+    }
+    else if (gPlayerAvatar.flags & PLAYER_AVATAR_FLAG_UNDERWATER)
+    {
+        UnderwaterMovement(direction, newKeys, heldKeys);
+    }
+    else
+    {
+        // Walking/running on foot
+        WalkingMovement(direction, newKeys, heldKeys);
+    }
+}
+```
+
+### Walking Movement
+
+```c
+static void WalkingMovement(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    if (direction == DIR_NONE)
+    {
+        // No input - stop if currently moving
+        gPlayerAvatar.runningState = NOT_MOVING;
+        return;
+    }
+
+    // Check for collision in the target direction
+    u8 collision = CheckForPlayerAvatarCollision(direction);
+
+    switch (collision)
+    {
+    case COLLISION_NONE:
+        // Can move - check if running
+        if (heldKeys & B_BUTTON && CanPlayerRun())
+        {
+            PlayerRun(direction);
+        }
+        else
+        {
+            PlayerWalk(direction);
+        }
+        break;
+
+    case COLLISION_LEDGE_JUMP:
+        PlayerJumpLedge(direction);
+        break;
+
+    case COLLISION_OBJECT_EVENT:
+        // Bump into NPC, can't move
+        PlayerFaceDirection(direction);
+        break;
+
+    case COLLISION_IMPASSABLE:
+        // Wall or obstacle
+        PlayerFaceDirection(direction);
+        break;
+
+    case COLLISION_ELEVATION_MISMATCH:
+        // Can't walk on different height
+        PlayerFaceDirection(direction);
+        break;
+    }
+}
+```
+
+## Collision Detection
+
+Before moving, the system checks what's in the target tile:
+
+<DiagramContainer title="Collision Detection Flow">
+<pre class="mermaid">
+{`flowchart TD
+    A[Player wants to move] --> B{Target on map?}
+    B -->|No| C[COLLISION_OUTSIDE_RANGE]
+    B -->|Yes| D{Check metatile behavior}
+    D --> E{Impassable?}
+    E -->|Yes| F[COLLISION_IMPASSABLE]
+    E -->|No| G{Ledge tile?}
+    G -->|Yes| H[COLLISION_LEDGE_JUMP]
+    G -->|No| I{Object blocking?}
+    I -->|Yes| J[COLLISION_OBJECT_EVENT]
+    I -->|No| K{Elevation match?}
+    K -->|No| L[COLLISION_ELEVATION_MISMATCH]
+    K -->|Yes| M[COLLISION_NONE]`}
+</pre>
+</DiagramContainer>
+
+### Collision Types
+
+```c
+enum {
+    COLLISION_NONE,                  // Can move freely
+    COLLISION_OUTSIDE_RANGE,         // Off map edge
+    COLLISION_IMPASSABLE,            // Wall/obstacle
+    COLLISION_ELEVATION_MISMATCH,    // Different height level
+    COLLISION_OBJECT_EVENT,          // NPC blocking path
+    COLLISION_STOP_SURFING,          // Land while surfing
+    COLLISION_LEDGE_JUMP,            // Jump down ledge
+    COLLISION_PUSHED_BOULDER,        // Strength boulder
+    COLLISION_ROTATING_GATE,         // Secret base gate
+    COLLISION_WHEELIE_HOP,           // Acro bike rail hop
+    COLLISION_ISOLATED_VERTICAL_RAIL,
+    COLLISION_ISOLATED_HORIZONTAL_RAIL,
+    COLLISION_VERTICAL_RAIL,
+    COLLISION_HORIZONTAL_RAIL,
+};
+```
+
+### Collision Check Implementation
+
+```c
+u8 CheckForPlayerAvatarCollision(u8 direction)
+{
+    s16 x, y;
+    struct ObjectEvent *playerObj = &gObjectEvents[gPlayerAvatar.objectEventId];
+
+    // Get current position
+    x = playerObj->currentCoords.x;
+    y = playerObj->currentCoords.y;
+
+    // Calculate target position
+    MoveCoords(direction, &x, &y);
+
+    // Check if outside map boundaries
+    if (!IsPositionInsideMap(x, y))
+        return COLLISION_OUTSIDE_RANGE;
+
+    // Get metatile behavior at target
+    u8 behavior = MapGridGetMetatileBehaviorAt(x, y);
+
+    // Check if impassable
+    if (MetatileBehavior_IsImpassable(behavior))
+        return COLLISION_IMPASSABLE;
+
+    // Check for ledge
+    if (MetatileBehavior_IsJumpLedge(behavior, direction))
+        return COLLISION_LEDGE_JUMP;
+
+    // Check for object event (NPC)
+    if (GetCollisionAtCoords(playerObj, x, y, direction) != COLLISION_NONE)
+        return COLLISION_OBJECT_EVENT;
+
+    // Check elevation
+    u8 targetElevation = MapGridGetElevationAt(x, y);
+    if (!AreElevationsCompatible(playerObj->currentElevation, targetElevation))
+        return COLLISION_ELEVATION_MISMATCH;
+
+    return COLLISION_NONE;
+}
+```
+
+## Movement Modes
+
+### Walking
+
+Standard movement at 1 tile per 16 frames:
+
+```c
+static void PlayerWalk(u8 direction)
+{
+    gPlayerAvatar.runningState = MOVING;
+    gPlayerAvatar.flags &= ~PLAYER_AVATAR_FLAG_DASH;
+
+    ObjectEventSetMovementType(
+        &gObjectEvents[gPlayerAvatar.objectEventId],
+        GetWalkingMovementAction(direction)
+    );
+}
+
+// Walking animation takes 16 frames per tile
+#define WALK_FRAMES_PER_TILE  16
+```
+
+### Running
+
+Faster movement when B is held (1 tile per 8 frames):
+
+```c
+static void PlayerRun(u8 direction)
+{
+    gPlayerAvatar.runningState = MOVING;
+    gPlayerAvatar.flags |= PLAYER_AVATAR_FLAG_DASH;
+
+    ObjectEventSetMovementType(
+        &gObjectEvents[gPlayerAvatar.objectEventId],
+        GetRunningMovementAction(direction)
+    );
+}
+
+// Running speed - twice as fast as walking
+#define RUN_FRAMES_PER_TILE   8
+
+// Check if player can run
+bool8 CanPlayerRun(void)
+{
+    // Can't run indoors (unless Running Shoes badge)
+    if (!gMapHeader.allowRunning)
+        return FALSE;
+
+    // Can run on normal ground
+    if (TestPlayerAvatarFlags(PLAYER_AVATAR_FLAG_ON_FOOT))
+        return TRUE;
+
+    return FALSE;
+}
+```
+
+### Mach Bike
+
+High-speed bike that builds momentum:
+
+```c
+static void MachBikeMovement(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    // Mach bike has 4 speed levels
+    // Speed increases while moving, decreases when turning
+
+    if (direction == DIR_NONE)
+    {
+        // Slow down when no input
+        DecreaseMachBikeSpeed();
+        gPlayerAvatar.runningState = NOT_MOVING;
+        return;
+    }
+
+    // Check if turning (resets speed)
+    u8 currentDir = GetPlayerFacingDirection();
+    if (direction != currentDir)
+    {
+        // Turning - reset to minimum speed
+        gPlayerAvatar.bikeSpeed = MACH_BIKE_SPEED_MIN;
+    }
+
+    // Try to move
+    u8 collision = CheckForPlayerAvatarCollision(direction);
+
+    if (collision == COLLISION_NONE)
+    {
+        // Accelerate
+        if (gPlayerAvatar.bikeSpeed < MACH_BIKE_SPEED_MAX)
+            gPlayerAvatar.bikeSpeed++;
+
+        // Move at current speed
+        MachBikeMove(direction, gPlayerAvatar.bikeSpeed);
+    }
+    else if (collision == COLLISION_LEDGE_JUMP)
+    {
+        // Can jump ledges at any speed
+        PlayerJumpLedge(direction);
+    }
+    else
+    {
+        // Hit obstacle - reset speed
+        gPlayerAvatar.bikeSpeed = MACH_BIKE_SPEED_MIN;
+        PlayerFaceDirection(direction);
+    }
+}
+
+// Mach bike speed levels
+#define MACH_BIKE_SPEED_MIN      0
+#define MACH_BIKE_SPEED_SLOW     1
+#define MACH_BIKE_SPEED_MED      2
+#define MACH_BIKE_SPEED_FAST     3
+#define MACH_BIKE_SPEED_MAX      4
+```
+
+<DiagramContainer title="Mach Bike Speed States">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> Stopped
+    Stopped --> Speed1: Move forward
+    Speed1 --> Speed2: Continue moving
+    Speed2 --> Speed3: Continue moving
+    Speed3 --> Speed4: Continue moving
+    Speed4 --> Speed4: Max speed
+
+    Speed4 --> Speed1: Turn
+    Speed3 --> Speed1: Turn
+    Speed2 --> Speed1: Turn
+
+    Speed4 --> Stopped: Release D-pad
+    Speed3 --> Stopped: Release D-pad
+    Speed2 --> Stopped: Release D-pad
+    Speed1 --> Stopped: Release D-pad`}
+</pre>
+</DiagramContainer>
+
+### Acro Bike
+
+Trick bike with wheelies and bunny hops:
+
+```c
+static void AcroBikeMovement(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    // Record direction history for tricks
+    UpdateAcroBikeDirectionHistory(direction);
+
+    // Check for trick inputs
+    if (heldKeys & B_BUTTON)
+    {
+        if (direction == DIR_NONE)
+        {
+            // Wheelie in place
+            AcroBikeWheelieInPlace();
+        }
+        else
+        {
+            // Wheelie while moving
+            AcroBikeWheelieMove(direction);
+        }
+        return;
+    }
+
+    // Check for bunny hop (B tap while moving)
+    if (newKeys & B_BUTTON && gPlayerAvatar.acroBikeState == ACRO_STATE_MOVING)
+    {
+        AcroBikeBunnyHop(direction);
+        return;
+    }
+
+    // Normal movement
+    u8 collision = CheckForPlayerAvatarCollision(direction);
+
+    if (collision == COLLISION_NONE)
+    {
+        AcroBikeNormalMove(direction);
+    }
+    else if (collision == COLLISION_WHEELIE_HOP)
+    {
+        // Hop over rail
+        AcroBikeRailHop(direction);
+    }
+    // ... other collision handling
+}
+
+// Acro bike states
+enum {
+    ACRO_STATE_NORMAL,
+    ACRO_STATE_MOVING,
+    ACRO_STATE_WHEELIE,
+    ACRO_STATE_BUNNY_HOP,
+    ACRO_STATE_WHEELIE_HOP,
+    ACRO_STATE_SIDE_JUMP,
+};
+```
+
+### Surfing
+
+Movement on water:
+
+```c
+static void SurfingMovement(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    if (direction == DIR_NONE)
+    {
+        gPlayerAvatar.runningState = NOT_MOVING;
+        return;
+    }
+
+    // Check collision
+    u8 collision = CheckForPlayerAvatarCollisionSurfing(direction);
+
+    switch (collision)
+    {
+    case COLLISION_NONE:
+        // Continue surfing
+        SurfingMove(direction);
+        break;
+
+    case COLLISION_STOP_SURFING:
+        // Reached land - dismount
+        StartSurfDismount(direction);
+        break;
+
+    case COLLISION_OBJECT_EVENT:
+    case COLLISION_IMPASSABLE:
+        // Can't move
+        PlayerFaceDirection(direction);
+        break;
+    }
+}
+
+// Check if can start surfing from current position
+bool8 CanStartSurfing(void)
+{
+    s16 x, y;
+    u8 direction = GetPlayerFacingDirection();
+
+    // Get position player is facing
+    x = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x;
+    y = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y;
+    MoveCoords(direction, &x, &y);
+
+    // Check if it's surfable water
+    u8 behavior = MapGridGetMetatileBehaviorAt(x, y);
+    return MetatileBehavior_IsSurfableWaterOrUnderwater(behavior);
+}
+```
+
+### Diving
+
+Underwater movement:
+
+```c
+static void UnderwaterMovement(u8 direction, u16 newKeys, u16 heldKeys)
+{
+    // Similar to surfing but underwater
+    // Can surface at certain spots
+
+    if (direction == DIR_NONE)
+    {
+        gPlayerAvatar.runningState = NOT_MOVING;
+        return;
+    }
+
+    u8 collision = CheckForPlayerAvatarCollisionDiving(direction);
+
+    if (collision == COLLISION_NONE)
+    {
+        DivingMove(direction);
+    }
+    else
+    {
+        PlayerFaceDirection(direction);
+    }
+}
+
+// Check if can dive from current position
+bool8 CanDive(void)
+{
+    u8 behavior = GetPlayerCurrentMetatileBehavior();
+    return MetatileBehavior_IsDiveable(behavior);
+}
+
+// Check if can surface
+bool8 CanSurface(void)
+{
+    u8 behavior = GetPlayerCurrentMetatileBehavior();
+    return MetatileBehavior_IsSurfaceable(behavior);
+}
+```
+
+## Ledge Jumping
+
+When the player walks off a ledge, they jump down:
+
+```c
+static void PlayerJumpLedge(u8 direction)
+{
+    // Determine jump distance (always 2 tiles for ledges)
+    struct ObjectEvent *playerObj = &gObjectEvents[gPlayerAvatar.objectEventId];
+
+    // Play jump animation
+    ObjectEventSetMovementType(playerObj, GetLedgeJumpMovementAction(direction));
+
+    // Trigger ground effect when landing
+    playerObj->triggerGroundEffectsOnMove = TRUE;
+
+    // Play sound effect
+    PlaySE(SE_LEDGE);
+}
+
+// Get the movement action for ledge jumping
+static u8 GetLedgeJumpMovementAction(u8 direction)
+{
+    switch (direction)
+    {
+    case DIR_SOUTH: return MOVEMENT_ACTION_JUMP_2_DOWN;
+    case DIR_NORTH: return MOVEMENT_ACTION_JUMP_2_UP;
+    case DIR_WEST:  return MOVEMENT_ACTION_JUMP_2_LEFT;
+    case DIR_EAST:  return MOVEMENT_ACTION_JUMP_2_RIGHT;
+    }
+    return MOVEMENT_ACTION_FACE_DOWN;
+}
+```
+
+<DiagramContainer title="Ledge Jump Sequence">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Player
+    participant Collision as Collision Check
+    participant Anim as Animation
+    participant Ground as Ground Effect
+
+    Player->>Collision: Walk towards ledge
+    Collision->>Player: COLLISION_LEDGE_JUMP
+    Player->>Anim: Start jump animation
+    Anim->>Anim: Jump arc (2 tiles)
+    Anim->>Ground: Land on new tile
+    Ground->>Ground: Spawn dust effect
+    Ground->>Player: Movement complete`}
+</pre>
+</DiagramContainer>
+
+## Forced Movement
+
+Certain tiles force the player to move:
+
+```c
+// Ice sliding
+void DoIceSliding(void)
+{
+    u8 direction = GetPlayerFacingDirection();
+
+    // Check if still on ice
+    if (!MetatileBehavior_IsIce(GetPlayerCurrentMetatileBehavior()))
+    {
+        // Stopped sliding
+        gPlayerAvatar.flags &= ~PLAYER_AVATAR_FLAG_FORCED_MOVE;
+        return;
+    }
+
+    // Check collision ahead
+    u8 collision = CheckForPlayerAvatarCollision(direction);
+
+    if (collision == COLLISION_NONE)
+    {
+        // Keep sliding
+        PlayerSlideOnIce(direction);
+    }
+    else
+    {
+        // Hit wall - stop
+        gPlayerAvatar.flags &= ~PLAYER_AVATAR_FLAG_FORCED_MOVE;
+    }
+}
+
+// Spin tiles (arrow panels)
+void DoSpinTile(void)
+{
+    u8 spinDirection = GetSpinTileDirection(GetPlayerCurrentMetatileBehavior());
+
+    // Force player to spin in the direction
+    StartPlayerSpinMovement(spinDirection);
+}
+
+// Water currents
+void DoWaterCurrent(void)
+{
+    u8 currentDir = GetCurrentDirection(GetPlayerCurrentMetatileBehavior());
+
+    // Move player with current
+    PlayerMoveWithCurrent(currentDir);
+}
+```
+
+## Terrain Effects
+
+Different terrain triggers different effects:
+
+```c
+// Called when player takes a step
+void HandleStepEffects(void)
+{
+    u8 behavior = GetPlayerCurrentMetatileBehavior();
+
+    // Tall grass - possible wild encounter
+    if (MetatileBehavior_IsTallGrass(behavior))
+    {
+        PlaySE(SE_GRASS_RUSTLE);
+        SpawnGrassRustleEffect();
+        TryStartWildEncounter();
+    }
+
+    // Sand - leave footprints
+    if (MetatileBehavior_IsSand(behavior))
+    {
+        SpawnSandFootprints();
+    }
+
+    // Shallow water - splash effect
+    if (MetatileBehavior_IsShallowWater(behavior))
+    {
+        PlaySE(SE_PUDDLE);
+        SpawnSplashEffect();
+    }
+
+    // Cracked floor (Sky Pillar)
+    if (MetatileBehavior_IsCrackedFloor(behavior))
+    {
+        TryCrackFloor();
+    }
+
+    // Deep sand - slower movement
+    if (MetatileBehavior_IsDeepSand(behavior))
+    {
+        gPlayerAvatar.flags |= PLAYER_AVATAR_FLAG_FORCED_MOVE;
+    }
+}
+```
+
+## State Transitions
+
+<DiagramContainer title="Avatar State Transitions">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> OnFoot
+
+    OnFoot --> Surfing: Use Surf
+    OnFoot --> MachBike: Get on Mach Bike
+    OnFoot --> AcroBike: Get on Acro Bike
+
+    Surfing --> Diving: Use Dive
+    Surfing --> OnFoot: Reach shore
+
+    Diving --> Surfing: Surface
+
+    MachBike --> OnFoot: Get off bike
+    AcroBike --> OnFoot: Get off bike
+
+    MachBike --> MachBike: Cannot surf on bike
+    AcroBike --> AcroBike: Cannot surf on bike`}
+</pre>
+</DiagramContainer>
+
+```c
+// Transition to surfing
+void StartSurfing(void)
+{
+    gPlayerAvatar.flags &= ~PLAYER_AVATAR_FLAG_ON_FOOT;
+    gPlayerAvatar.flags |= PLAYER_AVATAR_FLAG_SURFING;
+
+    // Change sprite to surfing sprite
+    SetPlayerAvatarGraphicsId(GetPlayerSurfingGraphicsId());
+
+    // Spawn Lapras/water mon sprite
+    CreateSurfBlobSprite();
+}
+
+// Get off bike
+void DismountBike(void)
+{
+    gPlayerAvatar.flags &= ~(PLAYER_AVATAR_FLAG_MACH_BIKE | PLAYER_AVATAR_FLAG_ACRO_BIKE);
+    gPlayerAvatar.flags |= PLAYER_AVATAR_FLAG_ON_FOOT;
+
+    // Change sprite back to normal
+    SetPlayerAvatarGraphicsId(GetPlayerNormalGraphicsId());
+
+    gPlayerAvatar.bikeSpeed = 0;
+}
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `PlayerStep()` | field_player_avatar.c | Main movement entry point |
+| `CheckForPlayerAvatarCollision()` | field_player_avatar.c | Collision detection |
+| `PlayerWalk()` | field_player_avatar.c | Walking movement |
+| `PlayerRun()` | field_player_avatar.c | Running movement |
+| `MachBikeMovement()` | field_player_avatar.c | Mach bike handling |
+| `AcroBikeMovement()` | field_player_avatar.c | Acro bike handling |
+| `SurfingMovement()` | field_player_avatar.c | Water movement |
+| `PlayerJumpLedge()` | field_player_avatar.c | Ledge jumping |
+| `GetPlayerFacingDirection()` | field_player_avatar.c | Get current direction |
+| `SetPlayerAvatarGraphicsId()` | field_player_avatar.c | Change player sprite |
+| `GetPlayerCurrentMetatileBehavior()` | field_player_avatar.c | Get terrain type |

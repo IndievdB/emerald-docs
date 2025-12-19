@@ -1,0 +1,410 @@
+---
+title: Save Validation
+description: Checksums, signatures, and corruption detection for save integrity
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald uses multiple validation mechanisms to ensure save data integrity. Each sector contains a signature, checksum, and counter that work together to detect corruption and select the best available save slot.
+
+## Validation Components
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph Sector["Sector Footer"]
+        ID["ID<br/>(2 bytes)"]
+        CS["Checksum<br/>(2 bytes)"]
+        SIG["Signature<br/>(4 bytes)"]
+        CTR["Counter<br/>(4 bytes)"]
+    end
+
+    subgraph Checks["Validation Steps"]
+        C1["1. Check Signature<br/>== 0x08012025"]
+        C2["2. Verify Checksum<br/>matches data"]
+        C3["3. Compare Counters<br/>between slots"]
+    end
+
+    SIG --> C1
+    CS --> C2
+    CTR --> C3
+
+    style SIG fill:#f99,stroke:#333,color:#000
+    style CS fill:#9f9,stroke:#333,color:#000
+    style CTR fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Checksum Algorithm
+
+The checksum is a 16-bit value computed from all data bytes:
+
+```c
+static u16 CalculateChecksum(void *data, u16 size)
+{
+    u16 i;
+    u32 checksum = 0;
+
+    // Sum all 32-bit words in the data
+    for (i = 0; i < (size / 4); i++)
+    {
+        checksum += *((u32 *)data);
+        data += sizeof(u32);
+    }
+
+    // Fold 32-bit sum into 16 bits
+    return ((checksum >> 16) + checksum);
+}
+```
+
+### How It Works
+
+1. **Sum all 32-bit words** - Add each 4-byte chunk as an unsigned integer
+2. **Fold to 16 bits** - Add upper 16 bits to lower 16 bits
+3. **Natural overflow** - The u16 return type truncates to 16 bits
+
+### Example
+
+For a small data block `[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]`:
+
+```
+Word 1: 0x78563412
+Word 2: 0xF0DEBC9A
+
+Sum: 0x78563412 + 0xF0DEBC9A = 0x16934F0AC
+
+Fold: (0x16934 >> 16) + 0x16934 = 0x0001 + 0x6934 = 0x6935
+Final (truncated to u16): 0x6935
+```
+
+## Signature Validation
+
+Every valid sector must have the magic signature `0x08012025`:
+
+```c
+#define SECTOR_SIGNATURE 0x08012025
+
+// Check if sector has valid signature
+if (gReadWriteSector->signature == SECTOR_SIGNATURE)
+{
+    signatureValid = TRUE;
+    // Proceed with checksum validation
+}
+else
+{
+    // Sector is empty or corrupted
+    return SAVE_STATUS_EMPTY;
+}
+```
+
+The signature serves as a quick sanity check before spending time on checksum calculation. An empty (never-written) sector will have all 0xFF or 0x00 bytes, which won't match the signature.
+
+## Sector Validation Flow
+
+<DiagramContainer>
+<pre class="mermaid">
+{`flowchart TD
+    Start["Read Sector"] --> CheckSig{"Signature<br/>== 0x08012025?"}
+    CheckSig -->|No| Empty["SAVE_STATUS_EMPTY"]
+    CheckSig -->|Yes| CalcCS["Calculate Checksum"]
+    CalcCS --> CheckCS{"Checksum<br/>matches?"}
+    CheckCS -->|No| Corrupt["SAVE_STATUS_CORRUPT"]
+    CheckCS -->|Yes| Valid["SAVE_STATUS_OK"]
+
+    style Empty fill:#ff9,stroke:#333,color:#000
+    style Corrupt fill:#f99,stroke:#333,color:#000
+    style Valid fill:#9f9,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Save Slot Validation
+
+When loading a game, both save slots are validated to determine which to use:
+
+```c
+static u8 GetSaveValidStatus(const struct SaveSectorLocation *locations)
+{
+    u32 saveSlot1Counter = 0;
+    u32 saveSlot2Counter = 0;
+    u32 validSectorFlags = 0;
+    bool8 signatureValid = FALSE;
+    u8 saveSlot1Status, saveSlot2Status;
+
+    // === Validate Save Slot 1 (Sectors 0-13) ===
+    for (i = 0; i < NUM_SECTORS_PER_SLOT; i++)
+    {
+        ReadFlashSector(i, gReadWriteSector);
+
+        // Check signature
+        if (gReadWriteSector->signature == SECTOR_SIGNATURE)
+        {
+            signatureValid = TRUE;
+
+            // Calculate and verify checksum
+            checksum = CalculateChecksum(
+                gReadWriteSector->data,
+                locations[gReadWriteSector->id].size
+            );
+
+            if (gReadWriteSector->checksum == checksum)
+            {
+                // Valid sector - record counter and mark as valid
+                saveSlot1Counter = gReadWriteSector->counter;
+                validSectorFlags |= 1 << gReadWriteSector->id;
+            }
+        }
+    }
+
+    // Determine slot 1 status
+    if (signatureValid)
+    {
+        // Check if ALL 14 sectors are valid
+        if (validSectorFlags == (1 << NUM_SECTORS_PER_SLOT) - 1)
+            saveSlot1Status = SAVE_STATUS_OK;
+        else
+            saveSlot1Status = SAVE_STATUS_ERROR;  // Some sectors corrupted
+    }
+    else
+    {
+        saveSlot1Status = SAVE_STATUS_EMPTY;  // No valid signatures
+    }
+
+    // === Repeat for Save Slot 2 (Sectors 14-27) ===
+    // ... same process ...
+
+    // === Select Best Slot ===
+    return DetermineBestSlot(saveSlot1Status, saveSlot2Status,
+                             saveSlot1Counter, saveSlot2Counter);
+}
+```
+
+### Valid Sector Bitmask
+
+The `validSectorFlags` bitmask tracks which sectors passed validation:
+
+```c
+// Each bit represents one sector (0-13)
+validSectorFlags |= 1 << gReadWriteSector->id;
+
+// All sectors valid when:
+// validSectorFlags == 0b11111111111111 (14 bits set)
+// validSectorFlags == (1 << 14) - 1 = 0x3FFF
+```
+
+## Slot Selection Logic
+
+When both slots have valid data, the counter determines which is newer:
+
+```c
+if (saveSlot1Status == SAVE_STATUS_OK && saveSlot2Status == SAVE_STATUS_OK)
+{
+    // Handle counter wraparound at u32 max
+    if ((saveSlot1Counter == -1 && saveSlot2Counter == 0) ||
+        (saveSlot1Counter == 0 && saveSlot2Counter == -1))
+    {
+        // Special case: counter wrapped from 0xFFFFFFFF to 0
+        if ((unsigned)(saveSlot1Counter + 1) < (unsigned)(saveSlot2Counter + 1))
+            gSaveCounter = saveSlot2Counter;
+        else
+            gSaveCounter = saveSlot1Counter;
+    }
+    else
+    {
+        // Normal case: higher counter is newer
+        if (saveSlot1Counter < saveSlot2Counter)
+            gSaveCounter = saveSlot2Counter;
+        else
+            gSaveCounter = saveSlot1Counter;
+    }
+    return SAVE_STATUS_OK;
+}
+```
+
+### Counter Wraparound
+
+The save counter is a 32-bit unsigned integer that increments each save. The code handles the edge case where it wraps from `0xFFFFFFFF` to `0`:
+
+```
+Save #4294967295: counter = 0xFFFFFFFF (in slot 1)
+Save #4294967296: counter = 0x00000000 (in slot 2)
+
+Without special handling: 0 < 0xFFFFFFFF, so slot 1 would be chosen (wrong!)
+With special handling: (0 + 1) > (0xFFFFFFFF + 1), so slot 2 is chosen (correct!)
+```
+
+## Fallback Logic
+
+If one slot is corrupted, the other is used as backup:
+
+```c
+if (saveSlot1Status == SAVE_STATUS_OK)
+{
+    if (saveSlot2Status == SAVE_STATUS_OK)
+    {
+        // Both OK - use newer (higher counter)
+    }
+    else
+    {
+        // Only slot 1 OK - use it
+        gSaveCounter = saveSlot1Counter;
+        return SAVE_STATUS_OK;
+    }
+}
+else if (saveSlot2Status == SAVE_STATUS_OK)
+{
+    // Only slot 2 OK - use it
+    gSaveCounter = saveSlot2Counter;
+    return SAVE_STATUS_OK;
+}
+else if (saveSlot1Status == SAVE_STATUS_EMPTY &&
+         saveSlot2Status == SAVE_STATUS_EMPTY)
+{
+    // No save data
+    gSaveCounter = 0;
+    gLastWrittenSector = 0;
+    return SAVE_STATUS_EMPTY;
+}
+else
+{
+    // Both slots corrupted
+    gSaveCounter = 0;
+    gLastWrittenSector = 0;
+    return SAVE_STATUS_CORRUPT;
+}
+```
+
+## Data Copy with Validation
+
+When loading save data, each sector is individually validated:
+
+```c
+static u8 CopySaveSlotData(u16 sectorId, struct SaveSectorLocation *locations)
+{
+    u16 slotOffset = NUM_SECTORS_PER_SLOT * (gSaveCounter % NUM_SAVE_SLOTS);
+
+    for (i = 0; i < NUM_SECTORS_PER_SLOT; i++)
+    {
+        ReadFlashSector(i + slotOffset, gReadWriteSector);
+
+        u16 id = gReadWriteSector->id;
+
+        // Track which sector was last written (for rotation)
+        if (id == 0)
+            gLastWrittenSector = i;
+
+        // Verify checksum before copying
+        checksum = CalculateChecksum(
+            gReadWriteSector->data,
+            locations[id].size
+        );
+
+        // Only copy if signature AND checksum are valid
+        if (gReadWriteSector->signature == SECTOR_SIGNATURE &&
+            gReadWriteSector->checksum == checksum)
+        {
+            // Copy sector data to RAM
+            for (j = 0; j < locations[id].size; j++)
+                ((u8 *)locations[id].data)[j] = gReadWriteSector->data[j];
+        }
+        // Invalid sectors are silently skipped (partial corruption)
+    }
+
+    return SAVE_STATUS_OK;
+}
+```
+
+## Special Sector Validation
+
+Hall of Fame and other special sectors use a different validation scheme:
+
+```c
+u32 TryReadSpecialSaveSector(u8 sector, u8 *dst)
+{
+    // Only valid for special sectors
+    if (sector != SECTOR_ID_TRAINER_HILL &&
+        sector != SECTOR_ID_RECORDED_BATTLE)
+        return SAVE_STATUS_ERROR;
+
+    ReadFlash(sector, 0, (u8 *)&gSaveDataBuffer, SECTOR_SIZE);
+
+    // Special sectors use a sentinel value instead of signature
+    if (*(u32 *)(&gSaveDataBuffer.data[0]) != SPECIAL_SECTOR_SENTINEL)
+        return SAVE_STATUS_ERROR;
+
+    // Copy data (excluding sentinel)
+    // ...
+
+    return SAVE_STATUS_OK;
+}
+```
+
+### Special Sector Sentinel
+
+```c
+#define SPECIAL_SECTOR_SENTINEL 0xB39D
+
+// Written at the start of special sector data
+// Different from main save signature to distinguish sector types
+```
+
+## Error Status Codes
+
+```c
+#define SAVE_STATUS_EMPTY    0   // No save data (signatures missing)
+#define SAVE_STATUS_OK       1   // All sectors valid
+#define SAVE_STATUS_CORRUPT  2   // Checksum mismatch detected
+#define SAVE_STATUS_NO_FLASH 4   // Flash memory not present
+#define SAVE_STATUS_ERROR    0xFF // General/unspecified error
+```
+
+## Validation Summary
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph LoadProcess["Save Load Process"]
+        L1["Read Slot 1<br/>(14 sectors)"]
+        L2["Read Slot 2<br/>(14 sectors)"]
+        L3["Compare<br/>Status/Counter"]
+        L4["Copy Best Slot<br/>to RAM"]
+    end
+
+    subgraph PerSector["Per-Sector Validation"]
+        S1["Check Signature"]
+        S2["Calculate Checksum"]
+        S3["Compare Checksums"]
+        S4["Mark Valid Bit"]
+    end
+
+    L1 --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> L2
+    L2 --> L3
+    L3 --> L4
+
+    style L4 fill:#9f9,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Security Considerations
+
+### Limitations
+
+1. **Simple checksum** - Sum-based checksums detect single-bit errors but miss some multi-bit errors
+2. **No cryptographic integrity** - Checksums can be recalculated by save editors
+3. **No authentication** - Anyone with flash access can modify saves
+
+### Why It Works
+
+1. **Target threats** - Primarily protects against power loss and flash degradation, not intentional tampering
+2. **Dual slots** - Provides redundancy for corruption recovery
+3. **Sector rotation** - Reduces flash wear to prevent premature failure
+4. **Fast validation** - Simple algorithms work well on GBA's limited CPU
+
+## Related Topics
+
+- [Save Blocks](/save-system/save-blocks) - Structure of saved data
+- [Flash Sectors](/save-system/flash-sectors) - Physical storage layout
+- [Pokemon Encryption](/pokemon/encryption) - Additional data protection layer

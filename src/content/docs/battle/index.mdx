@@ -1,0 +1,323 @@
+---
+title: Battle System Overview
+description: Understanding Pokemon Emerald's battle engine architecture
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+The battle system is the most complex subsystem in Pokemon Emerald, spanning **62 source files** with over 50,000 lines of code. It handles everything from wild encounters to link battles, trainer AI to move animations, damage calculation to status effects.
+
+## Battle System Architecture
+
+<DiagramContainer title="Battle System Components">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Core["Core Systems"]
+        Main[battle_main.c<br/>State Machine]
+        Script[battle_script_commands.c<br/>Battle Scripts]
+        Util[battle_util.c<br/>Move Execution]
+    end
+
+    subgraph Controllers["Controller System"]
+        Player[battle_controller_player.c]
+        Opponent[battle_controller_opponent.c]
+        Link[battle_controller_link.c]
+        Safari[battle_controller_safari.c]
+    end
+
+    subgraph Features["Feature Systems"]
+        AI[battle_ai_script_commands.c<br/>AI Decision Making]
+        Anim[battle_anim.c<br/>Move Animations]
+        Msg[battle_message.c<br/>Battle Text]
+        Interface[battle_interface.c<br/>HP Bars, Menus]
+    end
+
+    subgraph Data["Battle Data"]
+        BattleMons[gBattleMons<br/>Active Pokemon]
+        BattleStruct[gBattleStruct<br/>Battle State]
+        MoveData[gBattleMoves<br/>Move Database]
+    end
+
+    Main --> Controllers
+    Main --> Script
+    Script --> Util
+    Controllers --> Script
+    AI --> Controllers
+    Util --> Data`}
+</pre>
+</DiagramContainer>
+
+## Key Concepts
+
+### The Battle State Machine
+
+Battles run through a state machine in `battle_main.c`. Every frame, `gBattleMainFunc` is called - a function pointer that changes as the battle progresses through different phases.
+
+<DiagramContainer title="Battle State Flow">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> BattleIntro: CB2_InitBattle
+    BattleIntro --> SendOutMons: Intro animations
+    SendOutMons --> PreTurnEffects: Pokemon sent out
+    PreTurnEffects --> ActionSelection: Weather, abilities
+    ActionSelection --> TurnExecution: Actions chosen
+    TurnExecution --> TurnEnd: Actions executed
+    TurnEnd --> ActionSelection: Battle continues
+    TurnEnd --> BattleEnd: Win/Lose/Run
+    BattleEnd --> [*]: Return to overworld`}
+</pre>
+</DiagramContainer>
+
+### Controllers
+
+The **controller system** abstracts input sources. Each battler slot has a controller that handles UI, animations, and decision-making:
+
+| Controller | Purpose | File |
+|------------|---------|------|
+| Player | Human player input | `battle_controller_player.c` |
+| Opponent | AI-controlled trainer | `battle_controller_opponent.c` |
+| Link | Remote player (multiplayer) | `battle_controller_link_*.c` |
+| Safari | Safari Zone (limited actions) | `battle_controller_safari.c` |
+| Wally | Tutorial battle | `battle_controller_wally.c` |
+| Recorded | Battle playback | `battle_controller_recorded_*.c` |
+
+This design means the battle engine doesn't care *who* is making decisions - it just asks the controller for the next action.
+
+<LearnMore title="Why controllers?" summary="Flexibility and code reuse">
+The controller pattern allows:
+- Same battle code works for player, AI, and link battles
+- Easy to add new battle types (Battle Factory, recorded battles)
+- Clean separation between decision-making and battle logic
+- Testability - can simulate battles with AI-only controllers
+</LearnMore>
+
+### Battle Scripts
+
+Complex battle logic uses a **scripting system** rather than hardcoded C. Move effects, ability triggers, and battle events are defined as bytecode scripts:
+
+```c
+// Move effects are defined in scripts
+gBattlescriptCurrInstr = BattleScript_EffectHit;
+
+// The script runs commands like:
+// attackcanceler     - Check if attack should be canceled
+// accuracycheck      - Roll for hit/miss
+// damagecalc         - Calculate damage
+// typecalc           - Apply type effectiveness
+// attackanimation    - Play move animation
+// healthbarupdate    - Update HP bars
+// seteffectwithchance - Apply secondary effects
+```
+
+This makes move effects data-driven and easier to modify than hardcoded logic.
+
+## Core Data Structures
+
+### gBattleMons - Active Pokemon
+
+The Pokemon currently in battle:
+
+```c
+struct BattlePokemon gBattleMons[MAX_BATTLERS_COUNT];  // 4 slots
+
+struct BattlePokemon
+{
+    u16 species;
+    u16 attack;
+    u16 defense;
+    u16 speed;
+    u16 spAttack;
+    u16 spDefense;
+    u16 moves[MAX_MON_MOVES];       // 4 moves
+    u32 personality;
+    u8 pp[MAX_MON_MOVES];
+    u16 hp;
+    u16 maxHP;
+    u8 level;
+    u8 friendship;
+    u16 ability;
+    u8 type1;
+    u8 type2;
+    u32 status1;                     // Primary status (PSN, BRN, etc.)
+    u32 status2;                     // Volatile status (confusion, etc.)
+    u8 statStages[NUM_BATTLE_STATS]; // Stat modifiers (-6 to +6)
+    u16 item;
+    // ... more fields
+};
+```
+
+### Battle Position Indices
+
+```c
+// In singles (2 battlers)
+#define B_POSITION_PLAYER_LEFT      0
+#define B_POSITION_OPPONENT_LEFT    1
+
+// In doubles (4 battlers)
+#define B_POSITION_PLAYER_LEFT      0
+#define B_POSITION_OPPONENT_LEFT    1
+#define B_POSITION_PLAYER_RIGHT     2
+#define B_POSITION_OPPONENT_RIGHT   3
+
+// Access battlers by position
+#define GET_BATTLER_SIDE(battler)  ((battler) & 1)  // 0=player, 1=opponent
+```
+
+### gBattleTypeFlags
+
+Determines the battle variant:
+
+```c
+#define BATTLE_TYPE_DOUBLE          (1 << 0)   // 2v2 battle
+#define BATTLE_TYPE_LINK            (1 << 1)   // Link cable battle
+#define BATTLE_TYPE_IS_MASTER       (1 << 2)   // This GBA is master
+#define BATTLE_TYPE_TRAINER         (1 << 3)   // Vs trainer (not wild)
+#define BATTLE_TYPE_FIRST_BATTLE    (1 << 4)   // Birch tutorial
+#define BATTLE_TYPE_SAFARI          (1 << 7)   // Safari Zone
+#define BATTLE_TYPE_BATTLE_TOWER    (1 << 8)   // Battle Tower
+#define BATTLE_TYPE_WALLY_TUTORIAL  (1 << 9)   // Wally catches Ralts
+#define BATTLE_TYPE_ROAMER          (1 << 10)  // Roaming legendary
+#define BATTLE_TYPE_EREADER_TRAINER (1 << 11)  // E-Reader trainer
+#define BATTLE_TYPE_KYOGRE_GROUDON  (1 << 12)  // Weather legends
+#define BATTLE_TYPE_MULTI           (1 << 13)  // Multi battle
+#define BATTLE_TYPE_DOME            (1 << 14)  // Battle Dome
+#define BATTLE_TYPE_PALACE          (1 << 15)  // Battle Palace
+#define BATTLE_TYPE_ARENA           (1 << 16)  // Battle Arena
+#define BATTLE_TYPE_FACTORY         (1 << 17)  // Battle Factory
+#define BATTLE_TYPE_PIKE            (1 << 18)  // Battle Pike
+#define BATTLE_TYPE_PYRAMID         (1 << 19)  // Battle Pyramid
+#define BATTLE_TYPE_RECORDED        (1 << 25)  // Playback
+// ... more flags
+```
+
+### gBattleStruct - Battle State
+
+Tracks turn-by-turn battle state:
+
+```c
+struct BattleStruct
+{
+    u8 turnEffectsTracker;           // End-of-turn effect index
+    u8 turnEffectsBattlerId;         // Who's applying effects
+    u8 turnCountersTracker;          // Multi-turn move counter
+    u8 wrappedMove[MAX_BATTLERS_COUNT * 2];  // Wrap/Bind data
+    u8 moveTarget[MAX_BATTLERS_COUNT];       // Target for each move
+    u8 expGetterMonId;               // Who gets experience
+    u8 battlerPartyIndexes[MAX_BATTLERS_COUNT]; // Party slot mapping
+    u8 chosenMovePositions[MAX_BATTLERS_COUNT]; // Selected move slot
+    u16 usedHeldItems[MAX_BATTLERS_COUNT];      // Consumed items
+    u16 choicedMove[MAX_BATTLERS_COUNT];        // Choice-locked move
+    u8 AI_monToSwitchIntoId[MAX_BATTLERS_COUNT]; // AI switch target
+    // ... many more fields
+};
+```
+
+## Battle Flow Example
+
+Here's how a simple attack works from selection to damage:
+
+<DiagramContainer title="Attack Execution Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Player
+    participant Controller
+    participant Main as battle_main
+    participant Script as battle_scripts
+    participant Util as battle_util
+
+    Player->>Controller: Select "Thunderbolt"
+    Controller->>Main: B_ACTION_USE_MOVE
+    Main->>Main: SetActionsAndBattlersTurnOrder()
+    Main->>Script: Execute BattleScript_EffectHit
+    Script->>Script: attackcanceler
+    Script->>Util: AccuracyCalc()
+    alt Missed
+        Script->>Main: Display "Attack missed!"
+    else Hit
+        Script->>Util: CalculateBaseDamage()
+        Script->>Util: TypeCalc() (effectiveness)
+        Script->>Script: critcalc
+        Script->>Script: Apply random factor
+        Script->>Main: healthbarupdate
+        Script->>Main: datahpupdate
+        Script->>Script: Check secondary effects
+    end
+    Script->>Main: moveend`}
+</pre>
+</DiagramContainer>
+
+## File Organization
+
+The battle system spans many files:
+
+| Category | Files | Purpose |
+|----------|-------|---------|
+| Core | `battle_main.c`, `battle_util.c`, `battle_util2.c` | State machine, utilities |
+| Setup | `battle_setup.c`, `battle_transition.c` | Battle initialization |
+| Scripts | `battle_script_commands.c` | Script interpreter (100+ commands) |
+| Controllers | `battle_controller_*.c` (8 files) | Input handling per battler type |
+| AI | `battle_ai_script_commands.c`, `battle_ai_switch_items.c` | Computer opponent |
+| Animations | `battle_anim_*.c` (20+ files) | Move effects by type |
+| UI | `battle_interface.c`, `battle_message.c` | Health bars, text |
+| Graphics | `battle_gfx_sfx_util.c`, `battle_bg.c` | Sprites, backgrounds |
+
+## Battle Outcomes
+
+```c
+#define B_OUTCOME_WON                  1   // Player won
+#define B_OUTCOME_LOST                 2   // Player lost
+#define B_OUTCOME_DREW                 3   // Draw (link battle)
+#define B_OUTCOME_RAN                  4   // Player fled
+#define B_OUTCOME_PLAYER_TELEPORTED    5   // Used Teleport
+#define B_OUTCOME_MON_FLED             6   // Wild mon fled
+#define B_OUTCOME_CAUGHT               7   // Caught wild mon
+#define B_OUTCOME_NO_SAFARI_BALLS      8   // Out of Safari Balls
+#define B_OUTCOME_FORFEITED            9   // Forfeited (Frontier)
+#define B_OUTCOME_MON_TELEPORTED       10  // Wild mon teleported
+```
+
+## Deep Dives
+
+<DeepDiveLink
+  href="/battle/battle-setup"
+  title="Battle Setup"
+  description="How battles are initialized from wild encounters to trainer battles"
+/>
+
+<DeepDiveLink
+  href="/battle/battle-main"
+  title="Battle Main"
+  description="The core state machine driving battle flow"
+/>
+
+<DeepDiveLink
+  href="/battle/battle-controllers"
+  title="Battle Controllers"
+  description="How player, AI, and link battles share code"
+/>
+
+<DeepDiveLink
+  href="/battle/battle-scripts"
+  title="Battle Scripts"
+  description="The bytecode scripting system for move effects"
+/>
+
+<DeepDiveLink
+  href="/battle/move-execution"
+  title="Move Execution"
+  description="From move selection to damage application"
+/>
+
+<DeepDiveLink
+  href="/battle/damage-calculation"
+  title="Damage Calculation"
+  description="The math behind Pokemon damage formulas"
+/>
+
+<DeepDiveLink
+  href="/battle/battle-ai"
+  title="Battle AI"
+  description="How the computer opponent makes decisions"
+/>

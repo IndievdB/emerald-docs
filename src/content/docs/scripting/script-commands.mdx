@@ -1,0 +1,788 @@
+---
+title: Script Commands
+description: Complete reference for all script commands in Pokemon Emerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald has approximately 230 script commands (opcodes 0x00-0xE2). This page documents the most commonly used commands organized by category.
+
+## Control Flow Commands
+
+### Basic Flow
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `end` | 0x02 | Terminates script execution |
+| `return` | 0x03 | Returns from a subroutine call |
+| `call` | 0x04 | Calls a subroutine, pushing return address |
+| `goto` | 0x05 | Unconditional jump to address |
+| `goto_if` | 0x06 | Conditional jump based on comparison result |
+| `call_if` | 0x07 | Conditional call based on comparison result |
+| `waitstate` | 0x27 | Pauses script until resumed externally |
+
+### Implementation
+
+```c
+bool8 ScrCmd_end(struct ScriptContext *ctx)
+{
+    StopScript(ctx);
+    return FALSE;
+}
+
+bool8 ScrCmd_call(struct ScriptContext *ctx)
+{
+    const u8 *ptr = (const u8 *)ScriptReadWord(ctx);
+    ScriptCall(ctx, ptr);
+    return FALSE;
+}
+
+bool8 ScrCmd_goto(struct ScriptContext *ctx)
+{
+    const u8 *ptr = (const u8 *)ScriptReadWord(ctx);
+    ScriptJump(ctx, ptr);
+    return FALSE;
+}
+```
+
+### Standard Scripts
+
+```c
+// Jump to a predefined standard script
+bool8 ScrCmd_gotostd(struct ScriptContext *ctx)
+{
+    u8 index = ScriptReadByte(ctx);
+    const u8 **ptr = &gStdScripts[index];
+
+    if (ptr < gStdScripts_End)
+        ScriptJump(ctx, *ptr);
+    return FALSE;
+}
+
+// Standard scripts include common routines like:
+// STD_OBTAIN_ITEM, STD_FIND_ITEM, STD_OBTAIN_DECORATION, etc.
+```
+
+## Variable Commands
+
+### Variable Operations
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `setvar` | 0x16 | Set variable to immediate value |
+| `addvar` | 0x17 | Add immediate value to variable |
+| `subvar` | 0x18 | Subtract value from variable |
+| `copyvar` | 0x19 | Copy one variable to another |
+| `setorcopyvar` | 0x1A | Set or copy (handles both immediate and var) |
+
+### Implementation
+
+```c
+bool8 ScrCmd_setvar(struct ScriptContext *ctx)
+{
+    u16 *ptr = GetVarPointer(ScriptReadHalfword(ctx));
+    *ptr = ScriptReadHalfword(ctx);
+    return FALSE;
+}
+
+bool8 ScrCmd_addvar(struct ScriptContext *ctx)
+{
+    u16 *ptr = GetVarPointer(ScriptReadHalfword(ctx));
+    *ptr += ScriptReadHalfword(ctx);
+    return FALSE;
+}
+
+bool8 ScrCmd_copyvar(struct ScriptContext *ctx)
+{
+    u16 *ptr = GetVarPointer(ScriptReadHalfword(ctx));
+    *ptr = *GetVarPointer(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+```
+
+### Variable Ranges
+
+```c
+// Variable ID ranges
+#define VARS_START           0x4000  // Saved variables
+#define TEMP_VARS_START      0x4020  // Temporary (cleared on map change)
+#define SPECIAL_VARS_START   0x8000  // Special runtime variables
+
+// Special variables (0x8000-0x8014)
+EWRAM_DATA u16 gSpecialVar_0x8000 = 0;  // General purpose
+EWRAM_DATA u16 gSpecialVar_0x8001 = 0;  // General purpose
+// ... through 0x800B
+EWRAM_DATA u16 gSpecialVar_Result = 0;      // 0x800D - Return value
+EWRAM_DATA u16 gSpecialVar_LastTalked = 0;  // 0x800E - Last NPC ID
+EWRAM_DATA u16 gSpecialVar_Facing = 0;      // 0x800F - Player facing
+```
+
+## Comparison Commands
+
+### Compare Operations
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `compare_var_to_value` | 0x21 | Compare variable to immediate |
+| `compare_var_to_var` | 0x22 | Compare two variables |
+| `compare_local_to_local` | 0x1B | Compare two local data slots |
+| `compare_local_to_value` | 0x1C | Compare local to immediate |
+
+### Condition Codes
+
+```c
+// Used with goto_if and call_if
+#define COND_LESS_THAN      0
+#define COND_EQUAL          1
+#define COND_GREATER_THAN   2
+#define COND_LESS_OR_EQUAL  3
+#define COND_GREATER_OR_EQ  4
+#define COND_NOT_EQUAL      5
+
+// Comparison result mapping
+static const u8 sScriptConditionTable[6][3] =
+{
+//  <  =  >
+    {1, 0, 0}, // LESS_THAN
+    {0, 1, 0}, // EQUAL
+    {0, 0, 1}, // GREATER_THAN
+    {1, 1, 0}, // LESS_OR_EQUAL
+    {0, 1, 1}, // GREATER_OR_EQUAL
+    {1, 0, 1}, // NOT_EQUAL
+};
+```
+
+## Flag Commands
+
+### Flag Operations
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `setflag` | 0x29 | Set flag to TRUE |
+| `clearflag` | 0x2A | Set flag to FALSE |
+| `checkflag` | 0x2B | Check flag, sets comparison result |
+
+### Implementation
+
+```c
+bool8 ScrCmd_setflag(struct ScriptContext *ctx)
+{
+    FlagSet(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+
+bool8 ScrCmd_clearflag(struct ScriptContext *ctx)
+{
+    FlagClear(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+
+bool8 ScrCmd_checkflag(struct ScriptContext *ctx)
+{
+    // Sets comparisonResult: 1 if set, 0 if clear
+    ctx->comparisonResult = FlagGet(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+```
+
+### Flag Ranges
+
+```c
+// Flag ID ranges
+#define FLAGS_START          0x001  // Saved flags
+#define TEMP_FLAGS_START     0x0C0  // Temporary (cleared on map)
+#define DAILY_FLAGS_START    0x108  // Reset daily
+#define SPECIAL_FLAGS_START  0x4000 // Runtime-only flags
+```
+
+## Message Commands
+
+### Text Display
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `message` | 0x67 | Start displaying text (non-blocking) |
+| `waitmessage` | 0x66 | Wait for message to finish rendering |
+| `closemessage` | 0x68 | Close the message box |
+| `waitbuttonpress` | 0x6D | Wait for player to press A/B |
+
+### Implementation
+
+```c
+bool8 ScrCmd_message(struct ScriptContext *ctx)
+{
+    const u8 *msg = (const u8 *)ScriptReadWord(ctx);
+    if (msg == NULL)
+        msg = (const u8 *)ctx->data[0];
+
+    ShowFieldMessage(msg);
+    return FALSE;
+}
+
+bool8 ScrCmd_waitmessage(struct ScriptContext *ctx)
+{
+    SetupNativeScript(ctx, IsFieldMessageBoxHidden);
+    return TRUE;  // Yield until message is drawn
+}
+
+bool8 ScrCmd_closemessage(struct ScriptContext *ctx)
+{
+    HideFieldMessageBox();
+    return FALSE;
+}
+```
+
+### Message Box Macros
+
+The macro system provides convenient wrappers:
+
+```asm
+@ Display message and wait for button press
+.macro msgbox text:req, type=MSGBOX_DEFAULT
+    loadword 0, \text
+    callstd \type
+.endm
+
+@ Message box types (standard script indices)
+.set MSGBOX_NPC,       2  @ NPC dialogue with automatic facing
+.set MSGBOX_SIGN,      3  @ Sign reading
+.set MSGBOX_DEFAULT,   4  @ Standard dialogue
+.set MSGBOX_YESNO,     5  @ Yes/No prompt
+.set MSGBOX_AUTOCLOSE, 6  @ Auto-closes after displaying
+```
+
+## Object Event Commands
+
+### Movement and Visibility
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `applymovement` | 0x4F | Start movement script for object |
+| `waitmovement` | 0x51 | Wait for movement to complete |
+| `removeobject` | 0x53 | Remove object from map |
+| `addobject` | 0x55 | Add object to map |
+| `showobjectat` | 0x58 | Show object at position |
+| `hideobjectat` | 0x59 | Hide object at position |
+| `faceplayer` | 0x5A | Turn object to face player |
+| `turnobject` | 0x5B | Turn object to face direction |
+
+### Movement Implementation
+
+```c
+bool8 ScrCmd_applymovement(struct ScriptContext *ctx)
+{
+    u16 localId = VarGet(ScriptReadHalfword(ctx));
+    const void *movementScript = (const void *)ScriptReadWord(ctx);
+
+    ScriptMovement_StartObjectMovementScript(localId, gSaveBlock1Ptr->location.mapNum,
+                                             gSaveBlock1Ptr->location.mapGroup, movementScript);
+    sMovingNpcId = localId;
+    return FALSE;
+}
+
+bool8 ScrCmd_waitmovement(struct ScriptContext *ctx)
+{
+    u16 localId = VarGet(ScriptReadHalfword(ctx));
+
+    if (localId == 0)
+        localId = sMovingNpcId;
+
+    SetupNativeScript(ctx, WaitForMovementFinish);
+    return TRUE;
+}
+
+static bool8 WaitForMovementFinish(void)
+{
+    return ScriptMovement_IsObjectMovementFinished(sMovingNpcId,
+        sMovingNpcMapNum, sMovingNpcMapGroup);
+}
+```
+
+### Locking Commands
+
+```c
+bool8 ScrCmd_lockall(struct ScriptContext *ctx)
+{
+    if (IsUpdateLinkStateCBActive())
+    {
+        return FALSE;
+    }
+    else
+    {
+        LockPlayerFieldControls();
+        FreezeObjectEvents();
+        return FALSE;
+    }
+}
+
+bool8 ScrCmd_lock(struct ScriptContext *ctx)
+{
+    if (IsUpdateLinkStateCBActive())
+    {
+        return FALSE;
+    }
+    else
+    {
+        LockPlayerFieldControls();
+        if (gObjectEvents[gSelectedObjectEvent].active)
+            LockSelectedObjectEvent();
+        return FALSE;
+    }
+}
+
+bool8 ScrCmd_releaseall(struct ScriptContext *ctx)
+{
+    UnfreezeObjectEvents();
+    UnlockPlayerFieldControls();
+    return FALSE;
+}
+```
+
+## Item Commands
+
+### Inventory Management
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `additem` | 0x44 | Add item to bag |
+| `removeitem` | 0x45 | Remove item from bag |
+| `checkitemspace` | 0x46 | Check if bag has room |
+| `checkitem` | 0x47 | Check if player has item |
+| `addpcitem` | 0x49 | Add item to PC storage |
+
+### Implementation
+
+```c
+bool8 ScrCmd_additem(struct ScriptContext *ctx)
+{
+    u16 itemId = VarGet(ScriptReadHalfword(ctx));
+    u32 quantity = VarGet(ScriptReadHalfword(ctx));
+
+    gSpecialVar_Result = AddBagItem(itemId, (u8)quantity);
+    return FALSE;
+}
+
+bool8 ScrCmd_removeitem(struct ScriptContext *ctx)
+{
+    u16 itemId = VarGet(ScriptReadHalfword(ctx));
+    u32 quantity = VarGet(ScriptReadHalfword(ctx));
+
+    gSpecialVar_Result = RemoveBagItem(itemId, (u8)quantity);
+    return FALSE;
+}
+
+bool8 ScrCmd_checkitem(struct ScriptContext *ctx)
+{
+    u16 itemId = VarGet(ScriptReadHalfword(ctx));
+    u32 quantity = VarGet(ScriptReadHalfword(ctx));
+
+    gSpecialVar_Result = CheckBagHasItem(itemId, (u8)quantity);
+    return FALSE;
+}
+```
+
+## Pokemon Commands
+
+### Party Management
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `givemon` | 0x79 | Give Pokemon to player |
+| `giveegg` | 0x7A | Give Pokemon egg |
+| `setmonmove` | 0x7B | Set move for party Pokemon |
+| `checkpartymove` | 0x7C | Check if party knows move |
+| `getpartysize` | 0x43 | Get number of Pokemon in party |
+
+### Implementation
+
+```c
+bool8 ScrCmd_givemon(struct ScriptContext *ctx)
+{
+    u16 species = VarGet(ScriptReadHalfword(ctx));
+    u8 level = ScriptReadByte(ctx);
+    u16 item = VarGet(ScriptReadHalfword(ctx));
+    u32 unused1 = ScriptReadWord(ctx);
+    u32 unused2 = ScriptReadWord(ctx);
+    u8 unused3 = ScriptReadByte(ctx);
+
+    gSpecialVar_Result = ScriptGiveMonParameterized(species, level, item,
+                                                    unused1, unused2, unused3);
+    return FALSE;
+}
+
+// Result values:
+// 0 = Added to party
+// 1 = Sent to PC
+// 2 = No room (party and PC full)
+
+bool8 ScrCmd_checkpartymove(struct ScriptContext *ctx)
+{
+    u16 moveId = ScriptReadHalfword(ctx);
+
+    gSpecialVar_Result = PARTY_SIZE;  // Default: not found
+    for (u8 i = 0; i < PARTY_SIZE; i++)
+    {
+        u16 species = GetMonData(&gPlayerParty[i], MON_DATA_SPECIES);
+        if (!species)
+            break;
+
+        for (u8 j = 0; j < MAX_MON_MOVES; j++)
+        {
+            if (GetMonData(&gPlayerParty[i], MON_DATA_MOVE1 + j) == moveId)
+            {
+                gSpecialVar_Result = i;  // Return party slot
+                return FALSE;
+            }
+        }
+    }
+    return FALSE;
+}
+```
+
+## Warp Commands
+
+### Map Transitions
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `warp` | 0x39 | Standard warp with transition |
+| `warpsilent` | 0x3A | Warp without screen effect |
+| `warpdoor` | 0x3B | Warp through door |
+| `warphole` | 0x3C | Fall through hole warp |
+| `warpteleport` | 0x3D | Teleport warp effect |
+| `setwarp` | 0x3E | Set return warp point |
+
+### Implementation
+
+```c
+bool8 ScrCmd_warp(struct ScriptContext *ctx)
+{
+    u8 mapGroup = ScriptReadByte(ctx);
+    u8 mapNum = ScriptReadByte(ctx);
+    u8 warpId = ScriptReadByte(ctx);
+    u16 x = VarGet(ScriptReadHalfword(ctx));
+    u16 y = VarGet(ScriptReadHalfword(ctx));
+
+    SetWarpDestination(mapGroup, mapNum, warpId, x, y);
+    DoWarp();
+    ResetInitialPlayerAvatarState();
+    return TRUE;  // Yield for warp
+}
+
+bool8 ScrCmd_setwarp(struct ScriptContext *ctx)
+{
+    u8 mapGroup = ScriptReadByte(ctx);
+    u8 mapNum = ScriptReadByte(ctx);
+    u8 warpId = ScriptReadByte(ctx);
+    u16 x = VarGet(ScriptReadHalfword(ctx));
+    u16 y = VarGet(ScriptReadHalfword(ctx));
+
+    SetWarpDestination(mapGroup, mapNum, warpId, x, y);
+    return FALSE;
+}
+```
+
+## Battle Commands
+
+### Trainer Battles
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `trainerbattle` | 0x5C | Configure trainer battle |
+| `dotrainerbattle` | 0x5D | Start the battle |
+| `checktrainerflag` | 0x60 | Check if trainer beaten |
+| `settrainerflag` | 0x61 | Mark trainer as beaten |
+
+### Battle Types
+
+```c
+// trainerbattle type parameter
+#define TRAINER_BATTLE_SINGLE               0  // Normal single battle
+#define TRAINER_BATTLE_CONTINUE_SCRIPT      1  // Run script after
+#define TRAINER_BATTLE_CONTINUE_SCRIPT_NO_MUSIC 2
+#define TRAINER_BATTLE_DOUBLE               3  // Double battle
+#define TRAINER_BATTLE_REMATCH              4  // Rematch encounter
+#define TRAINER_BATTLE_CONTINUE_SCRIPT_DOUBLE 5
+#define TRAINER_BATTLE_REMATCH_DOUBLE       6
+#define TRAINER_BATTLE_PYRAMID              7  // Battle Pyramid
+#define TRAINER_BATTLE_SET_TRAINER_A        8
+#define TRAINER_BATTLE_SET_TRAINER_B        9
+```
+
+### Wild Battles
+
+```c
+bool8 ScrCmd_setwildbattle(struct ScriptContext *ctx)
+{
+    u16 species = ScriptReadHalfword(ctx);
+    u8 level = ScriptReadByte(ctx);
+    u16 item = ScriptReadHalfword(ctx);
+
+    CreateScriptedWildMon(species, level, item);
+    return FALSE;
+}
+
+bool8 ScrCmd_dowildbattle(struct ScriptContext *ctx)
+{
+    BattleSetup_StartScriptedWildBattle();
+    ScriptContext_Stop();  // Wait for battle to finish
+    return TRUE;
+}
+```
+
+## Sound Commands
+
+### Audio Control
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `playse` | 0x2F | Play sound effect |
+| `waitse` | 0x30 | Wait for SE to finish |
+| `playfanfare` | 0x31 | Play fanfare music |
+| `waitfanfare` | 0x32 | Wait for fanfare |
+| `playbgm` | 0x33 | Change background music |
+| `fadeoutbgm` | 0x37 | Fade out BGM |
+| `fadeinbgm` | 0x38 | Fade in BGM |
+| `playmoncry` | 0xA1 | Play Pokemon cry |
+
+### Implementation
+
+```c
+bool8 ScrCmd_playse(struct ScriptContext *ctx)
+{
+    PlaySE(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+
+bool8 ScrCmd_waitse(struct ScriptContext *ctx)
+{
+    SetupNativeScript(ctx, IsSEPlaying);
+    return TRUE;
+}
+
+static bool8 IsSEPlaying(void)
+{
+    return !IsSEPlaying();
+}
+
+bool8 ScrCmd_playfanfare(struct ScriptContext *ctx)
+{
+    PlayFanfare(ScriptReadHalfword(ctx));
+    return FALSE;
+}
+
+bool8 ScrCmd_waitfanfare(struct ScriptContext *ctx)
+{
+    SetupNativeScript(ctx, IsFanfareTaskInactive);
+    return TRUE;
+}
+```
+
+## Screen Effect Commands
+
+### Fading
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `fadescreen` | 0x97 | Fade screen in/out |
+| `fadescreenspeed` | 0x98 | Fade with custom speed |
+
+```c
+// Fade modes
+#define FADE_TO_BLACK   0
+#define FADE_FROM_BLACK 1
+#define FADE_TO_WHITE   2
+#define FADE_FROM_WHITE 3
+
+bool8 ScrCmd_fadescreen(struct ScriptContext *ctx)
+{
+    FadeScreen(ScriptReadByte(ctx), 0);
+    SetupNativeScript(ctx, IsPaletteNotActive);
+    return TRUE;
+}
+
+static bool8 IsPaletteNotActive(void)
+{
+    return !gPaletteFade.active;
+}
+```
+
+### Weather
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `setweather` | 0xA4 | Set weather type |
+| `doweather` | 0xA5 | Transition to weather |
+| `resetweather` | 0xA3 | Reset to map default |
+
+## Menu Commands
+
+### User Choices
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `yesnobox` | 0x6E | Display Yes/No prompt |
+| `multichoice` | 0x6F | Display multiple choice menu |
+| `multichoicedefault` | 0x70 | Multichoice with default selection |
+
+```c
+bool8 ScrCmd_yesnobox(struct ScriptContext *ctx)
+{
+    u8 left = ScriptReadByte(ctx);
+    u8 top = ScriptReadByte(ctx);
+
+    if (YesNoMenuScript(left, top) == TRUE)
+    {
+        SetupNativeScript(ctx, WaitForYesNoResult);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// Result: 0 = Yes, 1 = No, 127 = B pressed
+```
+
+## Special Commands
+
+### Calling C Functions
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `special` | 0x25 | Call special function |
+| `specialvar` | 0x26 | Call special, store result |
+| `callnative` | 0x23 | Call arbitrary C function |
+
+```c
+bool8 ScrCmd_special(struct ScriptContext *ctx)
+{
+    u16 index = ScriptReadHalfword(ctx);
+    gSpecials[index]();
+    return FALSE;
+}
+
+bool8 ScrCmd_specialvar(struct ScriptContext *ctx)
+{
+    u16 *var = GetVarPointer(ScriptReadHalfword(ctx));
+    *var = gSpecials[ScriptReadHalfword(ctx)]();
+    return FALSE;
+}
+
+bool8 ScrCmd_callnative(struct ScriptContext *ctx)
+{
+    NativeFunc func = (NativeFunc)ScriptReadWord(ctx);
+    func();
+    return FALSE;
+}
+```
+
+### Common Specials
+
+```c
+// Example specials from gSpecials table
+void HealPlayerParty(void);
+void SavePlayerParty(void);
+void LoadPlayerParty(void);
+u16 GetPlayerTrainerId(void);
+u16 GetPokedexCount(void);
+void UpdatePokemonStorageReminder(void);
+```
+
+## String Buffer Commands
+
+### Text Formatting
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `bufferspeciesname` | 0x7D | Buffer Pokemon name |
+| `bufferpartymonnick` | 0x7F | Buffer party mon nickname |
+| `bufferitemname` | 0x80 | Buffer item name |
+| `buffermovename` | 0x82 | Buffer move name |
+| `buffernumberstring` | 0x83 | Buffer number as string |
+| `bufferstring` | 0x85 | Buffer arbitrary string |
+
+```c
+// Three string buffers available
+static u8 *const sScriptStringVars[] =
+{
+    gStringVar1,  // {STR_VAR_1}
+    gStringVar2,  // {STR_VAR_2}
+    gStringVar3,  // {STR_VAR_3}
+};
+
+bool8 ScrCmd_bufferspeciesname(struct ScriptContext *ctx)
+{
+    u8 stringVarIndex = ScriptReadByte(ctx);
+    u16 species = VarGet(ScriptReadHalfword(ctx));
+
+    StringCopy(sScriptStringVars[stringVarIndex], gSpeciesNames[species]);
+    return FALSE;
+}
+
+bool8 ScrCmd_buffernumberstring(struct ScriptContext *ctx)
+{
+    u8 stringVarIndex = ScriptReadByte(ctx);
+    u16 value = VarGet(ScriptReadHalfword(ctx));
+    u8 digits = ConvertIntToDecimalStringN(sScriptStringVars[stringVarIndex],
+                                           value, STR_CONV_MODE_LEFT_ALIGN, 5);
+    return FALSE;
+}
+```
+
+## Time Commands
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| `gettime` | 0x2E | Get current RTC time |
+| `initclock` | 0x2C | Initialize RTC offset |
+| `delay` | 0x28 | Pause for frames |
+
+```c
+bool8 ScrCmd_gettime(struct ScriptContext *ctx)
+{
+    RtcCalcLocalTime();
+    gSpecialVar_0x8000 = gLocalTime.hours;
+    gSpecialVar_0x8001 = gLocalTime.minutes;
+    gSpecialVar_0x8002 = gLocalTime.seconds;
+    return FALSE;
+}
+
+bool8 ScrCmd_delay(struct ScriptContext *ctx)
+{
+    sPauseCounter = ScriptReadHalfword(ctx);
+    SetupNativeScript(ctx, RunPauseTimer);
+    return TRUE;
+}
+```
+
+## Random Command
+
+```c
+bool8 ScrCmd_random(struct ScriptContext *ctx)
+{
+    u16 max = VarGet(ScriptReadHalfword(ctx));
+    gSpecialVar_Result = Random() % max;
+    return FALSE;
+}
+```
+
+## Command Table
+
+The full command table is defined in `data/script_cmd_table.inc`:
+
+```asm
+gScriptCmdTable::
+    script_cmd_table_entry SCR_OP_NOP           ScrCmd_nop            @ 0x00
+    script_cmd_table_entry SCR_OP_NOP1          ScrCmd_nop1           @ 0x01
+    script_cmd_table_entry SCR_OP_END           ScrCmd_end            @ 0x02
+    script_cmd_table_entry SCR_OP_RETURN        ScrCmd_return         @ 0x03
+    script_cmd_table_entry SCR_OP_CALL          ScrCmd_call           @ 0x04
+    script_cmd_table_entry SCR_OP_GOTO          ScrCmd_goto           @ 0x05
+    @ ... continues through 0xE2
+gScriptCmdTableEnd::
+```
+
+<LearnMore>
+- [Script VM](/scripting/script-vm) - How the interpreter executes commands
+- [Event Scripts](/scripting/event-scripts) - Writing scripts using macros
+</LearnMore>

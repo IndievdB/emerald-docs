@@ -1,0 +1,946 @@
+---
+title: Battle Scripts
+description: The bytecode scripting system that powers Pokemon Emerald's move effects
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald uses a **bytecode scripting system** for battle logic. Rather than hardcoding every move effect in C, moves are defined as sequences of script commands that the battle engine interprets. This makes move effects data-driven and much easier to modify.
+
+## Why Scripts?
+
+<LearnMore title="Benefits of Scripting" summary="Flexibility and maintainability">
+The scripting approach provides several advantages:
+
+- **Data-driven**: Move effects are defined in data files, not scattered through code
+- **Reusable**: Common sequences (damage calculation, status application) are shared
+- **Extensible**: Adding new moves doesn't require modifying core battle code
+- **Readable**: Script flow is easier to follow than nested C conditionals
+- **Debuggable**: Script execution can be traced step-by-step
+
+The tradeoff is some performance overhead, but the GBA handles it fine.
+</LearnMore>
+
+## Script Architecture
+
+<DiagramContainer title="Battle Script System">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph MoveData[Move Effect Assignment]
+        Move[gBattleMoves]
+        Effect[effect field]
+        Move --> Effect
+    end
+
+    subgraph ScriptLookup[Script Lookup]
+        Table[gBattleScriptsForMoveEffects]
+        Effect --> Table
+        Table --> Script[BattleScript_EffectXxx]
+    end
+
+    subgraph Execution[Script Execution]
+        IP[gBattlescriptCurrInstr<br/>Instruction Pointer]
+        Cmd[Read Command Byte]
+        Handler[Command Handler]
+        Script --> IP
+        IP --> Cmd
+        Cmd --> Handler
+    end
+
+    subgraph Commands[Command Table]
+        Cmd0[attackcanceler]
+        Cmd1[accuracycheck]
+        Cmd2[damagecalc]
+        Cmd3[attackanimation]
+        Handler --> Cmd0
+        Handler --> Cmd1
+        Handler --> Cmd2
+        Handler --> Cmd3
+    end`}
+</pre>
+</DiagramContainer>
+
+## Script Execution
+
+### The Script Interpreter
+
+```c
+// Main script execution function
+void RunBattleScriptCommands(void)
+{
+    // Process commands until script yields
+    while (TRUE)
+    {
+        // Read command byte at current position
+        u8 cmdId = *gBattlescriptCurrInstr;
+
+        // Look up handler in command table
+        sBattleScriptingCommandsTable[cmdId]();
+
+        // Check if script yielded (switched state)
+        if (gBattleMainFunc != RunBattleScriptCommands)
+            break;
+
+        // Check for end of script
+        if (gBattlescriptCurrInstr == NULL)
+            break;
+    }
+}
+
+// Command handler table (100+ commands)
+void (*const sBattleScriptingCommandsTable[])(void) = {
+    [CMDID_ATTACKCANCELER]     = Cmd_attackcanceler,
+    [CMDID_ACCURACYCHECK]      = Cmd_accuracycheck,
+    [CMDID_ATTACKSTRING]       = Cmd_attackstring,
+    [CMDID_PPREDUCE]           = Cmd_ppreduce,
+    [CMDID_CRITCALC]           = Cmd_critcalc,
+    [CMDID_DAMAGECALC]         = Cmd_damagecalc,
+    [CMDID_TYPECALC]           = Cmd_typecalc,
+    [CMDID_ADJUSTNORMALDAMAGE] = Cmd_adjustnormaldamage,
+    [CMDID_ATTACKANIMATION]    = Cmd_attackanimation,
+    [CMDID_WAITANIMATION]      = Cmd_waitanimation,
+    [CMDID_HEALTHBARUPDATE]    = Cmd_healthbarupdate,
+    [CMDID_DATAHPUPDATE]       = Cmd_datahpupdate,
+    [CMDID_CRITMESSAGE]        = Cmd_critmessage,
+    [CMDID_EFFECTIVENESSSOUND] = Cmd_effectivenesssound,
+    [CMDID_RESULTMESSAGE]      = Cmd_resultmessage,
+    [CMDID_PRINTSTRING]        = Cmd_printstring,
+    [CMDID_SETEFFECTWITHCHANCE] = Cmd_seteffectwithchance,
+    [CMDID_SETEFFECTPRIMARY]   = Cmd_seteffectprimary,
+    [CMDID_SETEFFECTSECONDARY] = Cmd_seteffectsecondary,
+    [CMDID_CLEARSTATUSFROMEFFECT] = Cmd_clearstatusfromeffect,
+    [CMDID_TRYFAINTMON]        = Cmd_tryfaintmon,
+    // ... many more
+    [CMDID_MOVEEND]            = Cmd_moveend,
+    [CMDID_END]                = Cmd_end,
+};
+```
+
+### Instruction Pointer
+
+```c
+// Current script position
+const u8 *gBattlescriptCurrInstr;
+
+// Scripts are arrays of bytes
+const u8 BattleScript_EffectHit[] = {
+    CMDID_ATTACKCANCELER,           // 0x00
+    CMDID_ACCURACYCHECK,            // 0x01
+    // ... argument bytes
+    CMDID_CRITCALC,                 // 0x05
+    CMDID_DAMAGECALC,               // 0x06
+    // ... more commands
+    CMDID_MOVEEND,                  // End of move
+};
+
+// Advancing the instruction pointer
+static void Cmd_example(void)
+{
+    // Read arguments after command byte
+    u8 arg1 = gBattlescriptCurrInstr[1];
+    u16 arg2 = T1_READ_16(gBattlescriptCurrInstr + 2);
+
+    // Do something with arguments...
+
+    // Advance past this command (1 byte) + arguments (3 bytes)
+    gBattlescriptCurrInstr += 4;
+}
+```
+
+## Common Script Commands
+
+### attackcanceler - Check for Attack Cancellation
+
+```c
+static void Cmd_attackcanceler(void)
+{
+    s32 i;
+
+    // Check if attacker fainted
+    if (gBattleMons[gBattlerAttacker].hp == 0)
+    {
+        gBattlescriptCurrInstr = BattleScript_AttackCanceledByFainting;
+        return;
+    }
+
+    // Check for Sleep
+    if (gBattleMons[gBattlerAttacker].status1 & STATUS1_SLEEP)
+    {
+        // Decrement sleep counter
+        gBattleMons[gBattlerAttacker].status1--;
+        if (gBattleMons[gBattlerAttacker].status1 & STATUS1_SLEEP)
+        {
+            // Still asleep
+            gBattlescriptCurrInstr = BattleScript_MoveUsedIsAsleep;
+            return;
+        }
+        // Woke up - continue with move
+    }
+
+    // Check for Freeze
+    if (gBattleMons[gBattlerAttacker].status1 & STATUS1_FREEZE)
+    {
+        // 20% chance to thaw each turn
+        if (Random() % 5 == 0)
+        {
+            gBattleMons[gBattlerAttacker].status1 &= ~STATUS1_FREEZE;
+            BattleScriptPush(gBattlescriptCurrInstr + 1);
+            gBattlescriptCurrInstr = BattleScript_MoveUsedUnfroze;
+            return;
+        }
+        // Still frozen
+        gBattlescriptCurrInstr = BattleScript_MoveUsedIsFrozen;
+        return;
+    }
+
+    // Check for Paralysis
+    if (gBattleMons[gBattlerAttacker].status1 & STATUS1_PARALYSIS)
+    {
+        // 25% chance to be fully paralyzed
+        if (Random() % 4 == 0)
+        {
+            gBattlescriptCurrInstr = BattleScript_MoveUsedIsParalyzed;
+            return;
+        }
+    }
+
+    // Check for Confusion
+    if (gBattleMons[gBattlerAttacker].status2 & STATUS2_CONFUSION)
+    {
+        // Decrement confusion counter
+        gBattleMons[gBattlerAttacker].status2 -= STATUS2_CONFUSION_TURN(1);
+
+        if (gBattleMons[gBattlerAttacker].status2 & STATUS2_CONFUSION)
+        {
+            // Still confused - 50% chance to hit self
+            if (Random() & 1)
+            {
+                gBattlerTarget = gBattlerAttacker;
+                gBattlescriptCurrInstr = BattleScript_MoveUsedIsConfused;
+                return;
+            }
+            // Snapped out
+            BattleScriptPush(gBattlescriptCurrInstr + 1);
+            gBattlescriptCurrInstr = BattleScript_ConfusionSnappedOut;
+            return;
+        }
+    }
+
+    // Check for Flinching
+    if (gBattleMons[gBattlerAttacker].status2 & STATUS2_FLINCHED)
+    {
+        gBattleMons[gBattlerAttacker].status2 &= ~STATUS2_FLINCHED;
+        gBattlescriptCurrInstr = BattleScript_MoveUsedFlinched;
+        return;
+    }
+
+    // No cancellation - continue to next command
+    gBattlescriptCurrInstr++;
+}
+```
+
+<DiagramContainer title="Attack Cancellation Flow">
+<pre class="mermaid">
+{`flowchart TB
+    Start[attackcanceler] --> Fainted{Attacker fainted?}
+    Fainted -->|Yes| CancelFaint[BattleScript_AttackCanceledByFainting]
+    Fainted -->|No| Sleep{Asleep?}
+
+    Sleep -->|Yes| DecrSleep[Decrement counter]
+    DecrSleep --> StillAsleep{Still asleep?}
+    StillAsleep -->|Yes| CancelSleep[BattleScript_MoveUsedIsAsleep]
+    StillAsleep -->|No| Freeze
+
+    Sleep -->|No| Freeze{Frozen?}
+    Freeze -->|Yes| ThawRoll{20% thaw?}
+    ThawRoll -->|Yes| Thaw[Unfreeze + continue]
+    ThawRoll -->|No| CancelFreeze[BattleScript_MoveUsedIsFrozen]
+
+    Freeze -->|No| Para{Paralyzed?}
+    Para -->|Yes| ParaRoll{25% full para?}
+    ParaRoll -->|Yes| CancelPara[BattleScript_MoveUsedIsParalyzed]
+    ParaRoll -->|No| Confuse
+
+    Para -->|No| Confuse{Confused?}
+    Confuse -->|Yes| ConfRoll{50% self-hit?}
+    ConfRoll -->|Yes| HitSelf[BattleScript_MoveUsedIsConfused]
+    ConfRoll -->|No| Flinch
+
+    Confuse -->|No| Flinch{Flinched?}
+    Flinch -->|Yes| CancelFlinch[BattleScript_MoveUsedFlinched]
+    Flinch -->|No| Continue[Advance to next command]`}
+</pre>
+</DiagramContainer>
+
+### accuracycheck - Hit/Miss Calculation
+
+```c
+static void Cmd_accuracycheck(void)
+{
+    // Read arguments: failure script address
+    const u8 *failScript = T1_READ_PTR(gBattlescriptCurrInstr + 1);
+    u16 move = T1_READ_16(gBattlescriptCurrInstr + 5);
+
+    // Check for moves that never miss
+    if (gBattleMoves[gCurrentMove].accuracy == 0)
+    {
+        // 0 accuracy = always hits
+        gBattlescriptCurrInstr += 7;
+        return;
+    }
+
+    // Check for Lock-On/Mind Reader
+    if (gStatuses3[gBattlerTarget] & STATUS3_ALWAYS_HITS)
+    {
+        gBattlescriptCurrInstr += 7;
+        return;
+    }
+
+    // Check for No Guard
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_NO_GUARD
+     || GetBattlerAbility(gBattlerTarget) == ABILITY_NO_GUARD)
+    {
+        gBattlescriptCurrInstr += 7;
+        return;
+    }
+
+    // Calculate accuracy
+    u32 accuracy = gBattleMoves[gCurrentMove].accuracy;
+
+    // Apply accuracy stat stages
+    s8 accStage = gBattleMons[gBattlerAttacker].statStages[STAT_ACC];
+    s8 evaStage = gBattleMons[gBattlerTarget].statStages[STAT_EVASION];
+    s8 stage = accStage - evaStage + 6;
+
+    if (stage < 0) stage = 0;
+    if (stage > 12) stage = 12;
+
+    // Stat stage multipliers
+    static const u8 sAccuracyStageRatios[][2] = {
+        {33, 100}, {36, 100}, {43, 100}, {50, 100}, {60, 100}, {75, 100},
+        {100, 100},  // Stage 0 (neutral)
+        {133, 100}, {166, 100}, {200, 100}, {250, 100}, {266, 100}, {300, 100},
+    };
+
+    accuracy = (accuracy * sAccuracyStageRatios[stage][0]) / sAccuracyStageRatios[stage][1];
+
+    // Apply ability modifiers
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_COMPOUND_EYES)
+        accuracy = (accuracy * 130) / 100;
+
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_HUSTLE
+     && gBattleMoves[gCurrentMove].power > 0)
+        accuracy = (accuracy * 80) / 100;
+
+    // Roll for hit
+    if (Random() % 100 >= accuracy)
+    {
+        // Miss!
+        gMoveResultFlags |= MOVE_RESULT_MISSED;
+        gBattlescriptCurrInstr = failScript;
+    }
+    else
+    {
+        // Hit!
+        gBattlescriptCurrInstr += 7;
+    }
+}
+```
+
+### damagecalc - Calculate Damage
+
+```c
+static void Cmd_damagecalc(void)
+{
+    // Get base stats
+    u16 attack, defense;
+    u8 type = gBattleMoves[gCurrentMove].type;
+
+    // Determine physical or special
+    if (gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+    {
+        attack = gBattleMons[gBattlerAttacker].attack;
+        defense = gBattleMons[gBattlerTarget].defense;
+    }
+    else if (gBattleMoves[gCurrentMove].split == SPLIT_SPECIAL)
+    {
+        attack = gBattleMons[gBattlerAttacker].spAttack;
+        defense = gBattleMons[gBattlerTarget].spDefense;
+    }
+    else
+    {
+        // Status moves don't deal damage
+        gBattleMoveDamage = 0;
+        gBattlescriptCurrInstr++;
+        return;
+    }
+
+    // Apply stat stages
+    attack = ApplyStatStageModifier(attack, gBattleMons[gBattlerAttacker].statStages[STAT_ATK]);
+    defense = ApplyStatStageModifier(defense, gBattleMons[gBattlerTarget].statStages[STAT_DEF]);
+
+    // Core damage formula
+    u32 damage = ((2 * gBattleMons[gBattlerAttacker].level) / 5) + 2;
+    damage *= gBattleMoves[gCurrentMove].power;
+    damage *= attack;
+    damage /= defense;
+    damage /= 50;
+    damage += 2;
+
+    // Random factor (85-100%)
+    damage *= (100 - (Random() % 16));
+    damage /= 100;
+
+    // STAB bonus
+    if (IS_BATTLER_OF_TYPE(gBattlerAttacker, type))
+        damage = (damage * 15) / 10;  // 1.5x
+
+    // Minimum damage is 1
+    if (damage == 0)
+        damage = 1;
+
+    gBattleMoveDamage = damage;
+    gBattlescriptCurrInstr++;
+}
+```
+
+### typecalc - Type Effectiveness
+
+```c
+static void Cmd_typecalc(void)
+{
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+    u8 defType1 = gBattleMons[gBattlerTarget].type1;
+    u8 defType2 = gBattleMons[gBattlerTarget].type2;
+
+    // Type effectiveness table
+    // TYPE_EFFECT_SUPER_EFFECTIVE = 20 (2.0x)
+    // TYPE_EFFECT_NOT_VERY = 5 (0.5x)
+    // TYPE_EFFECT_NO_EFFECT = 0 (0x)
+    // TYPE_EFFECT_NORMAL = 10 (1.0x)
+
+    u8 modifier = TYPE_EFFECT_NORMAL;
+
+    // Check first type
+    modifier = GetTypeModifier(moveType, defType1);
+
+    // Check second type (if different)
+    if (defType1 != defType2)
+    {
+        u8 modifier2 = GetTypeModifier(moveType, defType2);
+        modifier = (modifier * modifier2) / TYPE_EFFECT_NORMAL;
+    }
+
+    // Apply modifier to damage
+    gBattleMoveDamage = (gBattleMoveDamage * modifier) / TYPE_EFFECT_NORMAL;
+
+    // Set result flags
+    if (modifier == 0)
+    {
+        gMoveResultFlags |= MOVE_RESULT_DOESNT_AFFECT_FOE;
+        gBattleMoveDamage = 0;
+    }
+    else if (modifier > TYPE_EFFECT_NORMAL)
+    {
+        gMoveResultFlags |= MOVE_RESULT_SUPER_EFFECTIVE;
+    }
+    else if (modifier < TYPE_EFFECT_NORMAL)
+    {
+        gMoveResultFlags |= MOVE_RESULT_NOT_VERY_EFFECTIVE;
+    }
+
+    gBattlescriptCurrInstr++;
+}
+```
+
+<DiagramContainer title="Type Effectiveness Lookup">
+<pre class="mermaid">
+{`flowchart TB
+    Start[typecalc] --> GetTypes[Get move type, defender types]
+    GetTypes --> Lookup1[Lookup modifier vs Type 1]
+    Lookup1 --> Check{Type 1 != Type 2?}
+    Check -->|Yes| Lookup2[Lookup modifier vs Type 2]
+    Lookup2 --> Multiply[Combine modifiers]
+    Check -->|No| Apply
+
+    Multiply --> Apply[Apply to damage]
+
+    Apply --> Zero{Modifier = 0?}
+    Zero -->|Yes| NoEffect[MOVE_RESULT_DOESNT_AFFECT_FOE]
+    Zero -->|No| Super{Modifier > 10?}
+    Super -->|Yes| SE[MOVE_RESULT_SUPER_EFFECTIVE]
+    Super -->|No| NVE{Modifier < 10?}
+    NVE -->|Yes| NotVery[MOVE_RESULT_NOT_VERY_EFFECTIVE]
+    NVE -->|No| Done[Next command]`}
+</pre>
+</DiagramContainer>
+
+### seteffectwithchance - Secondary Effects
+
+```c
+static void Cmd_seteffectwithchance(void)
+{
+    // Read effect chance from move data
+    u8 chance = gBattleMoves[gCurrentMove].secondaryEffectChance;
+
+    // Always apply if 0% (means 100% for primary effects)
+    // or if Serene Grace doubles the chance
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_SERENE_GRACE)
+        chance *= 2;
+
+    // Roll for effect
+    if (chance == 0 || Random() % 100 < chance)
+    {
+        // Apply the effect
+        SetMoveEffect(gBattleMoves[gCurrentMove].additionalEffects[0].moveEffect,
+                      FALSE, FALSE);
+    }
+
+    gBattlescriptCurrInstr++;
+}
+
+// Effect application
+void SetMoveEffect(u16 effect, bool8 primary, bool8 affectsUser)
+{
+    u8 target = affectsUser ? gBattlerAttacker : gBattlerTarget;
+
+    switch (effect)
+    {
+    case MOVE_EFFECT_BURN:
+        // Check for Fire type immunity
+        if (IS_BATTLER_OF_TYPE(target, TYPE_FIRE))
+            break;
+        // Check for existing status
+        if (gBattleMons[target].status1)
+            break;
+        // Apply burn
+        gBattleMons[target].status1 = STATUS1_BURN;
+        BattleScriptPush(gBattlescriptCurrInstr);
+        gBattlescriptCurrInstr = BattleScript_BurnTarget;
+        break;
+
+    case MOVE_EFFECT_PARALYSIS:
+        if (IS_BATTLER_OF_TYPE(target, TYPE_ELECTRIC))
+            break;
+        if (gBattleMons[target].status1)
+            break;
+        gBattleMons[target].status1 = STATUS1_PARALYSIS;
+        BattleScriptPush(gBattlescriptCurrInstr);
+        gBattlescriptCurrInstr = BattleScript_ParalyzeTarget;
+        break;
+
+    case MOVE_EFFECT_FLINCH:
+        // Only works if target hasn't acted yet
+        if (GetBattlerTurnOrderNum(target) > gCurrentTurnActionNumber)
+            gBattleMons[target].status2 |= STATUS2_FLINCHED;
+        break;
+
+    case MOVE_EFFECT_CONFUSION:
+        if (gBattleMons[target].status2 & STATUS2_CONFUSION)
+            break;
+        gBattleMons[target].status2 |= STATUS2_CONFUSION_TURN(Random() % 4 + 2);
+        BattleScriptPush(gBattlescriptCurrInstr);
+        gBattlescriptCurrInstr = BattleScript_ConfuseTarget;
+        break;
+
+    // ... many more effects
+    }
+}
+```
+
+## Script Flow Control
+
+### Branching and Jumping
+
+```c
+// Unconditional jump
+static void Cmd_goto(void)
+{
+    gBattlescriptCurrInstr = T1_READ_PTR(gBattlescriptCurrInstr + 1);
+}
+
+// Conditional jump
+static void Cmd_jumpifbyte(void)
+{
+    u8 comparison = gBattlescriptCurrInstr[1];
+    u8 *value = T1_READ_PTR(gBattlescriptCurrInstr + 2);
+    u8 compareTo = gBattlescriptCurrInstr[6];
+    const u8 *jumpTo = T1_READ_PTR(gBattlescriptCurrInstr + 7);
+
+    bool8 condition = FALSE;
+
+    switch (comparison)
+    {
+    case CMP_EQUAL:
+        condition = (*value == compareTo);
+        break;
+    case CMP_NOT_EQUAL:
+        condition = (*value != compareTo);
+        break;
+    case CMP_GREATER_THAN:
+        condition = (*value > compareTo);
+        break;
+    case CMP_LESS_THAN:
+        condition = (*value < compareTo);
+        break;
+    }
+
+    if (condition)
+        gBattlescriptCurrInstr = jumpTo;
+    else
+        gBattlescriptCurrInstr += 11;
+}
+
+// Call subroutine (push return address)
+static void Cmd_call(void)
+{
+    BattleScriptPush(gBattlescriptCurrInstr + 5);
+    gBattlescriptCurrInstr = T1_READ_PTR(gBattlescriptCurrInstr + 1);
+}
+
+// Return from subroutine
+static void Cmd_return(void)
+{
+    gBattlescriptCurrInstr = BattleScriptPop();
+}
+```
+
+### Script Call Stack
+
+```c
+// Script stack for subroutines
+static const u8 *sBattleScriptStack[8];
+static u8 sBattleScriptStackSize;
+
+void BattleScriptPush(const u8 *script)
+{
+    sBattleScriptStack[sBattleScriptStackSize++] = script;
+}
+
+const u8 *BattleScriptPop(void)
+{
+    return sBattleScriptStack[--sBattleScriptStackSize];
+}
+
+// Push current position and jump to new script
+void BattleScriptPushCursor(void)
+{
+    BattleScriptPush(gBattlescriptCurrInstr);
+}
+```
+
+<DiagramContainer title="Script Call Stack">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Main as MainScript
+    participant Sub as Subroutine
+    participant Stack as Script Stack
+
+    Main->>Stack: Push return address
+    Main->>Sub: Jump to subroutine
+
+    Sub->>Sub: Execute commands
+
+    Sub->>Stack: Pop return address
+    Stack->>Main: Return to caller
+
+    Main->>Main: Continue execution`}
+</pre>
+</DiagramContainer>
+
+## Example Move Scripts
+
+### Simple Damage Move (Tackle)
+
+```c
+// BattleScript_EffectHit - Basic damaging move
+const u8 BattleScript_EffectHit[] = {
+    attackcanceler,                 // Check sleep, freeze, flinch, etc.
+    accuracycheck BS_MISS,          // Check if move hits
+    attackstring,                   // Print "[Pokemon] used [Move]!"
+    ppreduce,                       // Reduce PP
+    critcalc,                       // Calculate critical hit
+    damagecalc,                     // Calculate base damage
+    typecalc,                       // Apply type effectiveness
+    adjustnormaldamage,             // Apply held items, abilities
+    attackanimation,                // Play move animation
+    waitanimation,                  // Wait for animation to finish
+    effectivenesssound,             // Play super effective / not very effective sound
+    hitanimation TARGET,            // Play hit animation on target
+    waitanimation,
+    healthbarupdate TARGET,         // Animate HP bar decreasing
+    datahpupdate TARGET,            // Update actual HP value
+    critmessage,                    // Print "Critical hit!" if applicable
+    waitmessage 0x40,
+    resultmessage,                  // Print effectiveness message
+    waitmessage 0x40,
+    seteffectwithchance,            // Apply secondary effect if any
+    tryfaintmon TARGET,             // Check if target fainted
+    moveend,                        // End move sequence
+    end,
+};
+```
+
+### Status Move (Thunder Wave)
+
+```c
+// BattleScript_EffectParalyze - Paralysis move
+const u8 BattleScript_EffectParalyze[] = {
+    attackcanceler,
+    accuracycheck BS_MISS,
+    attackstring,
+    ppreduce,
+    jumpifstatus TARGET, STATUS1_PARALYSIS, BS_ALREADY_PARALYZED,
+    jumpiftype TARGET, TYPE_ELECTRIC, BS_TYPE_IMMUNE,
+    attackanimation,
+    waitanimation,
+    seteffectprimary,               // Apply paralysis (100% if not blocked)
+    goto BS_MOVE_END,
+};
+
+// Branch targets
+const u8 BS_ALREADY_PARALYZED[] = {
+    printstring STRINGID_ALREADY_PARALYZED,
+    waitmessage 0x40,
+    goto BS_MOVE_FAILED,
+};
+
+const u8 BS_TYPE_IMMUNE[] = {
+    printstring STRINGID_DOESNT_AFFECT,
+    waitmessage 0x40,
+    goto BS_MOVE_FAILED,
+};
+```
+
+### Multi-Hit Move (Fury Attack)
+
+```c
+// BattleScript_EffectMultiHit - Hits 2-5 times
+const u8 BattleScript_EffectMultiHit[] = {
+    attackcanceler,
+    accuracycheck BS_MISS,
+    attackstring,
+    ppreduce,
+    setmultihitcounter MULTIHIT_2_5,  // Set hit count (2-5)
+    // Loop start
+MULTI_HIT_LOOP:
+    critcalc,
+    damagecalc,
+    typecalc,
+    adjustnormaldamage,
+    attackanimation,
+    waitanimation,
+    effectivenesssound,
+    hitanimation TARGET,
+    waitanimation,
+    healthbarupdate TARGET,
+    datahpupdate TARGET,
+    critmessage,
+    waitmessage 0x40,
+    seteffectwithchance,
+    tryfaintmon TARGET,
+    jumpiffainted TARGET, BS_MULTI_HIT_END,
+    decrementmultihit,
+    jumpifbyte CMP_NOT_EQUAL, gMultiHitCounter, 0, MULTI_HIT_LOOP,
+BS_MULTI_HIT_END:
+    resultmessage,
+    waitmessage 0x40,
+    printstring STRINGID_HIT_X_TIMES,
+    waitmessage 0x40,
+    moveend,
+    end,
+};
+```
+
+### Stat-Boosting Move (Swords Dance)
+
+```c
+// BattleScript_EffectAttackUp2 - Raise Attack sharply
+const u8 BattleScript_EffectAttackUp2[] = {
+    attackcanceler,
+    attackstring,
+    ppreduce,
+    jumpifstat ATTACKER, CMP_LESS_THAN, STAT_ATK, MAX_STAT_STAGE, BS_STAT_CHANGE,
+    jumpifstat ATTACKER, CMP_EQUAL, STAT_ATK, MAX_STAT_STAGE, BS_STAT_MAXED,
+BS_STAT_CHANGE:
+    attackanimation,
+    waitanimation,
+    setbyte sSTATCHANGER, STAT_ATK | STAT_BUFF_ALLOW_PTR,
+    statbuffchange ATTACKER | MOVE_EFFECT_RAISE_STAT(2),
+    jumpifbyte CMP_EQUAL, cMULTISTRING_CHOOSER, 0, BS_STAT_CHANGE_SUCCESS,
+    goto BS_STAT_CHANGE_FAILED,
+BS_STAT_CHANGE_SUCCESS:
+    printfromtable gStatUpStringIds,
+    waitmessage 0x40,
+    moveend,
+    end,
+BS_STAT_MAXED:
+    printstring STRINGID_STAT_WONT_GO_HIGHER,
+    waitmessage 0x40,
+    goto BS_MOVE_FAILED,
+};
+```
+
+<DiagramContainer title="Stat Boost Script Flow">
+<pre class="mermaid">
+{`flowchart TB
+    Start[EffectAttackUp2] --> Cancel[attackcanceler]
+    Cancel --> String[attackstring]
+    String --> PP[ppreduce]
+    PP --> Check{Stat at max?}
+
+    Check -->|Yes| Maxed[Print 'won't go higher']
+    Maxed --> Fail[Move failed]
+
+    Check -->|No| Anim[attackanimation]
+    Anim --> Wait[waitanimation]
+    Wait --> Buff[statbuffchange +2]
+    Buff --> Print[Print stat rose sharply]
+    Print --> End[moveend]`}
+</pre>
+</DiagramContainer>
+
+## Script Macros
+
+Scripts use assembly macros for readability:
+
+```c
+// In battle_scripts.s
+.macro attackcanceler
+    .byte CMDID_ATTACKCANCELER
+.endm
+
+.macro accuracycheck failscript:req
+    .byte CMDID_ACCURACYCHECK
+    .4byte \failscript
+.endm
+
+.macro jumpifstatus battler:req, status:req, jumpptr:req
+    .byte CMDID_JUMPIFSTATUS
+    .byte \battler
+    .4byte \status
+    .4byte \jumpptr
+.endm
+
+.macro seteffectwithchance
+    .byte CMDID_SETEFFECTWITHCHANCE
+.endm
+
+// Usage in scripts
+BattleScript_EffectHit:
+    attackcanceler
+    accuracycheck BattleScript_Miss
+    attackstring
+    // ...
+```
+
+## moveend - End of Move Processing
+
+The `moveend` command handles all cleanup after a move:
+
+```c
+static void Cmd_moveend(void)
+{
+    // State machine for end-of-move effects
+    switch (gBattleStruct->moveendState)
+    {
+    case MOVEEND_STATE_SUM_DAMAGE:
+        // Track total damage for Counter/Mirror Coat
+        break;
+
+    case MOVEEND_STATE_RAGE:
+        // Rage boost if hit while raging
+        if (gBattleMons[gBattlerTarget].status2 & STATUS2_RAGE
+         && gBattlerTarget != gBattlerAttacker
+         && gBattleMons[gBattlerTarget].hp != 0
+         && gBattleMoveDamage != 0)
+        {
+            if (gBattleMons[gBattlerTarget].statStages[STAT_ATK] < MAX_STAT_STAGE)
+            {
+                gBattleMons[gBattlerTarget].statStages[STAT_ATK]++;
+                BattleScriptPushCursor();
+                gBattlescriptCurrInstr = BattleScript_RageBoosted;
+            }
+        }
+        break;
+
+    case MOVEEND_STATE_DEFROST:
+        // Fire moves thaw frozen targets
+        if (gBattleMons[gBattlerTarget].status1 & STATUS1_FREEZE
+         && gBattleMoves[gCurrentMove].type == TYPE_FIRE)
+        {
+            gBattleMons[gBattlerTarget].status1 &= ~STATUS1_FREEZE;
+            BattleScriptPushCursor();
+            gBattlescriptCurrInstr = BattleScript_TargetThawed;
+        }
+        break;
+
+    case MOVEEND_STATE_SYNCHRONIZE:
+        // Synchronize ability passes status
+        break;
+
+    case MOVEEND_STATE_LIFE_ORB:
+        // Life Orb recoil
+        break;
+
+    case MOVEEND_STATE_ITEM_EFFECTS_ATTACKER:
+        // Attacker's held item effects
+        break;
+
+    case MOVEEND_STATE_ITEM_EFFECTS_TARGET:
+        // Target's held item effects
+        break;
+
+    case MOVEEND_STATE_UPDATE_LAST_MOVES:
+        // Track for Encore, Disable, etc.
+        gLastUsedMove = gCurrentMove;
+        gLastMoves[gBattlerAttacker] = gCurrentMove;
+        break;
+
+    case MOVEEND_STATE_DONE:
+        // Finished - return to main battle flow
+        gBattleMainFunc = RunTurnActionsFunctions;
+        gBattleStruct->moveendState = 0;
+        return;
+    }
+
+    gBattleStruct->moveendState++;
+}
+```
+
+## Key Script Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `gBattlescriptCurrInstr` | Current script instruction pointer |
+| `gBattlerAttacker` | Who is using the move |
+| `gBattlerTarget` | Who is being targeted |
+| `gCurrentMove` | Move being executed |
+| `gBattleMoveDamage` | Calculated damage value |
+| `gMoveResultFlags` | Hit/miss, effectiveness flags |
+| `gBattleCommunication` | General-purpose communication bytes |
+| `gBattleScripting` | Script-specific state data |
+
+## Command Reference
+
+| Command | Purpose |
+|---------|---------|
+| `attackcanceler` | Check status conditions that prevent attacking |
+| `accuracycheck` | Roll for hit/miss |
+| `attackstring` | Print "[Mon] used [Move]!" |
+| `ppreduce` | Reduce move PP |
+| `critcalc` | Calculate critical hit |
+| `damagecalc` | Calculate damage amount |
+| `typecalc` | Apply type effectiveness |
+| `attackanimation` | Play move animation |
+| `healthbarupdate` | Animate HP bar change |
+| `seteffectwithchance` | Apply secondary effect |
+| `seteffectprimary` | Apply primary effect (100%) |
+| `tryfaintmon` | Check if target fainted |
+| `jumpifstatus` | Branch if status condition met |
+| `goto` | Unconditional jump |
+| `call` | Call subroutine |
+| `return` | Return from subroutine |
+| `moveend` | End-of-move cleanup |
+| `end` | Terminate script |

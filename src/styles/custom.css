@@ -1,0 +1,231 @@
+/* Pokemon Emerald Docs - Custom Styles */
+
+:root {
+	--pokemon-emerald: #50c878;
+	--pokemon-emerald-dark: #3a9a5a;
+	--gba-purple: #7b68ee;
+}
+
+/* Override accent colors to match Pokemon Emerald theme */
+:root {
+	--sl-color-accent-low: #1a3d2a;
+	--sl-color-accent: #50c878;
+	--sl-color-accent-high: #7ddb9c;
+}
+
+/* LearnMore Component Styles */
+.learn-more {
+	border: 1px solid var(--sl-color-gray-5);
+	border-radius: 0.5rem;
+	margin: 1rem 0;
+	background: var(--sl-color-gray-6);
+}
+
+.learn-more summary {
+	padding: 0.75rem 1rem;
+	cursor: pointer;
+	list-style: none;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+
+.learn-more summary::-webkit-details-marker {
+	display: none;
+}
+
+.learn-more-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 1.25rem;
+	height: 1.25rem;
+	font-family: monospace;
+	font-weight: bold;
+	color: var(--sl-color-accent);
+	border: 1px solid var(--sl-color-accent);
+	border-radius: 0.25rem;
+	font-size: 0.875rem;
+}
+
+.learn-more[open] .learn-more-icon {
+	background: var(--sl-color-accent);
+	color: var(--sl-color-black);
+}
+
+.learn-more-title {
+	font-weight: 600;
+}
+
+.learn-more-summary {
+	color: var(--sl-color-gray-3);
+	font-weight: normal;
+	margin-left: 0.25rem;
+}
+
+.learn-more-content {
+	padding: 0 1rem 1rem;
+	border-top: 1px solid var(--sl-color-gray-5);
+	margin-top: 0.5rem;
+	padding-top: 1rem;
+}
+
+/* DeepDiveLink Component Styles */
+.deep-dive-link {
+	text-decoration: none;
+	display: block;
+	margin: 1.5rem 0;
+}
+
+.deep-dive-card {
+	border: 2px solid var(--sl-color-accent);
+	border-radius: 0.75rem;
+	padding: 1rem 1.25rem;
+	background: linear-gradient(135deg, var(--sl-color-accent-low) 0%, transparent 100%);
+	transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.deep-dive-card:hover {
+	transform: translateY(-2px);
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.deep-dive-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 0.5rem;
+}
+
+.deep-dive-badge {
+	background: var(--sl-color-accent);
+	color: var(--sl-color-black);
+	padding: 0.125rem 0.5rem;
+	border-radius: 0.25rem;
+	font-size: 0.75rem;
+	font-weight: bold;
+	text-transform: uppercase;
+}
+
+.deep-dive-arrow {
+	color: var(--sl-color-accent);
+}
+
+.deep-dive-title {
+	margin: 0.25rem 0;
+	color: var(--sl-color-white);
+	font-size: 1.1rem;
+}
+
+.deep-dive-description {
+	margin: 0;
+	color: var(--sl-color-gray-2);
+	font-size: 0.9rem;
+}
+
+/* CodeReference Component Styles */
+.code-reference {
+	margin: 1rem 0;
+	border-radius: 0.5rem;
+	overflow: hidden;
+	border: 1px solid var(--sl-color-gray-5);
+}
+
+.code-reference-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 0.5rem 1rem;
+	background: var(--sl-color-gray-6);
+	border-bottom: 1px solid var(--sl-color-gray-5);
+}
+
+.code-reference-title {
+	font-family: var(--sl-font-mono);
+	font-size: 0.85rem;
+	color: var(--sl-color-gray-2);
+}
+
+.code-reference-link {
+	font-size: 0.75rem;
+	color: var(--sl-color-accent);
+	text-decoration: none;
+}
+
+.code-reference-link:hover {
+	text-decoration: underline;
+}
+
+.code-reference :global(pre) {
+	margin: 0;
+	border-radius: 0;
+}
+
+/* DiagramContainer Component Styles */
+.diagram-container {
+	margin: 2rem 0;
+	text-align: center;
+}
+
+.diagram-title {
+	font-weight: bold;
+	margin-bottom: 1rem;
+	font-size: 1.1rem;
+	color: var(--sl-color-white);
+}
+
+.mermaid-wrapper {
+	background: var(--sl-color-gray-6);
+	padding: 1.5rem;
+	border-radius: 0.5rem;
+	overflow-x: auto;
+}
+
+.diagram-caption {
+	margin-top: 0.75rem;
+	font-size: 0.9rem;
+	color: var(--sl-color-gray-3);
+	font-style: italic;
+}
+
+/* Mermaid diagram theme adjustments */
+.mermaid {
+	line-height: 1.4;
+}
+
+/* Memory map visualization */
+.memory-block {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	font-family: var(--sl-font-mono);
+	font-size: 0.85rem;
+}
+
+.memory-region {
+	display: flex;
+	align-items: center;
+	padding: 0.5rem;
+	border-radius: 0.25rem;
+	gap: 1rem;
+}
+
+.memory-region.ewram { background: rgba(100, 149, 237, 0.2); }
+.memory-region.iwram { background: rgba(255, 165, 0, 0.2); }
+.memory-region.vram { background: rgba(50, 200, 120, 0.2); }
+.memory-region.rom { background: rgba(128, 128, 128, 0.2); }
+
+/* Table improvements */
+table {
+	width: 100%;
+	margin: 1rem 0;
+}
+
+th {
+	background: var(--sl-color-gray-6);
+}
+
+/* Code block improvements for C */
+pre code .keyword { color: #ff7b72; }
+pre code .function { color: #d2a8ff; }
+pre code .type { color: #79c0ff; }

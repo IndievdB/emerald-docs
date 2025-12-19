@@ -1,0 +1,171 @@
+---
+title: Game Flow Overview
+description: Understanding how Pokemon Emerald executes from power-on to gameplay
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+Understanding how Pokemon Emerald flows from power-on to gameplay is essential for navigating the codebase. This section covers the **execution flow** that drives everything in the game.
+
+## The Big Picture
+
+When you power on a Game Boy Advance running Pokemon Emerald:
+
+1. **BIOS** runs first (built into GBA hardware)
+2. **AgbMain()** is called - the game's entry point
+3. **Hardware initializes** - graphics, sound, interrupts
+4. **Main loop starts** - runs 60 times per second forever
+5. **Callbacks execute** - game state logic runs each frame
+
+<DiagramContainer title="Execution Flow">
+<pre class="mermaid">
+{`flowchart TD
+    A[Power On] --> B[GBA BIOS]
+    B --> C[AgbMain Entry Point]
+    C --> D[Initialize Hardware]
+    D --> E[Initialize Callbacks]
+    E --> F[Main Loop]
+
+    F --> G[Read Input]
+    G --> H[Call Callbacks]
+    H --> I[Wait for VBlank]
+    I --> F
+
+    subgraph Callbacks["Active Callbacks"]
+        J[callback1 - Per-frame logic]
+        K[callback2 - State machine]
+    end
+
+    H --> Callbacks`}
+</pre>
+</DiagramContainer>
+
+## Key Concepts
+
+### The Main Loop
+
+The game runs an infinite loop at **60 frames per second** (matching the GBA's display refresh rate). Each iteration:
+
+1. Reads button input
+2. Checks for soft reset (A+B+Start+Select)
+3. Handles link cable communication
+4. Calls `callback1` and `callback2`
+5. Updates play time and music
+6. Waits for the next frame
+
+<LearnMore title="Why 60 FPS?" summary="Tied to hardware refresh rate">
+The GBA's LCD refreshes 60 times per second. The game synchronizes with this by waiting for **VBlank** - the brief period when the display isn't drawing. This ensures:
+
+- Smooth animation without tearing
+- Consistent timing for game logic
+- Safe window for updating graphics memory
+
+All GBA games follow this 60 FPS pattern.
+</LearnMore>
+
+### Callbacks
+
+Instead of one giant game loop, pokeemerald uses **callback functions** - function pointers that change based on game state:
+
+| Callback | Purpose | Example |
+|----------|---------|---------|
+| `callback1` | Per-frame housekeeping | Animation updates |
+| `callback2` | Main state machine | Title screen, overworld, battle |
+| `vblankCallback` | Runs during VBlank interrupt | Copy sprites to display |
+
+The magic is that `callback2` changes when transitioning between screens:
+
+```c
+// Transition to overworld
+SetMainCallback2(CB2_Overworld);
+
+// Transition to battle
+SetMainCallback2(CB2_InitBattle);
+```
+
+### Interrupts
+
+The GBA uses **hardware interrupts** to handle time-sensitive operations:
+
+- **VBlank** - Fires when display finishes drawing (60Hz)
+- **HBlank** - Fires after each scanline (for effects)
+- **Timer** - Fires at configurable intervals
+- **Serial** - Fires for link cable communication
+
+<DiagramContainer title="Frame Timing">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant ML as Main Loop
+    participant CPU as Game Logic
+    participant VB as VBlank Interrupt
+    participant LCD as Display
+
+    loop Every Frame (16.7ms)
+        ML->>CPU: Read keys, call callbacks
+        CPU->>CPU: Update game state
+        ML->>ML: WaitForVBlank()
+        LCD->>VB: VBlank fires
+        VB->>VB: Copy OAM, process DMA
+        VB->>ML: Resume main loop
+    end`}
+</pre>
+</DiagramContainer>
+
+## The `gMain` Structure
+
+All main loop state lives in a global structure:
+
+```c
+struct Main {
+    MainCallback callback1;      // Per-frame callback
+    MainCallback callback2;      // State machine callback
+
+    IntrCallback vblankCallback; // VBlank interrupt handler
+    IntrCallback hblankCallback; // HBlank interrupt handler
+
+    u16 heldKeys;               // Currently held buttons
+    u16 newKeys;                // Just-pressed buttons
+    u16 newAndRepeatedKeys;     // With key repeat
+
+    u8 state;                   // Generic state variable
+    // ... more fields
+};
+
+// The global instance
+extern struct Main gMain;
+```
+
+<LearnMore title="Why global state?" summary="Embedded systems pattern">
+On resource-constrained systems like the GBA, global state is common because:
+
+- No dynamic memory allocation overhead
+- Fast access (no pointer indirection)
+- Predictable memory layout
+- Easy to save/restore state
+
+Modern games avoid globals, but for 2005 GBA development, this was standard practice.
+</LearnMore>
+
+## Navigation
+
+Dive deeper into each aspect:
+
+<DeepDiveLink
+  href="/game-flow/boot-sequence"
+  title="Boot Sequence"
+  description="What happens inside AgbMain() before the main loop starts"
+/>
+
+<DeepDiveLink
+  href="/game-flow/main-loop"
+  title="Main Loop"
+  description="The 60 FPS loop that drives everything"
+/>
+
+<DeepDiveLink
+  href="/game-flow/state-machine"
+  title="State Machine"
+  description="How callbacks manage game state transitions"
+/>

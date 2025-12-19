@@ -1,0 +1,287 @@
+---
+title: Boot Sequence
+description: What happens when Pokemon Emerald starts up
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import CodeReference from '../../../components/CodeReference.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+When you power on Pokemon Emerald, a precise sequence of initialization happens before you see the Game Freak logo. This page walks through **AgbMain()** - the game's entry point.
+
+## Overview
+
+The boot sequence initializes:
+1. **RAM** - Clear and set up memory
+2. **GPU** - Graphics processing registers
+3. **Input** - Key reading system
+4. **Interrupts** - Hardware event handlers
+5. **Sound** - Audio engine
+6. **RTC** - Real-time clock
+7. **Flash** - Save memory detection
+8. **Callbacks** - Initial game state
+9. **Heap** - Dynamic memory allocation
+
+<DiagramContainer title="Boot Sequence Flow">
+<pre class="mermaid">
+{`flowchart TD
+    A[AgbMain] --> B[RegisterRamReset]
+    B --> C[Set Backdrop White]
+    C --> D[InitGpuRegManager]
+    D --> E[Set Waitstates]
+    E --> F[InitKeys]
+    F --> G[InitIntrHandlers]
+    G --> H[m4aSoundInit]
+    H --> I[EnableVCountIntrAtLine150]
+    I --> J[InitRFU]
+    J --> K[RtcInit]
+    K --> L[CheckForFlashMemory]
+    L --> M[InitMainCallbacks]
+    M --> N[ClearDma3Requests]
+    N --> O[ResetBgs]
+    O --> P[SetDefaultFontsPointer]
+    P --> Q[InitHeap]
+    Q --> R[Enter Main Loop]`}
+</pre>
+</DiagramContainer>
+
+## The AgbMain Function
+
+Here's the actual entry point code:
+
+<CodeReference file="src/main.c" startLine={89} endLine={122}>
+```c
+void AgbMain(void)
+{
+    // Clear RAM on non-modern compilers
+#if !MODERN
+    RegisterRamReset(RESET_ALL);
+#endif
+
+    // Set backdrop to white (visible during boot)
+    *(vu16 *)BG_PLTT = RGB_WHITE;
+
+    // Initialize systems in order
+    InitGpuRegManager();
+    REG_WAITCNT = WAITCNT_PREFETCH_ENABLE | WAITCNT_WS0_S_1 | WAITCNT_WS0_N_3;
+    InitKeys();
+    InitIntrHandlers();
+    m4aSoundInit();
+    EnableVCountIntrAtLine150();
+    InitRFU();
+    RtcInit();
+    CheckForFlashMemory();
+    InitMainCallbacks();
+    InitMapMusic();
+    ClearDma3Requests();
+    ResetBgs();
+    SetDefaultFontsPointer();
+    InitHeap(gHeap, HEAP_SIZE);
+
+    gSoftResetDisabled = FALSE;
+
+    // Check if flash memory is present
+    if (gFlashMemoryPresent != TRUE)
+        SetMainCallback2(NULL);
+
+    gLinkTransferringData = FALSE;
+    // ... enters main loop
+}
+```
+</CodeReference>
+
+## Step-by-Step Breakdown
+
+### 1. RAM Reset
+
+```c
+RegisterRamReset(RESET_ALL);
+```
+
+Clears all RAM to a known state. This BIOS function zeros:
+- EWRAM (256 KB external RAM)
+- IWRAM (32 KB internal RAM)
+- Palette RAM
+- VRAM
+- OAM (sprite memory)
+
+<LearnMore title="Why reset RAM?" summary="Prevent undefined behavior">
+RAM contents are undefined at power-on. Without clearing, you might read garbage values as valid data. The reset ensures a clean slate for initialization.
+
+Note: Modern compilers handle stack differently, so this is conditionally compiled out with `#if !MODERN`.
+</LearnMore>
+
+### 2. GPU Initialization
+
+```c
+*(vu16 *)BG_PLTT = RGB_WHITE;  // White backdrop
+InitGpuRegManager();
+```
+
+Sets the screen background to white (so the player sees something immediately) and initializes the GPU register manager. The manager buffers graphics register changes to apply them safely during VBlank.
+
+### 3. Waitstate Configuration
+
+```c
+REG_WAITCNT = WAITCNT_PREFETCH_ENABLE | WAITCNT_WS0_S_1 | WAITCNT_WS0_N_3;
+```
+
+Configures memory access timing:
+- **Prefetch Enable** - CPU can fetch next instruction while current executes
+- **WS0 settings** - ROM access timing (3 cycles first access, 1 cycle sequential)
+
+<LearnMore title="What are waitstates?" summary="Memory speed configuration">
+Different memory regions have different speeds. The CPU must "wait" for slower memory. These settings optimize the tradeoff between speed and reliability:
+
+| Setting | Meaning |
+|---------|---------|
+| WAITCNT_PREFETCH_ENABLE | Allow instruction prefetch |
+| WAITCNT_WS0_N_3 | 3 wait cycles for first ROM access |
+| WAITCNT_WS0_S_1 | 1 wait cycle for sequential ROM access |
+
+Faster settings can cause issues on some cartridges, so these are conservative.
+</LearnMore>
+
+### 4. Input System
+
+```c
+InitKeys();
+```
+
+Sets up the key reading system:
+
+```c
+void InitKeys(void)
+{
+    gKeyRepeatContinueDelay = 5;
+    gKeyRepeatStartDelay = 40;
+
+    gMain.heldKeys = 0;
+    gMain.newKeys = 0;
+    gMain.newAndRepeatedKeys = 0;
+    gMain.heldKeysRaw = 0;
+    gMain.newKeysRaw = 0;
+}
+```
+
+Key repeat means holding a button eventually triggers repeated presses (like holding an arrow key in a text editor). Start delay is 40 frames (~0.67s), then repeat every 5 frames.
+
+### 5. Interrupt Handlers
+
+```c
+InitIntrHandlers();
+```
+
+Sets up the interrupt system:
+
+<CodeReference file="src/main.c" startLine={294} endLine={312}>
+```c
+void InitIntrHandlers(void)
+{
+    int i;
+
+    // Copy template to active table
+    for (i = 0; i < INTR_COUNT; i++)
+        gIntrTable[i] = gIntrTableTemplate[i];
+
+    // Copy interrupt dispatcher to RAM (faster execution)
+    DmaCopy32(3, IntrMain, IntrMain_Buffer, sizeof(IntrMain_Buffer));
+    INTR_VECTOR = IntrMain_Buffer;
+
+    // Clear callbacks
+    SetVBlankCallback(NULL);
+    SetHBlankCallback(NULL);
+    SetSerialCallback(NULL);
+
+    // Enable interrupt master
+    REG_IME = 1;
+    EnableInterrupts(INTR_FLAG_VBLANK);
+}
+```
+</CodeReference>
+
+Key points:
+- Copies interrupt handler to RAM for faster execution
+- Sets up the VBlank interrupt (essential for the main loop)
+- Clears callback function pointers
+
+### 6. Sound Initialization
+
+```c
+m4aSoundInit();
+```
+
+Initializes the **M4A** (MusicPlayer2000) sound engine. This is the standard GBA audio library used by most first-party games. It handles:
+- Background music (MIDI-like sequences)
+- Sound effects
+- Pokemon cries
+- Mixing multiple audio channels
+
+### 7. Callbacks Setup
+
+```c
+InitMainCallbacks();
+```
+
+<CodeReference file="src/main.c" startLine={177} endLine={186}>
+```c
+static void InitMainCallbacks(void)
+{
+    gMain.vblankCounter1 = 0;
+    gTrainerHillVBlankCounter = NULL;
+    gMain.vblankCounter2 = 0;
+    gMain.callback1 = NULL;
+    SetMainCallback2(CB2_InitCopyrightScreenAfterBootup);
+    gSaveBlock2Ptr = &gSaveblock2.block;
+    gPokemonStoragePtr = &gPokemonStorage.block;
+}
+```
+</CodeReference>
+
+This is crucial: it sets `callback2` to `CB2_InitCopyrightScreenAfterBootup`, which means the first thing you'll see after boot is the copyright/Game Freak logo sequence.
+
+### 8. Heap Initialization
+
+```c
+InitHeap(gHeap, HEAP_SIZE);
+```
+
+Sets up dynamic memory allocation. The heap is used for:
+- Temporary buffers
+- Variable-size data
+- Graphics decompression buffers
+
+<LearnMore title="GBA memory allocation" summary="Simple heap implementation">
+The GBA has no OS, so pokeemerald implements its own heap:
+
+```c
+// Allocate memory
+void *ptr = Alloc(size);
+
+// Free memory
+Free(ptr);
+```
+
+The heap lives in EWRAM and is relatively simple - no advanced features like garbage collection.
+</LearnMore>
+
+## After Boot
+
+Once initialization completes, the code enters the **main loop** (covered next). The initial callback (`CB2_InitCopyrightScreenAfterBootup`) handles:
+
+1. Displaying the Game Freak logo
+2. Showing the copyright text
+3. Transitioning to the title screen
+
+## Key Takeaways
+
+1. **Order matters** - Systems initialize in dependency order
+2. **Hardware first** - GPU, interrupts, sound before game logic
+3. **Callbacks last** - Game state set up after hardware ready
+4. **One entry point** - Everything flows from AgbMain()
+
+## Next Steps
+
+Now that you understand how the game starts, learn about:
+- [Main Loop](/game-flow/main-loop) - The 60 FPS loop
+- [State Machine](/game-flow/state-machine) - How callbacks work

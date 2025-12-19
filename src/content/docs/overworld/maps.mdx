@@ -1,0 +1,567 @@
+---
+title: Maps & Layouts
+description: Map data structures, headers, layouts, and connections in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Maps in Pokemon Emerald are composed of several interconnected data structures. Understanding how they fit together is essential for map editing and understanding the overworld system.
+
+## Map Data Hierarchy
+
+<DiagramContainer title="Map Structure Overview">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph ROM["ROM Data"]
+        Groups[Map Groups<br/>gMapGroups]
+        Headers[Map Headers]
+        Layouts[Map Layouts]
+        Events[Map Events]
+    end
+
+    subgraph RAM["Runtime"]
+        gMapHeader[gMapHeader]
+        gBackupMapLayout[gBackupMapLayout]
+        gObjectEvents[gObjectEvents]
+    end
+
+    Groups --> Headers
+    Headers --> gMapHeader
+    Headers --> Layouts
+    Layouts --> gBackupMapLayout
+    Headers --> Events
+    Events --> gObjectEvents`}
+</pre>
+</DiagramContainer>
+
+## Map Groups
+
+Maps are organized into **groups** for easy lookup. Each group typically represents a logical area:
+
+```c
+// data/maps.h
+#define MAP_GROUP(map) (MAP_##map >> 8)
+#define MAP_NUM(map) (MAP_##map & 0xFF)
+
+// Example map IDs
+#define MAP_PETALBURG_CITY          (0 | (0 << 8))   // Group 0, Map 0
+#define MAP_SLATEPORT_CITY          (1 | (0 << 8))   // Group 0, Map 1
+#define MAP_LITTLEROOT_TOWN         (0 | (1 << 8))   // Group 1, Map 0
+```
+
+The map group array provides the ROM lookup:
+
+```c
+// data/map_groups.h
+const struct MapHeader *const gMapGroups[] = {
+    [MAP_GROUP_PETALBURG_CITY] = &Petalburg_City_MapHeader,
+    [MAP_GROUP_LITTLEROOT_TOWN] = &Littleroot_Town_MapHeader,
+    // ... more groups
+};
+```
+
+<LearnMore title="Why use groups?" summary="Organized access patterns">
+Grouping maps by region allows:
+- Efficient ROM organization
+- Related maps stored together
+- Easy group-wide operations (like checking "am I in a town?")
+
+Groups include: Towns, Cities, Routes, Caves, Indoor areas, etc.
+</LearnMore>
+
+## MapHeader
+
+The `MapHeader` is the root structure for all map data:
+
+```c
+struct MapHeader
+{
+    /* 0x00 */ const struct MapLayout *mapLayout;
+    /* 0x04 */ const struct MapEvents *events;
+    /* 0x08 */ const u8 *mapScripts;
+    /* 0x0C */ const struct MapConnections *connections;
+    /* 0x10 */ u16 music;
+    /* 0x12 */ u16 mapLayoutId;
+    /* 0x14 */ u8 regionMapSectionId;
+    /* 0x15 */ u8 cave;
+    /* 0x16 */ u8 weather;
+    /* 0x17 */ u8 mapType;
+    /* 0x18 */ u8 filler[2];
+    /* 0x1A */ u8 allowCycling:1;
+               u8 allowEscaping:1;
+               u8 allowRunning:1;
+               u8 showMapName:5;
+    /* 0x1B */ u8 battleType;
+};
+```
+
+### Field Descriptions
+
+| Field | Purpose |
+|-------|---------|
+| `mapLayout` | Pointer to dimensions, tiles, and tilesets |
+| `events` | Pointer to NPCs, warps, triggers |
+| `mapScripts` | Pointer to map-specific event scripts |
+| `connections` | Pointer to adjacent map transitions |
+| `music` | Background music ID (`MUS_*` constant) |
+| `mapLayoutId` | Index for shared layouts |
+| `regionMapSectionId` | Town Map location (`MAPSEC_*`) |
+| `cave` | Cave darkness type (0=none, 1=dark, 2=very dark) |
+| `weather` | Weather effect (`WEATHER_*`) |
+| `mapType` | Indoor/outdoor/underwater type |
+| `allowCycling` | Can use bicycle |
+| `allowEscaping` | Can use Escape Rope / Dig |
+| `allowRunning` | Can run with B button |
+| `showMapName` | Display name on entry |
+| `battleType` | Wild battle terrain type |
+
+### Example Map Header
+
+```c
+// data/maps/PetalburgCity/header.h
+const struct MapHeader PetalburgCity_MapHeader = {
+    .mapLayout = &PetalburgCity_Layout,
+    .events = &PetalburgCity_MapEvents,
+    .mapScripts = PetalburgCity_MapScripts,
+    .connections = &PetalburgCity_MapConnections,
+    .music = MUS_PETALBURG,
+    .mapLayoutId = LAYOUT_PETALBURG_CITY,
+    .regionMapSectionId = MAPSEC_PETALBURG_CITY,
+    .cave = CAVE_TYPE_NONE,
+    .weather = WEATHER_SUNNY,
+    .mapType = MAP_TYPE_CITY,
+    .allowCycling = TRUE,
+    .allowEscaping = FALSE,
+    .allowRunning = TRUE,
+    .showMapName = TRUE,
+    .battleType = BATTLE_TERRAIN_GRASS,
+};
+```
+
+## MapLayout
+
+The `MapLayout` defines the physical map:
+
+```c
+struct MapLayout
+{
+    /* 0x00 */ s32 width;           // Width in metatiles
+    /* 0x04 */ s32 height;          // Height in metatiles
+    /* 0x08 */ const u16 *border;   // Border metatile array (4 entries)
+    /* 0x0C */ const u16 *map;      // Map grid data
+    /* 0x10 */ const struct Tileset *primaryTileset;
+    /* 0x14 */ const struct Tileset *secondaryTileset;
+};
+```
+
+### Map Grid Data
+
+The map grid is a 2D array of 16-bit values, one per metatile position:
+
+<DiagramContainer title="Map Block Data Format">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Block["16-bit Map Block"]
+        direction TB
+        A["Bits 0-9<br/>Metatile ID<br/>(0-1023)"]
+        B["Bits 10-11<br/>Collision<br/>(0-3)"]
+        C["Bits 12-15<br/>Elevation<br/>(0-15)"]
+    end`}
+</pre>
+</DiagramContainer>
+
+```c
+// Extracting components from a map block
+#define MAPGRID_METATILE_ID_MASK 0x03FF  // Bits 0-9
+#define MAPGRID_COLLISION_MASK   0x0C00  // Bits 10-11
+#define MAPGRID_ELEVATION_MASK   0xF000  // Bits 12-15
+
+u16 block = gBackupMapLayout.map[y * width + x];
+u16 metatileId = block & MAPGRID_METATILE_ID_MASK;
+u8 collision = (block & MAPGRID_COLLISION_MASK) >> 10;
+u8 elevation = (block & MAPGRID_ELEVATION_MASK) >> 12;
+```
+
+### Border Metatiles
+
+The border array defines what appears outside the map bounds:
+
+```c
+const u16 PetalburgCity_Border[] = {
+    METATILE_General_Grass,      // Top-left
+    METATILE_General_Grass,      // Top-right
+    METATILE_General_Grass,      // Bottom-left
+    METATILE_General_Grass,      // Bottom-right
+};
+```
+
+<LearnMore title="When is the border visible?" summary="Map edges and connections">
+Borders appear:
+- At edges of maps without connections
+- During camera scroll before adjacent map loads
+- When player is near map edge
+
+Connections replace borders with actual adjacent map data.
+</LearnMore>
+
+## MapEvents
+
+The `MapEvents` structure contains all interactive elements:
+
+```c
+struct MapEvents
+{
+    u8 objectEventCount;
+    u8 warpCount;
+    u8 coordEventCount;
+    u8 bgEventCount;
+    const struct ObjectEventTemplate *objectEvents;
+    const struct WarpEvent *warps;
+    const struct CoordEvent *coordEvents;
+    const struct BgEvent *bgEvents;
+};
+```
+
+### Event Types
+
+<DiagramContainer title="Map Event Types">
+<pre class="mermaid">
+{`flowchart TB
+    MapEvents --> ObjectEvents[Object Events<br/>NPCs, items, decorations]
+    MapEvents --> WarpEvents[Warp Events<br/>Doors, stairs, caves]
+    MapEvents --> CoordEvents[Coord Events<br/>Step triggers, scripts]
+    MapEvents --> BgEvents[BG Events<br/>Signs, hidden items]`}
+</pre>
+</DiagramContainer>
+
+### ObjectEventTemplate
+
+Defines NPCs and objects on the map:
+
+```c
+struct ObjectEventTemplate
+{
+    /* 0x00 */ u8 localId;       // Unique ID within this map
+    /* 0x01 */ u8 graphicsId;    // OBJ_EVENT_GFX_* sprite
+    /* 0x02 */ u8 kind;          // Always OBJ_KIND_NORMAL
+    /* 0x03 */ u8 padding;
+    /* 0x04 */ s16 x;            // X position (metatile coords)
+    /* 0x06 */ s16 y;            // Y position (metatile coords)
+    /* 0x08 */ u8 elevation;     // Height layer
+    /* 0x09 */ u8 movementType;  // MOVEMENT_TYPE_*
+    /* 0x0A */ u8 movementRangeX:4;
+               u8 movementRangeY:4;
+    /* 0x0B */ u8 padding2;
+    /* 0x0C */ u16 trainerType;  // TRAINER_TYPE_* (0 if not trainer)
+    /* 0x0E */ u16 trainerRange_berryTreeId;
+    /* 0x10 */ const u8 *script; // Event script pointer
+    /* 0x14 */ u16 flagId;       // FLAG_* to hide when set
+    /* 0x16 */ u8 padding3[2];
+};
+```
+
+Example NPC definition:
+
+```c
+const struct ObjectEventTemplate PetalburgCity_ObjectEvents[] = {
+    {
+        .localId = 1,
+        .graphicsId = OBJ_EVENT_GFX_MAN_1,
+        .x = 15, .y = 8,
+        .elevation = 3,
+        .movementType = MOVEMENT_TYPE_WANDER_AROUND,
+        .movementRangeX = 2, .movementRangeY = 2,
+        .script = PetalburgCity_Man1_Script,
+        .flagId = 0,
+    },
+    // ... more NPCs
+};
+```
+
+### WarpEvent
+
+Defines map transitions:
+
+```c
+struct WarpEvent
+{
+    s16 x, y;           // Warp tile position
+    u8 elevation;       // Height layer
+    u8 warpId;          // Destination warp ID (or -1 for x,y coords)
+    u8 mapNum;          // Destination map number
+    u8 mapGroup;        // Destination map group
+};
+```
+
+### CoordEvent
+
+Triggers scripts when player steps on tile:
+
+```c
+struct CoordEvent
+{
+    s16 x, y;           // Trigger position
+    u8 elevation;       // Height layer
+    u16 trigger;        // VAR_* and value that activates
+    u16 index;          // Which trigger instance
+    const u8 *script;   // Script to run
+};
+```
+
+### BgEvent
+
+Triggers when player interacts with tile (A button):
+
+```c
+struct BgEvent
+{
+    s16 x, y;                   // Position
+    u8 elevation;               // Height layer
+    u8 kind;                    // BG_EVENT_* type
+    union {
+        const u8 *script;       // Script pointer
+        u16 hiddenItemId;       // Hidden item ID
+    } bgUnion;
+};
+
+// BG event types
+#define BG_EVENT_PLAYER_FACING_ANY     0
+#define BG_EVENT_PLAYER_FACING_NORTH   1
+#define BG_EVENT_PLAYER_FACING_SOUTH   2
+#define BG_EVENT_PLAYER_FACING_EAST    3
+#define BG_EVENT_PLAYER_FACING_WEST    4
+#define BG_EVENT_HIDDEN_ITEM           7
+#define BG_EVENT_SECRET_BASE           8
+```
+
+## Map Connections
+
+Adjacent maps are linked via connections:
+
+```c
+struct MapConnection
+{
+    u8 direction;       // CONNECTION_* direction
+    s32 offset;         // Tile offset from map edge
+    u8 mapGroup;        // Connected map group
+    u8 mapNum;          // Connected map number
+};
+
+struct MapConnections
+{
+    s32 count;
+    const struct MapConnection *connections;
+};
+```
+
+### Connection Directions
+
+```c
+#define CONNECTION_NONE      0
+#define CONNECTION_DOWN      1
+#define CONNECTION_UP        2
+#define CONNECTION_LEFT      3
+#define CONNECTION_RIGHT     4
+#define CONNECTION_DIVE      5
+#define CONNECTION_EMERGE    6
+```
+
+<DiagramContainer title="Map Connection Example">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Route101["Route 101"]
+        A[Map Area]
+    end
+
+    subgraph Oldale["Oldale Town"]
+        B[Map Area]
+    end
+
+    subgraph Littleroot["Littleroot Town"]
+        C[Map Area]
+    end
+
+    Route101 -->|UP| Oldale
+    Route101 -->|DOWN| Littleroot
+    Oldale -->|DOWN| Route101
+    Littleroot -->|UP| Route101`}
+</pre>
+</DiagramContainer>
+
+Example connection setup:
+
+```c
+const struct MapConnection Route101_Connections[] = {
+    {
+        .direction = CONNECTION_UP,
+        .offset = 0,
+        .mapGroup = MAP_GROUP_OLDALE_TOWN,
+        .mapNum = MAP_NUM_OLDALE_TOWN,
+    },
+    {
+        .direction = CONNECTION_DOWN,
+        .offset = 0,
+        .mapGroup = MAP_GROUP_LITTLEROOT_TOWN,
+        .mapNum = MAP_NUM_LITTLEROOT_TOWN,
+    },
+};
+
+const struct MapConnections Route101_MapConnections = {
+    .count = 2,
+    .connections = Route101_Connections,
+};
+```
+
+## Map Loading Process
+
+When entering a new map, the loading sequence is:
+
+<DiagramContainer title="Map Loading Sequence">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Warp as Warp Trigger
+    participant Load as CB2_LoadMap
+    participant Data as LoadCurrentMapData
+    participant Init as InitMap
+    participant Spawn as SpawnObjectEvents
+
+    Warp->>Load: SetWarpDestination()
+    Load->>Data: Get MapHeader
+    Data->>Data: gMapHeader = header
+    Data->>Init: InitMapLayoutData()
+    Init->>Init: Copy map grid to RAM
+    Init->>Init: Load tilesets to VRAM
+    Init->>Init: Draw map to backgrounds
+    Load->>Spawn: Create player ObjectEvent
+    Spawn->>Spawn: Spawn visible NPCs
+    Load->>Load: Run map scripts`}
+</pre>
+</DiagramContainer>
+
+### Loading Implementation
+
+```c
+static bool8 LoadMapInStepsLocal(u8 *state, bool32 a1)
+{
+    switch (*state)
+    {
+    case 0:
+        LoadCurrentMapData();          // Load header
+        (*state)++;
+        break;
+    case 1:
+        InitMap();                     // Setup map layout
+        (*state)++;
+        break;
+    case 2:
+        LoadObjEventTemplatesFromHeader(); // Copy NPC templates
+        (*state)++;
+        break;
+    case 3:
+        // Spawn player and NPCs
+        InitPlayerAvatar(x, y, direction, gender);
+        SpawnObjectEventsOnReturnToField();
+        (*state)++;
+        break;
+    case 4:
+        RunOnLoadMapScript();          // Execute map init script
+        (*state)++;
+        break;
+    // ... more states
+    }
+}
+```
+
+## Runtime Map Access
+
+### Getting Metatile Data
+
+```c
+// Get metatile ID at world coordinates
+u32 MapGridGetMetatileIdAt(int x, int y)
+{
+    if (x < 0 || x >= gBackupMapLayout.width ||
+        y < 0 || y >= gBackupMapLayout.height)
+    {
+        // Return border metatile
+        return GetBorderMetatileAt(x, y);
+    }
+
+    return gBackupMapLayout.map[y * gBackupMapLayout.width + x]
+           & MAPGRID_METATILE_ID_MASK;
+}
+
+// Get behavior (collision, effects) at coordinates
+u32 MapGridGetMetatileBehaviorAt(int x, int y)
+{
+    u16 metatileId = MapGridGetMetatileIdAt(x, y);
+    return GetMetatileAttributeFromRawMetatileBehavior(
+        GetBehaviorFromMetatileAttributes(metatileId), METATILE_ATTRIBUTE_BEHAVIOR);
+}
+```
+
+### Checking Map Properties
+
+```c
+// Check if current map allows biking
+bool8 IsBikingAllowedOnCurrentMap(void)
+{
+    return gMapHeader.allowCycling;
+}
+
+// Check if current map is indoors
+bool8 IsMapIndoor(void)
+{
+    return gMapHeader.mapType == MAP_TYPE_INDOOR;
+}
+
+// Get current map's music
+u16 GetCurrentMapMusic(void)
+{
+    return gMapHeader.music;
+}
+```
+
+## Map Scripts
+
+Each map can have scripts that run at specific times:
+
+```c
+// Map script types
+#define MAP_SCRIPT_ON_TRANSITION        1  // On map load
+#define MAP_SCRIPT_ON_LOAD              2  // After load complete
+#define MAP_SCRIPT_ON_FRAME_TABLE       3  // Per-frame checks
+#define MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE  4  // On arrival
+#define MAP_SCRIPT_ON_RESUME            5  // After menu close
+#define MAP_SCRIPT_ON_DIVE_WARP         6  // Dive transitions
+
+// Example map scripts
+const u8 PetalburgCity_MapScripts[] = {
+    MAP_SCRIPT_ON_TRANSITION,
+    PetalburgCity_OnTransition,
+    MAP_SCRIPT_ON_FRAME_TABLE,
+    PetalburgCity_OnFrame,
+    MAP_SCRIPT_TERMINATE,
+};
+```
+
+<LearnMore title="When do map scripts run?" summary="Script execution timing">
+- **ON_TRANSITION**: During fade-in, before player visible
+- **ON_LOAD**: After map fully loaded, player visible
+- **ON_FRAME_TABLE**: Every frame while on map (for conditional checks)
+- **ON_WARP_INTO_MAP_TABLE**: When arriving via warp
+- **ON_RESUME**: When returning from pause menu
+</LearnMore>
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `LoadCurrentMapData()` | overworld.c | Load map header |
+| `InitMap()` | fieldmap.c | Initialize map layout |
+| `MapGridGetMetatileIdAt()` | fieldmap.c | Get tile at coords |
+| `MapGridGetMetatileBehaviorAt()` | fieldmap.c | Get tile behavior |
+| `GetMapConnectionAtPos()` | overworld.c | Find adjacent map |
+| `DrawWholeMapView()` | fieldmap.c | Render map to VRAM |
+| `CopyMapTilesetsToVram()` | fieldmap.c | Load tileset graphics |

@@ -1,0 +1,395 @@
+---
+title: Pokemon Encryption
+description: XOR-based data protection scheme for Pokemon structures
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald encrypts the core data within each Pokemon structure to prevent simple memory editing and ensure data integrity. The encryption uses a straightforward XOR cipher with the Pokemon's personality and trainer ID as keys.
+
+## Why Encryption?
+
+The encryption serves multiple purposes:
+
+1. **Anti-cheat** - Makes memory editing more difficult for casual cheaters
+2. **Data integrity** - Combined with checksum, detects corruption
+3. **Backwards compatibility** - Same format across Ruby/Sapphire/Emerald/FR/LG
+4. **Trade validation** - Ensures traded Pokemon weren't tampered with
+
+The encryption is intentionally simple—XOR is fast on the GBA's ARM7TDMI processor and doesn't require additional memory for lookup tables.
+
+## Encryption Architecture
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph BoxPokemon["BoxPokemon Structure"]
+        Header["Header<br/>(32 bytes)<br/>UNENCRYPTED"]
+        Secure["Secure Data<br/>(48 bytes)<br/>ENCRYPTED"]
+    end
+
+    subgraph Keys["Encryption Keys"]
+        PID["Personality<br/>(32-bit)"]
+        OTID["OT ID<br/>(32-bit)"]
+    end
+
+    PID --> XOR["XOR"]
+    OTID --> XOR
+    XOR --> Secure
+
+    style Header fill:#9f9,stroke:#333,color:#000
+    style Secure fill:#f99,stroke:#333,color:#000
+    style Keys fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## What's Encrypted
+
+Only the 48-byte "secure" portion of BoxPokemon is encrypted:
+
+| Region | Offset | Size | Encrypted |
+|--------|--------|------|-----------|
+| Header (personality, otId, nickname, etc.) | 0x00 | 32 bytes | No |
+| Secure data (4 substructs) | 0x20 | 48 bytes | **Yes** |
+
+The header contains the encryption keys themselves (personality and otId), so it cannot be encrypted.
+
+## The XOR Algorithm
+
+Encryption and decryption use the same function—XOR is its own inverse:
+
+```c
+static void EncryptBoxMon(struct BoxPokemon *boxMon)
+{
+    u32 i;
+    for (i = 0; i < ARRAY_COUNT(boxMon->secure.raw); i++)
+    {
+        boxMon->secure.raw[i] ^= boxMon->personality;
+        boxMon->secure.raw[i] ^= boxMon->otId;
+    }
+}
+
+static void DecryptBoxMon(struct BoxPokemon *boxMon)
+{
+    u32 i;
+    for (i = 0; i < ARRAY_COUNT(boxMon->secure.raw); i++)
+    {
+        boxMon->secure.raw[i] ^= boxMon->otId;
+        boxMon->secure.raw[i] ^= boxMon->personality;
+    }
+}
+```
+
+### Key Observations
+
+1. **XOR order matters** - Encryption applies personality then otId; decryption reverses this
+2. **32-bit operations** - The secure data is treated as 12 u32 words (48 bytes / 4)
+3. **Same key for all words** - Every 32-bit word uses the same two keys
+
+### Mathematical Proof
+
+For any data word `D`:
+```
+Encrypt: E = D ^ personality ^ otId
+Decrypt: D = E ^ otId ^ personality
+        = (D ^ personality ^ otId) ^ otId ^ personality
+        = D ^ (personality ^ personality) ^ (otId ^ otId)
+        = D ^ 0 ^ 0
+        = D
+```
+
+## Encryption Flow
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Game
+    participant API as GetMonData/SetMonData
+    participant Mon as BoxPokemon
+
+    Game->>API: GetMonData(mon, MON_DATA_SPECIES)
+    API->>Mon: DecryptBoxMon()
+    Note over Mon: Data now readable
+    API->>Mon: Read substruct0->species
+    API->>Mon: EncryptBoxMon()
+    Note over Mon: Data protected again
+    API-->>Game: Return species value
+
+    Game->>API: SetMonData(mon, MON_DATA_HELD_ITEM, &item)
+    API->>Mon: DecryptBoxMon()
+    Note over Mon: Data now writeable
+    API->>Mon: Write substruct0->heldItem
+    API->>Mon: Calculate new checksum
+    API->>Mon: EncryptBoxMon()
+    Note over Mon: Data protected again`}
+</pre>
+</DiagramContainer>
+
+## Data Access Functions
+
+The game never accesses encrypted data directly. All access goes through these APIs:
+
+```c
+// Reading data - handles decrypt/re-encrypt automatically
+u32 GetBoxMonData(struct BoxPokemon *boxMon, s32 field, u8 *data)
+{
+    // For encrypted fields...
+    if (field > MON_DATA_ENCRYPT_SEPARATOR)
+    {
+        // Get pointers to substructs
+        substruct0 = &(GetSubstruct(boxMon, boxMon->personality, 0)->type0);
+        substruct1 = &(GetSubstruct(boxMon, boxMon->personality, 1)->type1);
+        substruct2 = &(GetSubstruct(boxMon, boxMon->personality, 2)->type2);
+        substruct3 = &(GetSubstruct(boxMon, boxMon->personality, 3)->type3);
+
+        DecryptBoxMon(boxMon);
+
+        // Validate checksum
+        if (CalculateBoxMonChecksum(boxMon) != boxMon->checksum)
+        {
+            boxMon->isBadEgg = TRUE;
+            boxMon->isEgg = TRUE;
+            substruct3->isEgg = TRUE;
+        }
+    }
+
+    // Read the requested field
+    switch (field)
+    {
+        case MON_DATA_SPECIES:
+            retVal = substruct0->species;
+            break;
+        // ... other fields
+    }
+
+    // Re-encrypt if we decrypted
+    if (field > MON_DATA_ENCRYPT_SEPARATOR)
+        EncryptBoxMon(boxMon);
+
+    return retVal;
+}
+```
+
+### Field Categories
+
+The `MON_DATA_ENCRYPT_SEPARATOR` constant divides fields into encrypted and unencrypted:
+
+```c
+// Unencrypted fields (no decrypt needed)
+MON_DATA_PERSONALITY        // 0x00
+MON_DATA_OT_ID              // 0x04
+MON_DATA_NICKNAME           // 0x08
+MON_DATA_LANGUAGE           // 0x12
+MON_DATA_SANITY_IS_BAD_EGG  // 0x13 bit 0
+MON_DATA_SANITY_HAS_SPECIES // 0x13 bit 1
+MON_DATA_SANITY_IS_EGG      // 0x13 bit 2
+MON_DATA_OT_NAME            // 0x14
+MON_DATA_MARKINGS           // 0x1B
+MON_DATA_CHECKSUM           // 0x1C
+
+// === MON_DATA_ENCRYPT_SEPARATOR ===
+
+// Encrypted fields (require decrypt/encrypt cycle)
+MON_DATA_SPECIES            // Substruct 0
+MON_DATA_HELD_ITEM          // Substruct 0
+MON_DATA_EXPERIENCE         // Substruct 0
+MON_DATA_MOVE1-4            // Substruct 1
+MON_DATA_HP_EV, etc.        // Substruct 2
+MON_DATA_HP_IV, etc.        // Substruct 3
+```
+
+## Substruct Ordering
+
+The four 12-byte substructs are stored in a shuffled order based on personality % 24. This provides 24 possible arrangements, adding another layer of obfuscation:
+
+```c
+// Substruct order lookup table (simplified view)
+// personality % 24 -> [substruct 0 position, 1, 2, 3]
+switch (personality % 24)
+{
+    SUBSTRUCT_CASE( 0, 0,1,2,3)  // GAEM order
+    SUBSTRUCT_CASE( 1, 0,1,3,2)  // GAME order
+    SUBSTRUCT_CASE( 2, 0,2,1,3)  // GEAM order
+    SUBSTRUCT_CASE( 3, 0,3,1,2)  // GEMA order
+    SUBSTRUCT_CASE( 4, 0,2,3,1)  // GEAM order
+    SUBSTRUCT_CASE( 5, 0,3,2,1)  // GMEA order
+    SUBSTRUCT_CASE( 6, 1,0,2,3)  // AGEM order
+    SUBSTRUCT_CASE( 7, 1,0,3,2)  // AGME order
+    SUBSTRUCT_CASE( 8, 2,0,1,3)  // EGAM order
+    SUBSTRUCT_CASE( 9, 3,0,1,2)  // MGAE order
+    SUBSTRUCT_CASE(10, 2,0,3,1)  // EGMA order
+    SUBSTRUCT_CASE(11, 3,0,2,1)  // MGEA order
+    SUBSTRUCT_CASE(12, 1,2,0,3)  // AEGM order
+    SUBSTRUCT_CASE(13, 1,3,0,2)  // AMGE order
+    SUBSTRUCT_CASE(14, 2,1,0,3)  // EAGM order
+    SUBSTRUCT_CASE(15, 3,1,0,2)  // MAGE order
+    SUBSTRUCT_CASE(16, 2,3,0,1)  // EMGA order
+    SUBSTRUCT_CASE(17, 3,2,0,1)  // MEGA order
+    SUBSTRUCT_CASE(18, 1,2,3,0)  // AEMG order
+    SUBSTRUCT_CASE(19, 1,3,2,0)  // AMEG order
+    SUBSTRUCT_CASE(20, 2,1,3,0)  // EAMG order
+    SUBSTRUCT_CASE(21, 3,1,2,0)  // MAEG order
+    SUBSTRUCT_CASE(22, 2,3,1,0)  // EMAG order
+    SUBSTRUCT_CASE(23, 3,2,1,0)  // MEAG order
+}
+```
+
+### Substruct Location Example
+
+For a Pokemon with personality `0x12345678`:
+
+```c
+u32 orderIndex = 0x12345678 % 24;  // = 8
+
+// Order 8 = {2, 0, 1, 3}
+// Meaning:
+//   - Position 0 holds Substruct 2 (EVs/Contest)
+//   - Position 1 holds Substruct 0 (Growth)
+//   - Position 2 holds Substruct 1 (Attacks)
+//   - Position 3 holds Substruct 3 (Misc/IVs)
+```
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph Memory["Memory Layout (personality % 24 = 8)"]
+        P0["Position 0<br/>Substruct 2<br/>EVs/Contest"]
+        P1["Position 1<br/>Substruct 0<br/>Growth"]
+        P2["Position 2<br/>Substruct 1<br/>Attacks"]
+        P3["Position 3<br/>Substruct 3<br/>Misc/IVs"]
+    end
+
+    style P0 fill:#faa,stroke:#333,color:#000
+    style P1 fill:#afa,stroke:#333,color:#000
+    style P2 fill:#aaf,stroke:#333,color:#000
+    style P3 fill:#ffa,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Checksum Validation
+
+After decryption, the game validates data integrity with a 16-bit checksum:
+
+```c
+static u16 CalculateBoxMonChecksum(struct BoxPokemon *boxMon)
+{
+    u16 checksum = 0;
+
+    // Get pointers to each substruct (accounts for ordering)
+    union PokemonSubstruct *substruct0 = GetSubstruct(boxMon, boxMon->personality, 0);
+    union PokemonSubstruct *substruct1 = GetSubstruct(boxMon, boxMon->personality, 1);
+    union PokemonSubstruct *substruct2 = GetSubstruct(boxMon, boxMon->personality, 2);
+    union PokemonSubstruct *substruct3 = GetSubstruct(boxMon, boxMon->personality, 3);
+
+    // Sum all 16-bit words in each substruct
+    for (i = 0; i < ARRAY_COUNT(substruct0->raw); i++)
+        checksum += substruct0->raw[i];
+    for (i = 0; i < ARRAY_COUNT(substruct1->raw); i++)
+        checksum += substruct1->raw[i];
+    for (i = 0; i < ARRAY_COUNT(substruct2->raw); i++)
+        checksum += substruct2->raw[i];
+    for (i = 0; i < ARRAY_COUNT(substruct3->raw); i++)
+        checksum += substruct3->raw[i];
+
+    return checksum;
+}
+```
+
+### Checksum Verification Flow
+
+```c
+// Called during GetBoxMonData for encrypted fields
+DecryptBoxMon(boxMon);
+
+if (CalculateBoxMonChecksum(boxMon) != boxMon->checksum)
+{
+    // Data corrupted! Mark as Bad Egg
+    boxMon->isBadEgg = TRUE;
+    boxMon->isEgg = TRUE;
+    substruct3->isEgg = TRUE;
+}
+```
+
+### Bad Egg Consequences
+
+If checksum validation fails:
+- Pokemon marked as `isBadEgg` and `isEgg`
+- Appears as "Bad EGG" in menus
+- Cannot be moved, released, or traded
+- Effectively quarantined to prevent spreading corruption
+
+## Manual Decryption Example
+
+To decrypt Pokemon data manually (for tools/editors):
+
+```c
+void ManualDecrypt(struct BoxPokemon *boxMon)
+{
+    // Step 1: Get the encryption keys
+    u32 personality = boxMon->personality;
+    u32 otId = boxMon->otId;
+
+    // Step 2: XOR each 32-bit word
+    for (int i = 0; i < 12; i++)
+    {
+        boxMon->secure.raw[i] ^= otId;
+        boxMon->secure.raw[i] ^= personality;
+    }
+
+    // Step 3: Determine substruct order
+    u8 order = personality % 24;
+
+    // Step 4: Access data through correct positions
+    // See substruct ordering table above
+}
+```
+
+## Security Analysis
+
+### Weaknesses
+
+1. **Known plaintext** - Many fields have predictable values (species < 500, EVs < 256)
+2. **Key exposure** - Keys stored in same structure as encrypted data
+3. **Simple XOR** - No key scheduling, block chaining, or rounds
+4. **Deterministic** - Same Pokemon always encrypts the same way
+
+### Why It's "Good Enough"
+
+1. **Target audience** - Casual cheaters, not cryptographers
+2. **Resource constraints** - GBA has limited CPU cycles
+3. **Backwards compatibility** - Must work with existing saves
+4. **Defense in depth** - Combined with checksum, substruct shuffling
+
+## Practical Implications
+
+### For ROM Hackers
+
+When modifying Pokemon data programmatically:
+
+```c
+// WRONG - Direct modification breaks checksum
+boxMon->secure.raw[0] = newValue;  // Data still encrypted!
+
+// CORRECT - Use the API
+SetMonData(mon, MON_DATA_SPECIES, &newSpecies);  // Handles everything
+```
+
+### For Save Editors
+
+1. Read personality and otId from header
+2. XOR decrypt the secure region
+3. Parse substructs according to personality % 24
+4. Make modifications
+5. Recalculate checksum
+6. XOR encrypt with same keys
+7. Write back to save
+
+### For Emulator Developers
+
+Memory viewers should display Pokemon data decrypted for usability. Real-time decryption can be computed on-the-fly since XOR is fast.
+
+## Related Topics
+
+- [Pokemon Data Structures](/pokemon/data-structures) - Complete structure documentation
+- [Species Data](/pokemon/species-data) - Base stats and species info
+- [Save Validation](/save-system/save-validation) - Save file integrity checks

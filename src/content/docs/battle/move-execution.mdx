@@ -1,0 +1,1074 @@
+---
+title: Move Execution
+description: The complete flow of how moves are processed from selection to effect
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+This page covers the entire journey of a move from the moment it's selected to when all its effects have been applied. Understanding this flow is essential for anyone looking to modify move behavior or add new moves.
+
+## Move Execution Overview
+
+<DiagramContainer title="Complete Move Execution Flow">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Selection[Move Selection Phase]
+        Choose[Player/AI chooses move]
+        Store[Store in gChosenMoveByBattler]
+        Order[Calculate turn order]
+    end
+
+    subgraph Execution[Move Execution Phase]
+        Start[HandleAction_UseMove]
+        Cancel[attackcanceler]
+        Accuracy[accuracycheck]
+        Damage[Damage Calculation]
+        Animation[Play Animation]
+        Apply[Apply Damage]
+        Effects[Secondary Effects]
+        End[moveend]
+    end
+
+    subgraph PostMove[Post-Move Processing]
+        Faint[Check Fainting]
+        Items[Held Item Effects]
+        Abilities[Ability Triggers]
+        Next[Next Action]
+    end
+
+    Choose --> Store --> Order
+    Order --> Start
+    Start --> Cancel --> Accuracy --> Damage --> Animation
+    Animation --> Apply --> Effects --> End
+    End --> Faint --> Items --> Abilities --> Next`}
+</pre>
+</DiagramContainer>
+
+## Move Selection
+
+### Storing Move Choice
+
+When a player or AI selects a move:
+
+```c
+// Store chosen move in per-battler arrays
+gChosenMoveByBattler[battler] = selectedMove;
+gBattleStruct->chosenMovePositions[battler] = moveSlot;  // 0-3
+gBattleStruct->moveTarget[battler] = targetBattler;
+
+// For link battles, also store locally
+if (gBattleTypeFlags & BATTLE_TYPE_LINK)
+{
+    gBattleResources->bufferB[battler][1] = moveSlot;
+    gBattleResources->bufferB[battler][2] = targetBattler;
+}
+```
+
+### Move Target Resolution
+
+```c
+// Determine target based on move targeting flags
+u8 GetMoveTarget(u16 move, u8 battler)
+{
+    u8 targetFlags = gBattleMoves[move].target;
+
+    if (targetFlags & MOVE_TARGET_SELECTED)
+    {
+        // Player/AI explicitly chooses target
+        return gBattleStruct->moveTarget[battler];
+    }
+    else if (targetFlags & MOVE_TARGET_DEPENDS)
+    {
+        // Target depends on context (Curse, Counter, etc.)
+        return DetermineContextualTarget(move, battler);
+    }
+    else if (targetFlags & MOVE_TARGET_USER)
+    {
+        // Targets self (stat boosts, healing)
+        return battler;
+    }
+    else if (targetFlags & MOVE_TARGET_USER_OR_PARTNER)
+    {
+        // Can target self or ally
+        return gBattleStruct->moveTarget[battler];
+    }
+    else if (targetFlags & MOVE_TARGET_BOTH)
+    {
+        // Hits both opponents (Earthquake in doubles)
+        return GetBattlerAtPosition(B_POSITION_OPPONENT_LEFT);
+    }
+    else if (targetFlags & MOVE_TARGET_FOES_AND_ALLY)
+    {
+        // Hits all adjacent (Earthquake with Flying ally)
+        return GetBattlerAtPosition(B_POSITION_OPPONENT_LEFT);
+    }
+    else if (targetFlags & MOVE_TARGET_OPPONENTS_FIELD)
+    {
+        // Entry hazards (Stealth Rock, Spikes)
+        return GetBattlerAtPosition(B_POSITION_OPPONENT_LEFT);
+    }
+
+    // Default: random opponent
+    return GetBattlerAtPosition(BATTLE_OPPOSITE(GetBattlerPosition(battler)));
+}
+```
+
+### Target Flags
+
+```c
+// Move targeting options
+#define MOVE_TARGET_SELECTED        (1 << 0)  // Can select target
+#define MOVE_TARGET_DEPENDS         (1 << 1)  // Target depends on context
+#define MOVE_TARGET_USER_OR_PARTNER (1 << 2)  // Self or ally
+#define MOVE_TARGET_RANDOM          (1 << 3)  // Random opponent
+#define MOVE_TARGET_BOTH            (1 << 4)  // Both opponents
+#define MOVE_TARGET_USER            (1 << 5)  // Always targets self
+#define MOVE_TARGET_FOES_AND_ALLY   (1 << 6)  // All adjacent Pokemon
+#define MOVE_TARGET_OPPONENTS_FIELD (1 << 7)  // Entry hazards
+```
+
+<DiagramContainer title="Move Targets in Doubles">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Field[Battle Field]
+        P1[Player Left<br/>Position 0]
+        P2[Player Right<br/>Position 2]
+        O1[Opponent Left<br/>Position 1]
+        O2[Opponent Right<br/>Position 3]
+    end
+
+    subgraph Targets[Target Types]
+        Selected["SELECTED<br/>Pick one target"]
+        Both["BOTH<br/>Both opponents"]
+        All["FOES_AND_ALLY<br/>All adjacent"]
+        User["USER<br/>Self only"]
+    end
+
+    Selected --> O1
+    Selected --> O2
+    Selected --> P2
+
+    Both --> O1
+    Both --> O2
+
+    All --> O1
+    All --> O2
+    All --> P2
+
+    User --> P1`}
+</pre>
+</DiagramContainer>
+
+## Starting Move Execution
+
+### HandleAction_UseMove
+
+```c
+static void HandleAction_UseMove(void)
+{
+    u8 battler = gBattlerByTurnOrder[gCurrentTurnActionNumber];
+    u16 move = gChosenMoveByBattler[battler];
+
+    // Set global move context
+    gBattlerAttacker = battler;
+    gBattlerTarget = GetMoveTarget(move, battler);
+    gCurrentMove = gChosenMove = move;
+
+    // Check if target has fainted mid-turn
+    if (gAbsentBattlerFlags & gBitTable[gBattlerTarget]
+     && gBattleMoves[move].target == MOVE_TARGET_SELECTED)
+    {
+        // Retarget if possible
+        gBattlerTarget = GetTargetForRetarget(battler, move);
+        if (gBattlerTarget == 0xFF)
+        {
+            // No valid target - move fails
+            gBattlescriptCurrInstr = BattleScript_MoveTargetGone;
+            gBattleMainFunc = RunBattleScriptCommands;
+            return;
+        }
+    }
+
+    // Load the move effect script
+    gBattlescriptCurrInstr = gBattleScriptsForMoveEffects[
+        gBattleMoves[move].effect
+    ];
+
+    // Initialize hit tracking
+    gBattleScripting.animTurn = 0;
+    gBattleScripting.animTargetsHit = 0;
+    gMoveResultFlags = 0;
+    gBattleMoveDamage = 0;
+
+    // Switch to script execution mode
+    gBattleMainFunc = RunBattleScriptCommands;
+}
+```
+
+## Pre-Attack Checks
+
+### The attackcanceler Command
+
+Checks everything that might prevent the move from executing:
+
+<DiagramContainer title="Attack Cancellation Checks">
+<pre class="mermaid">
+{`flowchart TB
+    Start[attackcanceler] --> Fainted{Attacker HP = 0?}
+    Fainted -->|Yes| CancelDeath[Attack canceled]
+    Fainted -->|No| Sleep{STATUS1_SLEEP?}
+
+    Sleep -->|Yes| SleepTurn[Decrement sleep counter]
+    SleepTurn --> WakeUp{Counter = 0?}
+    WakeUp -->|No| CancelSleep[Fast asleep]
+    WakeUp -->|Yes| Freeze
+
+    Sleep -->|No| Freeze{STATUS1_FREEZE?}
+    Freeze -->|Yes| ThawCheck{Random 20%?}
+    ThawCheck -->|Yes| Thaw[Thaw out]
+    ThawCheck -->|No| CancelFreeze[Frozen solid]
+    Thaw --> Para
+
+    Freeze -->|No| Para{STATUS1_PARALYSIS?}
+    Para -->|Yes| ParaCheck{Random 25%?}
+    ParaCheck -->|Yes| CancelPara[Fully paralyzed]
+    ParaCheck -->|No| Confuse
+
+    Para -->|No| Confuse{STATUS2_CONFUSION?}
+    Confuse -->|Yes| ConfuseDecr[Decrement counter]
+    ConfuseDecr --> ConfuseDone{Counter = 0?}
+    ConfuseDone -->|Yes| SnapOut[Snapped out]
+    ConfuseDone -->|No| HitSelf{Random 50%?}
+    HitSelf -->|Yes| CancelConfuse[Hit self]
+    HitSelf -->|No| Infat
+
+    Confuse -->|No| Infat{STATUS2_INFATUATION?}
+    Infat -->|Yes| InfatCheck{Random 50%?}
+    InfatCheck -->|Yes| CancelInfat[Immobilized by love]
+    InfatCheck -->|No| Flinch
+
+    Infat -->|No| Flinch{STATUS2_FLINCHED?}
+    Flinch -->|Yes| CancelFlinch[Flinched]
+    Flinch -->|No| Taunt{Taunted + Status move?}
+    Taunt -->|Yes| CancelTaunt[Can't use move]
+    Taunt -->|No| Continue[Continue to accuracycheck]`}
+</pre>
+</DiagramContainer>
+
+### Special Move Checks
+
+```c
+// After basic cancellation checks, check move-specific conditions
+static void CheckSpecialMoveConditions(void)
+{
+    // Truant ability - skip every other turn
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_TRUANT)
+    {
+        if (gDisableStructs[gBattlerAttacker].truantCounter)
+        {
+            gBattlescriptCurrInstr = BattleScript_TruantLoafing;
+            return;
+        }
+        gDisableStructs[gBattlerAttacker].truantCounter = 1;
+    }
+
+    // Disable check
+    if (gCurrentMove == gDisableStructs[gBattlerAttacker].disabledMove
+     && gDisableStructs[gBattlerAttacker].disableTimer != 0)
+    {
+        gBattlescriptCurrInstr = BattleScript_MoveIsDisabled;
+        return;
+    }
+
+    // Torment check
+    if (gBattleMons[gBattlerAttacker].status2 & STATUS2_TORMENT
+     && gCurrentMove == gLastMoves[gBattlerAttacker])
+    {
+        gBattlescriptCurrInstr = BattleScript_MoveUsedIsTormented;
+        return;
+    }
+
+    // Gravity check - can't use flying moves
+    if (gFieldStatuses & STATUS_FIELD_GRAVITY
+     && gBattleMoves[gCurrentMove].flags & FLAG_AFFECTED_BY_GRAVITY)
+    {
+        gBattlescriptCurrInstr = BattleScript_CantUseMoveBecauseOfGravity;
+        return;
+    }
+}
+```
+
+## Accuracy Check
+
+### The accuracycheck Command
+
+```c
+static void Cmd_accuracycheck(void)
+{
+    const u8 *failScript = T1_READ_PTR(gBattlescriptCurrInstr + 1);
+
+    // Moves with 0 accuracy always hit
+    if (gBattleMoves[gCurrentMove].accuracy == 0)
+    {
+        gBattlescriptCurrInstr += 7;
+        return;
+    }
+
+    // Check for guaranteed hit conditions
+    if (CheckGuaranteedHit())
+    {
+        gBattlescriptCurrInstr += 7;
+        return;
+    }
+
+    // Check for semi-invulnerable states (Fly, Dig, etc.)
+    if (!CanHitSemiInvulnerable())
+    {
+        gMoveResultFlags |= MOVE_RESULT_MISSED;
+        gBattlescriptCurrInstr = failScript;
+        return;
+    }
+
+    // Calculate final accuracy
+    u32 accuracy = CalcMoveAccuracy();
+
+    // Roll the dice
+    if (Random() % 100 >= accuracy)
+    {
+        gMoveResultFlags |= MOVE_RESULT_MISSED;
+        gBattlescriptCurrInstr = failScript;
+    }
+    else
+    {
+        gBattlescriptCurrInstr += 7;
+    }
+}
+```
+
+### Accuracy Calculation
+
+```c
+u32 CalcMoveAccuracy(void)
+{
+    u32 accuracy = gBattleMoves[gCurrentMove].accuracy;
+
+    // Get accuracy and evasion stages
+    s8 accStage = gBattleMons[gBattlerAttacker].statStages[STAT_ACC] - 6;
+    s8 evaStage = gBattleMons[gBattlerTarget].statStages[STAT_EVASION] - 6;
+
+    // Cancel out evasion with Foresight/Miracle Eye
+    if (gStatuses3[gBattlerTarget] & STATUS3_MIRACLE_EYED
+     || gStatuses3[gBattlerTarget] & STATUS3_FORESIGHTED)
+    {
+        if (evaStage > 0)
+            evaStage = 0;
+    }
+
+    // Keen Eye ignores evasion boosts
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_KEEN_EYE)
+    {
+        if (evaStage > 0)
+            evaStage = 0;
+    }
+
+    // Calculate net stage
+    s8 netStage = accStage - evaStage + 6;
+    if (netStage < 0) netStage = 0;
+    if (netStage > 12) netStage = 12;
+
+    // Apply stage multiplier
+    static const u8 sAccuracyStageModifiers[][2] = {
+        { 33, 100}, // -6
+        { 36, 100}, // -5
+        { 43, 100}, // -4
+        { 50, 100}, // -3
+        { 60, 100}, // -2
+        { 75, 100}, // -1
+        {100, 100}, //  0
+        {133, 100}, // +1
+        {166, 100}, // +2
+        {200, 100}, // +3
+        {250, 100}, // +4
+        {266, 100}, // +5
+        {300, 100}, // +6
+    };
+
+    accuracy = accuracy * sAccuracyStageModifiers[netStage][0]
+                        / sAccuracyStageModifiers[netStage][1];
+
+    // Ability modifiers
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_COMPOUND_EYES)
+        accuracy = (accuracy * 130) / 100;
+
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_HUSTLE
+     && IS_MOVE_PHYSICAL(gCurrentMove))
+        accuracy = (accuracy * 80) / 100;
+
+    if (GetBattlerAbility(gBattlerTarget) == ABILITY_SAND_VEIL
+     && (gBattleWeather & B_WEATHER_SANDSTORM))
+        accuracy = (accuracy * 80) / 100;
+
+    if (GetBattlerAbility(gBattlerTarget) == ABILITY_SNOW_CLOAK
+     && (gBattleWeather & B_WEATHER_HAIL))
+        accuracy = (accuracy * 80) / 100;
+
+    // Item modifiers
+    if (GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_WIDE_LENS)
+        accuracy = (accuracy * 110) / 100;
+
+    if (GetBattlerHoldEffect(gBattlerTarget) == HOLD_EFFECT_BRIGHTPOWDER)
+        accuracy = (accuracy * 90) / 100;
+
+    return accuracy;
+}
+```
+
+### Semi-Invulnerable States
+
+```c
+bool8 CanHitSemiInvulnerable(void)
+{
+    u32 status3 = gStatuses3[gBattlerTarget];
+
+    // Flying (Fly, Bounce, Sky Drop)
+    if (status3 & STATUS3_ON_AIR)
+    {
+        // These moves can hit airborne targets
+        if (gCurrentMove == MOVE_THUNDER
+         || gCurrentMove == MOVE_HURRICANE
+         || gCurrentMove == MOVE_TWISTER
+         || gCurrentMove == MOVE_SKY_UPPERCUT
+         || gCurrentMove == MOVE_GUST)
+            return TRUE;
+        return FALSE;
+    }
+
+    // Underground (Dig)
+    if (status3 & STATUS3_UNDERGROUND)
+    {
+        if (gCurrentMove == MOVE_EARTHQUAKE
+         || gCurrentMove == MOVE_MAGNITUDE
+         || gCurrentMove == MOVE_FISSURE)
+            return TRUE;
+        return FALSE;
+    }
+
+    // Underwater (Dive)
+    if (status3 & STATUS3_UNDERWATER)
+    {
+        if (gCurrentMove == MOVE_SURF
+         || gCurrentMove == MOVE_WHIRLPOOL)
+            return TRUE;
+        return FALSE;
+    }
+
+    // Phantom Force / Shadow Force
+    if (status3 & STATUS3_PHANTOM_FORCE)
+        return FALSE;
+
+    return TRUE;
+}
+```
+
+## Damage Phase
+
+### Critical Hit Check
+
+```c
+static void Cmd_critcalc(void)
+{
+    // Check if move can crit
+    if (gStatuses3[gBattlerAttacker] & STATUS3_CANT_CRIT
+     || GetBattlerAbility(gBattlerTarget) == ABILITY_BATTLE_ARMOR
+     || GetBattlerAbility(gBattlerTarget) == ABILITY_SHELL_ARMOR)
+    {
+        gCritMultiplier = 1;
+        gBattlescriptCurrInstr++;
+        return;
+    }
+
+    // Calculate crit stage
+    u8 critStage = 0;
+
+    // Base crit ratio from move
+    critStage += gBattleMoves[gCurrentMove].criticalHitStage;
+
+    // Focus Energy
+    if (gBattleMons[gBattlerAttacker].status2 & STATUS2_FOCUS_ENERGY)
+        critStage += 2;
+
+    // Super Luck
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_SUPER_LUCK)
+        critStage += 1;
+
+    // Scope Lens / Razor Claw
+    if (GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_SCOPE_LENS)
+        critStage += 1;
+
+    // Stick (Farfetch'd) / Lucky Punch (Chansey)
+    if (SpeciesSpecificCritBoost(gBattlerAttacker))
+        critStage += 2;
+
+    // Cap at stage 3
+    if (critStage > 3)
+        critStage = 3;
+
+    // Crit ratios by stage
+    static const u8 sCriticalHitChances[] = {
+        24,   // Stage 0: 1/24 (4.17%)
+        8,    // Stage 1: 1/8 (12.5%)
+        2,    // Stage 2: 1/2 (50%)
+        1,    // Stage 3: 1/1 (100%)
+    };
+
+    // Roll for crit
+    if (Random() % sCriticalHitChances[critStage] == 0)
+    {
+        gCritMultiplier = 2;  // Gen 6+: 1.5x, but in Gen 3 it's 2x
+        gBattleMoveFlags |= MOVE_RESULT_CRITICAL;
+    }
+    else
+    {
+        gCritMultiplier = 1;
+    }
+
+    gBattlescriptCurrInstr++;
+}
+```
+
+### Damage Calculation
+
+```c
+static void Cmd_damagecalc(void)
+{
+    gBattleMoveDamage = CalculateMoveDamage(
+        gCurrentMove,
+        gBattlerAttacker,
+        gBattlerTarget,
+        gBattleMoves[gCurrentMove].type,
+        gBattleMoves[gCurrentMove].power,
+        gCritMultiplier,
+        TRUE,   // Apply random factor
+        TRUE    // Check immunities
+    );
+
+    gBattlescriptCurrInstr++;
+}
+
+s32 CalculateMoveDamage(u16 move, u8 attacker, u8 target, u8 type,
+                        u16 power, u8 crit, bool8 random, bool8 checkImm)
+{
+    u32 damage;
+    u16 attack, defense;
+
+    // Get attacking and defending stats
+    if (gBattleMoves[move].split == SPLIT_PHYSICAL)
+    {
+        attack = gBattleMons[attacker].attack;
+        defense = gBattleMons[target].defense;
+
+        // Critical hits ignore defense boosts
+        if (crit > 1 && gBattleMons[target].statStages[STAT_DEF] > 6)
+            ; // Use base defense
+        else
+            defense = ApplyStatStageModifier(defense, gBattleMons[target].statStages[STAT_DEF]);
+
+        // Critical hits ignore attack drops
+        if (crit > 1 && gBattleMons[attacker].statStages[STAT_ATK] < 6)
+            ; // Use base attack
+        else
+            attack = ApplyStatStageModifier(attack, gBattleMons[attacker].statStages[STAT_ATK]);
+    }
+    else // SPLIT_SPECIAL
+    {
+        attack = gBattleMons[attacker].spAttack;
+        defense = gBattleMons[target].spDefense;
+
+        // Apply stat stages (with crit logic)
+        // ... similar to physical
+    }
+
+    // Core formula
+    damage = ((2 * gBattleMons[attacker].level) / 5) + 2;
+    damage *= power;
+    damage *= attack;
+    damage /= defense;
+    damage /= 50;
+    damage += 2;
+
+    // Apply critical multiplier
+    if (crit > 1)
+        damage *= crit;
+
+    // Random factor (85-100%)
+    if (random)
+    {
+        damage *= (100 - (Random() % 16));
+        damage /= 100;
+    }
+
+    // STAB
+    if (IS_BATTLER_OF_TYPE(attacker, type))
+    {
+        if (GetBattlerAbility(attacker) == ABILITY_ADAPTABILITY)
+            damage = (damage * 20) / 10;  // 2.0x
+        else
+            damage = (damage * 15) / 10;  // 1.5x
+    }
+
+    // Minimum 1 damage
+    if (damage == 0)
+        damage = 1;
+
+    return damage;
+}
+```
+
+<DiagramContainer title="Damage Formula Steps">
+<pre class="mermaid">
+{`flowchart TB
+    Start[Start Damage Calc] --> Base["Base = (2 * Level / 5) + 2"]
+    Base --> Power["Base * Power"]
+    Power --> AtkDef["* Attack / Defense"]
+    AtkDef --> Div50["/ 50 + 2"]
+    Div50 --> Crit{Critical Hit?}
+    Crit -->|Yes| CritMult["* 2.0"]
+    Crit -->|No| Random
+    CritMult --> Random["* Random(0.85-1.0)"]
+    Random --> STAB{Same Type?}
+    STAB -->|Yes| STABMult["* 1.5"]
+    STAB -->|No| Type
+    STABMult --> Type[Type Effectiveness]
+    Type --> Final[Final Damage]`}
+</pre>
+</DiagramContainer>
+
+## Applying Damage
+
+### Health Bar Update
+
+```c
+static void Cmd_healthbarupdate(void)
+{
+    u8 battler = GetBattlerForBattleScript(gBattlescriptCurrInstr[1]);
+
+    if (gBattleMoveDamage == 0)
+    {
+        gBattlescriptCurrInstr += 2;
+        return;
+    }
+
+    // Calculate new HP
+    s32 newHp = gBattleMons[battler].hp - gBattleMoveDamage;
+
+    if (newHp < 0)
+        newHp = 0;
+    if (newHp > gBattleMons[battler].maxHP)
+        newHp = gBattleMons[battler].maxHP;
+
+    // Request HP bar animation from controller
+    BtlController_EmitHealthBarUpdate(
+        battler,
+        BUFFER_A,
+        gBattleMoveDamage
+    );
+    MarkBattlerForControllerExec(battler);
+
+    gBattlescriptCurrInstr += 2;
+}
+
+static void Cmd_datahpupdate(void)
+{
+    u8 battler = GetBattlerForBattleScript(gBattlescriptCurrInstr[1]);
+
+    // Actually update HP
+    if (gBattleMoveDamage < 0)
+    {
+        // Healing
+        gBattleMons[battler].hp -= gBattleMoveDamage;
+        if (gBattleMons[battler].hp > gBattleMons[battler].maxHP)
+            gBattleMons[battler].hp = gBattleMons[battler].maxHP;
+    }
+    else
+    {
+        // Damage
+        if (gBattleMoveDamage > gBattleMons[battler].hp)
+            gBattleMons[battler].hp = 0;
+        else
+            gBattleMons[battler].hp -= gBattleMoveDamage;
+    }
+
+    // Update party data too
+    if (GetBattlerSide(battler) == B_SIDE_PLAYER)
+    {
+        gPlayerParty[gBattlerPartyIndexes[battler]].hp = gBattleMons[battler].hp;
+    }
+    else
+    {
+        gEnemyParty[gBattlerPartyIndexes[battler]].hp = gBattleMons[battler].hp;
+    }
+
+    gBattlescriptCurrInstr += 2;
+}
+```
+
+## Secondary Effects
+
+### Effect Application
+
+```c
+static void Cmd_seteffectwithchance(void)
+{
+    bool8 effectApplied = FALSE;
+    u8 chance = gBattleMoves[gCurrentMove].secondaryEffectChance;
+
+    // Sheer Force negates secondary effects
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_SHEER_FORCE)
+    {
+        gBattlescriptCurrInstr++;
+        return;
+    }
+
+    // Serene Grace doubles effect chance
+    if (GetBattlerAbility(gBattlerAttacker) == ABILITY_SERENE_GRACE)
+        chance *= 2;
+
+    // Shield Dust blocks secondary effects
+    if (GetBattlerAbility(gBattlerTarget) == ABILITY_SHIELD_DUST)
+    {
+        gBattlescriptCurrInstr++;
+        return;
+    }
+
+    // Roll for effect
+    if (Random() % 100 < chance)
+    {
+        effectApplied = SetMoveEffect(
+            gBattleMoves[gCurrentMove].secondaryEffect,
+            PRIMARY_EFFECT,
+            AFFECTS_TARGET
+        );
+    }
+
+    gBattlescriptCurrInstr++;
+}
+```
+
+### Common Move Effects
+
+```c
+void SetMoveEffect(u32 effect, bool8 primary, bool8 affectsUser)
+{
+    u8 target = affectsUser ? gBattlerAttacker : gBattlerTarget;
+
+    switch (effect)
+    {
+    case MOVE_EFFECT_BURN:
+        if (!CanBeBurned(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_BURN;
+        gBattlescriptCurrInstr = BattleScript_BurnEffect;
+        break;
+
+    case MOVE_EFFECT_FREEZE:
+        if (!CanBeFrozen(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_FREEZE;
+        gBattlescriptCurrInstr = BattleScript_FreezeEffect;
+        break;
+
+    case MOVE_EFFECT_PARALYSIS:
+        if (!CanBeParalyzed(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_PARALYSIS;
+        // Also reduce speed immediately
+        gBattleMons[target].speed = gBattleMons[target].speed / 4;
+        gBattlescriptCurrInstr = BattleScript_ParalyzeEffect;
+        break;
+
+    case MOVE_EFFECT_POISON:
+        if (!CanBePoisoned(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_POISON;
+        gBattlescriptCurrInstr = BattleScript_PoisonEffect;
+        break;
+
+    case MOVE_EFFECT_TOXIC:
+        if (!CanBePoisoned(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_TOXIC_POISON;
+        gBattleMons[target].status1 |= STATUS1_TOXIC_COUNTER;  // Damage increases each turn
+        gBattlescriptCurrInstr = BattleScript_BadPoisonEffect;
+        break;
+
+    case MOVE_EFFECT_SLEEP:
+        if (!CanBePutToSleep(target))
+            return;
+        gBattleMons[target].status1 = STATUS1_SLEEP_TURN(Random() % 3 + 2);
+        gBattlescriptCurrInstr = BattleScript_SleepEffect;
+        break;
+
+    case MOVE_EFFECT_CONFUSION:
+        if (gBattleMons[target].status2 & STATUS2_CONFUSION)
+            return;
+        gBattleMons[target].status2 |= STATUS2_CONFUSION_TURN(Random() % 4 + 2);
+        gBattlescriptCurrInstr = BattleScript_ConfuseEffect;
+        break;
+
+    case MOVE_EFFECT_FLINCH:
+        // Only flinch if target hasn't moved yet
+        if (GetBattlerTurnOrderNum(target) > gCurrentTurnActionNumber)
+            gBattleMons[target].status2 |= STATUS2_FLINCHED;
+        break;
+
+    case MOVE_EFFECT_ATK_MINUS_1:
+        TryStatChange(target, STAT_ATK, -1, FALSE);
+        break;
+
+    case MOVE_EFFECT_DEF_MINUS_1:
+        TryStatChange(target, STAT_DEF, -1, FALSE);
+        break;
+
+    case MOVE_EFFECT_SPD_MINUS_1:
+        TryStatChange(target, STAT_SPEED, -1, FALSE);
+        break;
+
+    case MOVE_EFFECT_RECOIL_25:
+        // 25% of damage dealt as recoil
+        gBattleMoveDamage = gHpDealt / 4;
+        if (gBattleMoveDamage == 0)
+            gBattleMoveDamage = 1;
+        gBattlescriptCurrInstr = BattleScript_RecoilEffect;
+        break;
+
+    // ... many more effects
+    }
+}
+```
+
+## Post-Move Processing
+
+### The moveend Command
+
+After the move completes, `moveend` handles cleanup:
+
+```c
+static void Cmd_moveend(void)
+{
+    // State machine processes effects in order
+    switch (gBattleStruct->moveendState)
+    {
+    case MOVEEND_ABILITIES:
+        // Trigger ability effects (Color Change, etc.)
+        if (AbilityBattleEffects(ABILITYEFFECT_MOVE_END, gBattlerTarget, 0, 0, 0))
+            return;
+        break;
+
+    case MOVEEND_STATUS_IMMUNITIES:
+        // Remove status that shouldn't apply (Limber removes paralysis, etc.)
+        break;
+
+    case MOVEEND_MIRROR_MOVE:
+        // Record move for Mirror Move
+        if (gBattlerAttacker != gBattlerTarget
+         && !(gMoveResultFlags & MOVE_RESULT_NO_EFFECT))
+        {
+            gLastPrintedMoves[gBattlerTarget] = gCurrentMove;
+            gLastHitByType[gBattlerTarget] = gBattleMoves[gCurrentMove].type;
+        }
+        break;
+
+    case MOVEEND_METRONOME:
+        // Track consecutive use for Metronome item
+        if (gCurrentMove == gLastResultingMoves[gBattlerAttacker])
+            gBattleStruct->metronomeCounter[gBattlerAttacker]++;
+        else
+            gBattleStruct->metronomeCounter[gBattlerAttacker] = 0;
+        break;
+
+    case MOVEEND_LIFE_ORB:
+        // Apply Life Orb recoil if damage was dealt
+        if (GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_LIFE_ORB
+         && gHpDealt > 0)
+        {
+            gBattleMoveDamage = gBattleMons[gBattlerAttacker].maxHP / 10;
+            if (gBattleMoveDamage == 0)
+                gBattleMoveDamage = 1;
+            BattleScriptPushCursor();
+            gBattlescriptCurrInstr = BattleScript_LifeOrbDamage;
+        }
+        break;
+
+    case MOVEEND_UPDATE_LAST_MOVES:
+        gLastUsedMove = gCurrentMove;
+        gLastMoves[gBattlerAttacker] = gCurrentMove;
+        gLastResultingMoves[gBattlerAttacker] = gCurrentMove;
+        break;
+
+    case MOVEEND_CHOICE_MOVE:
+        // Lock into move for Choice items
+        if (GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_CHOICE_BAND
+         || GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_CHOICE_SPECS
+         || GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_CHOICE_SCARF)
+        {
+            gBattleStruct->choicedMove[gBattlerAttacker] = gCurrentMove;
+        }
+        break;
+
+    case MOVEEND_DONE:
+        // Return to main battle flow
+        gBattleStruct->moveendState = 0;
+        gBattleMainFunc = RunTurnActionsFunctions;
+        gBattleStruct->turnEffectsTracker++;
+        return;
+    }
+
+    gBattleStruct->moveendState++;
+}
+```
+
+<DiagramContainer title="Post-Move Effect Order">
+<pre class="mermaid">
+{`flowchart TB
+    Start[Move Complete] --> Abilities[Check Ability Effects]
+    Abilities --> Status[Status Immunity Check]
+    Status --> Mirror[Record for Mirror Move]
+    Mirror --> Metro[Update Metronome Counter]
+    Metro --> LifeOrb[Apply Life Orb Recoil]
+    LifeOrb --> Update[Update Last Move Records]
+    Update --> Choice[Lock Choice Move]
+    Choice --> Done[Return to Battle Flow]`}
+</pre>
+</DiagramContainer>
+
+## Special Move Categories
+
+### Multi-Hit Moves
+
+```c
+// Set up multi-hit (2-5 hits)
+static void Cmd_setmultihitcounter(void)
+{
+    u8 hitCount;
+    u8 ability = GetBattlerAbility(gBattlerAttacker);
+
+    if (ability == ABILITY_SKILL_LINK)
+    {
+        // Skill Link always hits 5 times
+        hitCount = 5;
+    }
+    else
+    {
+        // 2/8 chance for 2 hits
+        // 2/8 chance for 3 hits
+        // 3/8 chance for 4 hits
+        // 1/8 chance for 5 hits
+        u8 roll = Random() & 7;
+        if (roll < 2)
+            hitCount = 2;
+        else if (roll < 4)
+            hitCount = 3;
+        else if (roll < 7)
+            hitCount = 4;
+        else
+            hitCount = 5;
+    }
+
+    gMultiHitCounter = hitCount;
+    gBattlescriptCurrInstr++;
+}
+```
+
+### Two-Turn Moves
+
+```c
+// Solar Beam, Fly, Dig, etc.
+static void Cmd_twoturnmove(void)
+{
+    if (gBattleMons[gBattlerAttacker].status2 & STATUS2_MULTIPLETURNS)
+    {
+        // Second turn - attack
+        gBattleMons[gBattlerAttacker].status2 &= ~STATUS2_MULTIPLETURNS;
+        gBattlescriptCurrInstr++;
+    }
+    else
+    {
+        // First turn - charge
+        gBattleMons[gBattlerAttacker].status2 |= STATUS2_MULTIPLETURNS;
+
+        // Set semi-invulnerable state
+        if (gCurrentMove == MOVE_FLY || gCurrentMove == MOVE_BOUNCE)
+            gStatuses3[gBattlerAttacker] |= STATUS3_ON_AIR;
+        else if (gCurrentMove == MOVE_DIG)
+            gStatuses3[gBattlerAttacker] |= STATUS3_UNDERGROUND;
+        else if (gCurrentMove == MOVE_DIVE)
+            gStatuses3[gBattlerAttacker] |= STATUS3_UNDERWATER;
+
+        // Check for Power Herb
+        if (GetBattlerHoldEffect(gBattlerAttacker) == HOLD_EFFECT_POWER_HERB)
+        {
+            // Skip charge turn
+            gBattlescriptCurrInstr++;
+            RemoveItem(gBattlerAttacker);
+        }
+        else
+        {
+            // Show charge message and end turn
+            gBattlescriptCurrInstr = BattleScript_ChargeMessage;
+        }
+    }
+}
+```
+
+### Recharge Moves
+
+```c
+// Hyper Beam, Giga Impact, etc.
+static void Cmd_setrechargemove(void)
+{
+    // After executing, set recharge flag
+    gBattleMons[gBattlerAttacker].status2 |= STATUS2_RECHARGE;
+    gDisableStructs[gBattlerAttacker].rechargeTimer = 2;
+    gBattlescriptCurrInstr++;
+}
+
+// In attackcanceler, check for recharge
+if (gBattleMons[gBattlerAttacker].status2 & STATUS2_RECHARGE)
+{
+    gBattleMons[gBattlerAttacker].status2 &= ~STATUS2_RECHARGE;
+    gDisableStructs[gBattlerAttacker].rechargeTimer = 0;
+    gBattlescriptCurrInstr = BattleScript_MustRecharge;
+    return;
+}
+```
+
+## Key Variables Reference
+
+| Variable | Purpose |
+|----------|---------|
+| `gCurrentMove` | Move being executed |
+| `gChosenMove` | Original chosen move (before transform) |
+| `gBattlerAttacker` | Who is using the move |
+| `gBattlerTarget` | Primary target of the move |
+| `gBattleMoveDamage` | Calculated damage amount |
+| `gMoveResultFlags` | Hit/miss, crit, effectiveness |
+| `gCritMultiplier` | Critical hit multiplier |
+| `gHpDealt` | Actual HP lost by target |
+| `gMultiHitCounter` | Hits remaining for multi-hit |
+| `gBattlescriptCurrInstr` | Current script position |
+
+## Key Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `HandleAction_UseMove()` | Start move execution |
+| `Cmd_attackcanceler()` | Check cancellation conditions |
+| `Cmd_accuracycheck()` | Roll for hit/miss |
+| `Cmd_critcalc()` | Calculate critical hit |
+| `Cmd_damagecalc()` | Calculate damage |
+| `Cmd_typecalc()` | Apply type effectiveness |
+| `Cmd_healthbarupdate()` | Animate HP change |
+| `Cmd_datahpupdate()` | Apply HP change |
+| `Cmd_seteffectwithchance()` | Apply secondary effects |
+| `Cmd_moveend()` | Post-move cleanup |

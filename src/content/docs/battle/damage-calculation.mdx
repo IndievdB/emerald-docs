@@ -1,0 +1,774 @@
+---
+title: Damage Calculation
+description: The complete math behind Pokemon Emerald's damage formula
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+This page provides a complete breakdown of how damage is calculated in Pokemon Emerald. Understanding this formula is essential for modifying battle mechanics, adding new moves or abilities, and debugging damage-related issues.
+
+## The Core Formula
+
+The damage formula in Generation 3 Pokemon games:
+
+```
+Damage = Floor(Floor(Floor(2 * Level / 5 + 2) * Power * A / D) / 50) + 2
+```
+
+Then modifiers are applied in sequence:
+```
+FinalDamage = Damage * Targets * Weather * Badge * Critical * Random * STAB * Type1 * Type2 * ...
+```
+
+<DiagramContainer title="Damage Calculation Pipeline">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Base[Base Damage Calculation]
+        Level["(2 * Level / 5) + 2"]
+        Power["* Move Power"]
+        AtkDef["* Attack / Defense"]
+        Div50["/ 50 + 2"]
+        Level --> Power --> AtkDef --> Div50
+    end
+
+    subgraph Mods[Modifier Chain]
+        Targets["Targets (0.75 in doubles)"]
+        Weather["Weather (1.5x or 0.5x)"]
+        Crit["Critical Hit (2x)"]
+        Random["Random (0.85-1.0)"]
+        STAB["STAB (1.5x)"]
+        Type["Type Effectiveness"]
+        Burn["Burn (0.5x phys)"]
+        Other["Other Modifiers"]
+    end
+
+    Div50 --> Targets --> Weather --> Crit
+    Crit --> Random --> STAB --> Type --> Burn --> Other
+
+    Other --> Final[Final Damage]`}
+</pre>
+</DiagramContainer>
+
+## Implementation
+
+### Main Damage Function
+
+```c
+s32 CalculateBaseDamage(struct BattlePokemon *attacker,
+                        struct BattlePokemon *defender,
+                        u32 move, u16 sideStatus, u16 powerOverride,
+                        u8 typeOverride, u8 attackerFlags, u8 defenderFlags)
+{
+    u32 damage;
+    u16 attack, defense;
+    u8 type;
+    u16 power;
+
+    // Get move properties
+    power = (powerOverride) ? powerOverride : gBattleMoves[move].power;
+    type = (typeOverride) ? typeOverride : gBattleMoves[move].type;
+
+    // Determine which stats to use
+    if (gBattleMoves[move].split == SPLIT_PHYSICAL)
+    {
+        attack = attacker->attack;
+        defense = defender->defense;
+    }
+    else if (gBattleMoves[move].split == SPLIT_SPECIAL)
+    {
+        attack = attacker->spAttack;
+        defense = defender->spDefense;
+    }
+    else
+    {
+        // Status moves don't deal damage
+        return 0;
+    }
+
+    // Special cases for specific moves
+    if (move == MOVE_SELFDESTRUCT || move == MOVE_EXPLOSION)
+        defense /= 2;  // Explosion halves defense
+
+    // ===== CORE FORMULA =====
+    damage = ((2 * attacker->level) / 5) + 2;
+    damage = (damage * power * attack) / defense;
+    damage = (damage / 50) + 2;
+
+    return damage;
+}
+```
+
+### Stat Stage Modifiers
+
+Before using stats in the formula, apply stat stage modifiers:
+
+```c
+// Stat stage multipliers (stages -6 to +6)
+static const u8 sStatStageModifiers[][2] = {
+    { 2, 8}, // -6: 2/8 = 0.25x
+    { 2, 7}, // -5: 2/7 = 0.29x
+    { 2, 6}, // -4: 2/6 = 0.33x
+    { 2, 5}, // -3: 2/5 = 0.40x
+    { 2, 4}, // -2: 2/4 = 0.50x
+    { 2, 3}, // -1: 2/3 = 0.67x
+    { 2, 2}, //  0: 2/2 = 1.00x
+    { 3, 2}, // +1: 3/2 = 1.50x
+    { 4, 2}, // +2: 4/2 = 2.00x
+    { 5, 2}, // +3: 5/2 = 2.50x
+    { 6, 2}, // +4: 6/2 = 3.00x
+    { 7, 2}, // +5: 7/2 = 3.50x
+    { 8, 2}, // +6: 8/2 = 4.00x
+};
+
+u16 ApplyStatStageModifier(u16 stat, u8 stage)
+{
+    // Stage is stored as 0-12 (0 = -6, 6 = neutral, 12 = +6)
+    return (stat * sStatStageModifiers[stage][0]) / sStatStageModifiers[stage][1];
+}
+```
+
+<DiagramContainer title="Stat Stage Effects">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Stages[Stat Stages]
+        N6["-6: 0.25x"]
+        N3["-3: 0.40x"]
+        N1["-1: 0.67x"]
+        Z0["0: 1.00x"]
+        P1["+1: 1.50x"]
+        P3["+3: 2.50x"]
+        P6["+6: 4.00x"]
+    end
+
+    N6 --> N3 --> N1 --> Z0 --> P1 --> P3 --> P6`}
+</pre>
+</DiagramContainer>
+
+## Modifier Application Order
+
+Modifiers are applied in a specific order. Here's the complete chain:
+
+### 1. Multiple Targets (Doubles/Triples)
+
+```c
+// In doubles, moves hitting multiple targets deal 75% damage
+if (gBattleTypeFlags & BATTLE_TYPE_DOUBLE)
+{
+    if (GetMoveTargetCount(gCurrentMove) > 1)
+        damage = (damage * 75) / 100;
+}
+```
+
+### 2. Weather Effects
+
+```c
+void ApplyWeatherDamageModifier(void)
+{
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+
+    // Rain boosts Water, weakens Fire
+    if (gBattleWeather & B_WEATHER_RAIN)
+    {
+        if (moveType == TYPE_WATER)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;  // 1.5x
+        else if (moveType == TYPE_FIRE)
+            gBattleMoveDamage = (gBattleMoveDamage * 5) / 10;   // 0.5x
+    }
+
+    // Sun boosts Fire, weakens Water
+    if (gBattleWeather & B_WEATHER_SUN)
+    {
+        if (moveType == TYPE_FIRE)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;  // 1.5x
+        else if (moveType == TYPE_WATER)
+            gBattleMoveDamage = (gBattleMoveDamage * 5) / 10;   // 0.5x
+    }
+
+    // Note: Sandstorm and Hail don't modify damage directly
+    // Sandstorm boosts Rock-type Sp.Def by 1.5x (handled elsewhere)
+}
+```
+
+### 3. Critical Hits
+
+```c
+// Critical hit multiplier
+if (gCritMultiplier > 1)
+{
+    // Gen 3: 2x damage
+    gBattleMoveDamage *= 2;
+
+    // Critical hits ignore defense boosts
+    // (handled during stat calculation, not here)
+}
+```
+
+Critical hits also have special stat interactions:
+- Ignore the target's positive Defense/Sp.Def stages
+- Ignore the attacker's negative Attack/Sp.Atk stages
+- Ignore Reflect and Light Screen
+
+### 4. Random Factor
+
+```c
+// Apply random damage variance (85% to 100%)
+void ApplyRandomDamageFactor(void)
+{
+    u32 randomFactor = 100 - (Random() % 16);  // 85-100
+    gBattleMoveDamage = (gBattleMoveDamage * randomFactor) / 100;
+}
+```
+
+### 5. STAB (Same Type Attack Bonus)
+
+```c
+void ApplySTAB(void)
+{
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+
+    if (IS_BATTLER_OF_TYPE(gBattlerAttacker, moveType))
+    {
+        if (GetBattlerAbility(gBattlerAttacker) == ABILITY_ADAPTABILITY)
+        {
+            // Adaptability: 2.0x STAB
+            gBattleMoveDamage = (gBattleMoveDamage * 20) / 10;
+        }
+        else
+        {
+            // Normal STAB: 1.5x
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        }
+    }
+}
+```
+
+### 6. Type Effectiveness
+
+```c
+void ApplyTypeEffectiveness(void)
+{
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+    u8 defType1 = gBattleMons[gBattlerTarget].type1;
+    u8 defType2 = gBattleMons[gBattlerTarget].type2;
+
+    // Get effectiveness vs first type
+    u8 mod1 = GetTypeModifier(moveType, defType1);
+
+    // Get effectiveness vs second type
+    u8 mod2 = TYPE_MUL_NORMAL;
+    if (defType1 != defType2)
+        mod2 = GetTypeModifier(moveType, defType2);
+
+    // Combine modifiers
+    // TYPE_MUL values: 0 (immune), 5 (0.5x), 10 (1x), 20 (2x)
+    u32 totalMod = (mod1 * mod2);
+
+    gBattleMoveDamage = (gBattleMoveDamage * totalMod) / (TYPE_MUL_NORMAL * TYPE_MUL_NORMAL);
+
+    // Set result flags
+    if (totalMod == 0)
+        gMoveResultFlags |= MOVE_RESULT_DOESNT_AFFECT_FOE;
+    else if (totalMod > TYPE_MUL_NORMAL * TYPE_MUL_NORMAL)
+        gMoveResultFlags |= MOVE_RESULT_SUPER_EFFECTIVE;
+    else if (totalMod < TYPE_MUL_NORMAL * TYPE_MUL_NORMAL)
+        gMoveResultFlags |= MOVE_RESULT_NOT_VERY_EFFECTIVE;
+}
+```
+
+#### Type Chart Lookup
+
+```c
+// Type effectiveness table (partial)
+// Format: {AttackingType, DefendingType, Multiplier}
+const u8 gTypeEffectiveness[][3] = {
+    {TYPE_NORMAL, TYPE_ROCK, TYPE_MUL_NOT_EFFECTIVE},     // 0.5x
+    {TYPE_NORMAL, TYPE_GHOST, TYPE_MUL_NO_EFFECT},        // 0x
+    {TYPE_NORMAL, TYPE_STEEL, TYPE_MUL_NOT_EFFECTIVE},    // 0.5x
+
+    {TYPE_FIRE, TYPE_FIRE, TYPE_MUL_NOT_EFFECTIVE},       // 0.5x
+    {TYPE_FIRE, TYPE_WATER, TYPE_MUL_NOT_EFFECTIVE},      // 0.5x
+    {TYPE_FIRE, TYPE_GRASS, TYPE_MUL_SUPER_EFFECTIVE},    // 2x
+    {TYPE_FIRE, TYPE_ICE, TYPE_MUL_SUPER_EFFECTIVE},      // 2x
+    {TYPE_FIRE, TYPE_BUG, TYPE_MUL_SUPER_EFFECTIVE},      // 2x
+    {TYPE_FIRE, TYPE_ROCK, TYPE_MUL_NOT_EFFECTIVE},       // 0.5x
+    {TYPE_FIRE, TYPE_DRAGON, TYPE_MUL_NOT_EFFECTIVE},     // 0.5x
+    {TYPE_FIRE, TYPE_STEEL, TYPE_MUL_SUPER_EFFECTIVE},    // 2x
+
+    // ... hundreds more entries
+
+    {TYPE_FORESIGHT, TYPE_FORESIGHT, TYPE_MUL_NO_EFFECT}, // Terminator
+};
+
+u8 GetTypeModifier(u8 atkType, u8 defType)
+{
+    const u8 *entry = gTypeEffectiveness;
+
+    while (entry[0] != TYPE_FORESIGHT)
+    {
+        if (entry[0] == atkType && entry[1] == defType)
+            return entry[2];
+        entry += 3;
+    }
+
+    return TYPE_MUL_NORMAL;  // Default: 1x
+}
+```
+
+<DiagramContainer title="Type Effectiveness Calculation">
+<pre class="mermaid">
+{`flowchart TB
+    Start[Type Calculation] --> Type1[Get effectiveness vs Type 1]
+    Type1 --> Check{Has second type?}
+    Check -->|Yes| Type2[Get effectiveness vs Type 2]
+    Check -->|No| Apply1[Apply Type 1 modifier]
+    Type2 --> Combine[Multiply modifiers]
+    Combine --> Apply2[Apply combined modifier]
+    Apply1 --> Flags[Set result flags]
+    Apply2 --> Flags
+
+    subgraph Results[Possible Results]
+        Immune["0x = Immune"]
+        NVE["0.25x-0.5x = Not Very Effective"]
+        Neutral["1x = Neutral"]
+        SE["2x-4x = Super Effective"]
+    end
+
+    Flags --> Results`}
+</pre>
+</DiagramContainer>
+
+### 7. Burn Penalty
+
+```c
+// Burn halves physical attack damage
+if (gBattleMons[gBattlerAttacker].status1 & STATUS1_BURN)
+{
+    if (gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+    {
+        // Exception: Guts negates burn penalty
+        if (GetBattlerAbility(gBattlerAttacker) != ABILITY_GUTS)
+            gBattleMoveDamage /= 2;
+    }
+}
+```
+
+### 8. Screen Effects
+
+```c
+void ApplyScreenModifiers(void)
+{
+    u8 side = GetBattlerSide(gBattlerTarget);
+
+    // Check for Reflect (physical) or Light Screen (special)
+    if (gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+    {
+        if (gSideStatuses[side] & SIDE_STATUS_REFLECT)
+        {
+            if (gBattleTypeFlags & BATTLE_TYPE_DOUBLE)
+                gBattleMoveDamage = (gBattleMoveDamage * 2) / 3;  // 0.67x in doubles
+            else
+                gBattleMoveDamage /= 2;  // 0.5x in singles
+        }
+    }
+    else if (gBattleMoves[gCurrentMove].split == SPLIT_SPECIAL)
+    {
+        if (gSideStatuses[side] & SIDE_STATUS_LIGHTSCREEN)
+        {
+            if (gBattleTypeFlags & BATTLE_TYPE_DOUBLE)
+                gBattleMoveDamage = (gBattleMoveDamage * 2) / 3;
+            else
+                gBattleMoveDamage /= 2;
+        }
+    }
+
+    // Critical hits bypass screens (handled in critcalc)
+}
+```
+
+## Ability Modifiers
+
+Many abilities affect damage calculation:
+
+### Offensive Abilities
+
+```c
+void ApplyOffensiveAbilityModifiers(void)
+{
+    u8 ability = GetBattlerAbility(gBattlerAttacker);
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+
+    switch (ability)
+    {
+    case ABILITY_BLAZE:
+        // Fire moves boosted at low HP
+        if (moveType == TYPE_FIRE
+         && gBattleMons[gBattlerAttacker].hp <= gBattleMons[gBattlerAttacker].maxHP / 3)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;  // 1.5x
+        break;
+
+    case ABILITY_TORRENT:
+        if (moveType == TYPE_WATER
+         && gBattleMons[gBattlerAttacker].hp <= gBattleMons[gBattlerAttacker].maxHP / 3)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case ABILITY_OVERGROW:
+        if (moveType == TYPE_GRASS
+         && gBattleMons[gBattlerAttacker].hp <= gBattleMons[gBattlerAttacker].maxHP / 3)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case ABILITY_SWARM:
+        if (moveType == TYPE_BUG
+         && gBattleMons[gBattlerAttacker].hp <= gBattleMons[gBattlerAttacker].maxHP / 3)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case ABILITY_GUTS:
+        // Boost physical moves when statused
+        if (gBattleMons[gBattlerAttacker].status1 != 0
+         && gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case ABILITY_HUGE_POWER:
+    case ABILITY_PURE_POWER:
+        // Double Attack stat (applied during stat calc)
+        break;
+
+    case ABILITY_HUSTLE:
+        // 1.5x Attack, 0.8x accuracy (accuracy handled elsewhere)
+        if (gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+    }
+}
+```
+
+### Defensive Abilities
+
+```c
+void ApplyDefensiveAbilityModifiers(void)
+{
+    u8 ability = GetBattlerAbility(gBattlerTarget);
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+
+    switch (ability)
+    {
+    case ABILITY_THICK_FAT:
+        // Halves Fire and Ice damage
+        if (moveType == TYPE_FIRE || moveType == TYPE_ICE)
+            gBattleMoveDamage /= 2;
+        break;
+
+    case ABILITY_MARVEL_SCALE:
+        // 1.5x Defense when statused
+        if (gBattleMons[gBattlerTarget].status1 != 0
+         && gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+            gBattleMoveDamage = (gBattleMoveDamage * 2) / 3;
+        break;
+
+    case ABILITY_FILTER:
+    case ABILITY_SOLID_ROCK:
+        // Reduce super effective damage by 25%
+        if (gMoveResultFlags & MOVE_RESULT_SUPER_EFFECTIVE)
+            gBattleMoveDamage = (gBattleMoveDamage * 75) / 100;
+        break;
+
+    case ABILITY_MULTISCALE:
+        // Halve damage at full HP
+        if (gBattleMons[gBattlerTarget].hp == gBattleMons[gBattlerTarget].maxHP)
+            gBattleMoveDamage /= 2;
+        break;
+    }
+}
+```
+
+## Item Modifiers
+
+### Offensive Items
+
+```c
+void ApplyOffensiveItemModifiers(void)
+{
+    u16 item = gBattleMons[gBattlerAttacker].item;
+    u8 effect = GetBattlerHoldEffect(gBattlerAttacker);
+    u8 moveType = gBattleMoves[gCurrentMove].type;
+
+    switch (effect)
+    {
+    case HOLD_EFFECT_CHOICE_BAND:
+        // 1.5x Attack (physical only)
+        if (gBattleMoves[gCurrentMove].split == SPLIT_PHYSICAL)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case HOLD_EFFECT_CHOICE_SPECS:
+        // 1.5x Sp. Attack (special only)
+        if (gBattleMoves[gCurrentMove].split == SPLIT_SPECIAL)
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+        break;
+
+    case HOLD_EFFECT_LIFE_ORB:
+        // 1.3x damage (recoil applied elsewhere)
+        gBattleMoveDamage = (gBattleMoveDamage * 13) / 10;
+        break;
+
+    case HOLD_EFFECT_TYPE_BOOSTING_ITEM:
+        // Charcoal, Mystic Water, etc. - 1.2x
+        if (IsItemTypeBooster(item, moveType))
+            gBattleMoveDamage = (gBattleMoveDamage * 12) / 10;
+        break;
+
+    case HOLD_EFFECT_EXPERT_BELT:
+        // 1.2x on super effective moves
+        if (gMoveResultFlags & MOVE_RESULT_SUPER_EFFECTIVE)
+            gBattleMoveDamage = (gBattleMoveDamage * 12) / 10;
+        break;
+
+    case HOLD_EFFECT_METRONOME:
+        // Increases with consecutive use (up to 2x)
+        {
+            u8 count = gBattleStruct->metronomeCounter[gBattlerAttacker];
+            if (count > 5) count = 5;
+            gBattleMoveDamage = (gBattleMoveDamage * (10 + count * 2)) / 10;
+        }
+        break;
+
+    case HOLD_EFFECT_GEMS:
+        // 1.5x for matching type, consumed
+        if (IsItemGem(item, moveType))
+        {
+            gBattleMoveDamage = (gBattleMoveDamage * 15) / 10;
+            gBattleStruct->consumedItem[gBattlerAttacker] = item;
+        }
+        break;
+    }
+}
+```
+
+## Special Move Power Calculations
+
+Some moves have variable power:
+
+### Power Based on Weight
+
+```c
+// Low Kick, Grass Knot
+u16 GetWeightBasedMovePower(u16 weight)
+{
+    if (weight >= 2000)       // 200+ kg
+        return 120;
+    else if (weight >= 1000)  // 100+ kg
+        return 100;
+    else if (weight >= 500)   // 50+ kg
+        return 80;
+    else if (weight >= 250)   // 25+ kg
+        return 60;
+    else if (weight >= 100)   // 10+ kg
+        return 40;
+    else
+        return 20;
+}
+```
+
+### Power Based on HP
+
+```c
+// Flail, Reversal
+u16 GetHpBasedMovePower(u8 battler)
+{
+    u32 hpPercent = (gBattleMons[battler].hp * 48) / gBattleMons[battler].maxHP;
+
+    if (hpPercent <= 1)
+        return 200;
+    else if (hpPercent <= 4)
+        return 150;
+    else if (hpPercent <= 9)
+        return 100;
+    else if (hpPercent <= 16)
+        return 80;
+    else if (hpPercent <= 32)
+        return 40;
+    else
+        return 20;
+}
+
+// Eruption, Water Spout
+u16 GetHpPercentMovePower(u8 battler)
+{
+    u16 power = (150 * gBattleMons[battler].hp) / gBattleMons[battler].maxHP;
+    if (power < 1)
+        power = 1;
+    return power;
+}
+```
+
+### Power Based on Speed
+
+```c
+// Gyro Ball
+u16 GetGyroMovePower(u8 attacker, u8 target)
+{
+    u32 attackerSpeed = GetBattlerTotalSpeedStat(attacker);
+    u32 targetSpeed = GetBattlerTotalSpeedStat(target);
+
+    u16 power = (25 * targetSpeed) / attackerSpeed;
+
+    if (power > 150)
+        power = 150;
+    if (power < 1)
+        power = 1;
+
+    return power;
+}
+
+// Electro Ball
+u16 GetElectroBallPower(u8 attacker, u8 target)
+{
+    u32 ratio = GetBattlerTotalSpeedStat(attacker) / GetBattlerTotalSpeedStat(target);
+
+    if (ratio >= 4)
+        return 150;
+    else if (ratio >= 3)
+        return 120;
+    else if (ratio >= 2)
+        return 80;
+    else if (ratio >= 1)
+        return 60;
+    else
+        return 40;
+}
+```
+
+## Complete Damage Calc Example
+
+Here's the full damage calculation for a typical attack:
+
+```c
+// Example: Level 50 Charizard using Flamethrower on Venusaur in sun
+
+// Base stats after calculation:
+// Charizard: 109 Sp.Atk (with +1 boost = 163)
+// Venusaur: 100 Sp.Def (no boosts)
+
+// Step 1: Base damage
+// ((2 * 50 / 5) + 2) * 95 * 163 / 100 / 50 + 2
+// = (22 * 95 * 163 / 100 / 50) + 2
+// = (340,670 / 100 / 50) + 2
+// = (3,406 / 50) + 2
+// = 68 + 2
+// = 70
+
+// Step 2: Apply sun (Fire boost)
+// 70 * 1.5 = 105
+
+// Step 3: No crit (1x)
+// 105
+
+// Step 4: Random factor (say 92%)
+// 105 * 0.92 = 96
+
+// Step 5: STAB (Fire-type using Fire move)
+// 96 * 1.5 = 144
+
+// Step 6: Type effectiveness (Fire vs Grass/Poison)
+// Fire vs Grass = 2x
+// Fire vs Poison = 1x
+// Total = 2x
+// 144 * 2 = 288
+
+// Final damage: 288 HP
+```
+
+<DiagramContainer title="Example Damage Chain">
+<pre class="mermaid">
+{`flowchart LR
+    Base["Base: 70"] --> Sun["Sun: 105"]
+    Sun --> Crit["Crit: 105"]
+    Crit --> Rand["Random: 96"]
+    Rand --> STAB["STAB: 144"]
+    STAB --> Type["Type: 288"]
+    Type --> Final["Final: 288 HP"]`}
+</pre>
+</DiagramContainer>
+
+## Fixed Damage Moves
+
+Some moves bypass the formula entirely:
+
+```c
+void HandleFixedDamage(void)
+{
+    switch (gCurrentMove)
+    {
+    case MOVE_SONIC_BOOM:
+        gBattleMoveDamage = 20;
+        break;
+
+    case MOVE_DRAGON_RAGE:
+        gBattleMoveDamage = 40;
+        break;
+
+    case MOVE_SEISMIC_TOSS:
+    case MOVE_NIGHT_SHADE:
+        // Damage equals attacker's level
+        gBattleMoveDamage = gBattleMons[gBattlerAttacker].level;
+        break;
+
+    case MOVE_PSYWAVE:
+        // Random 50-150% of level
+        gBattleMoveDamage = gBattleMons[gBattlerAttacker].level
+                         * (Random() % 101 + 50) / 100;
+        break;
+
+    case MOVE_SUPER_FANG:
+        // Halve current HP
+        gBattleMoveDamage = gBattleMons[gBattlerTarget].hp / 2;
+        if (gBattleMoveDamage == 0)
+            gBattleMoveDamage = 1;
+        break;
+
+    case MOVE_ENDEAVOR:
+        // Reduce to attacker's HP
+        if (gBattleMons[gBattlerTarget].hp > gBattleMons[gBattlerAttacker].hp)
+            gBattleMoveDamage = gBattleMons[gBattlerTarget].hp
+                              - gBattleMons[gBattlerAttacker].hp;
+        break;
+
+    case MOVE_FINAL_GAMBIT:
+        // Deal attacker's current HP, then faint
+        gBattleMoveDamage = gBattleMons[gBattlerAttacker].hp;
+        break;
+    }
+}
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `CalculateBaseDamage()` | battle_util.c | Core damage formula |
+| `ApplyStatStageModifier()` | battle_util.c | Stat stage multipliers |
+| `Cmd_damagecalc()` | battle_script_commands.c | Script command wrapper |
+| `Cmd_typecalc()` | battle_script_commands.c | Type effectiveness |
+| `Cmd_adjustnormaldamage()` | battle_script_commands.c | Apply modifiers |
+| `GetTypeModifier()` | battle_util.c | Type chart lookup |
+| `AbilityBattleEffects()` | battle_util.c | Ability damage mods |
+
+## Damage Caps and Limits
+
+```c
+// Minimum damage
+if (gBattleMoveDamage == 0)
+    gBattleMoveDamage = 1;
+
+// Maximum damage (unsigned 16-bit in some contexts)
+if (gBattleMoveDamage > 65535)
+    gBattleMoveDamage = 65535;
+
+// HP cap
+if (gBattleMoveDamage > gBattleMons[gBattlerTarget].hp)
+    gBattleMoveDamage = gBattleMons[gBattlerTarget].hp;
+```

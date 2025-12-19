@@ -1,0 +1,230 @@
+---
+title: Palettes
+description: Color management on the GBA - BGR555 format and palette organization
+---
+
+import DiagramContainer from '../../../../components/DiagramContainer.astro';
+
+The GBA uses indexed color with two 256-color palettes: one for backgrounds and one for sprites. Each color is stored in BGR555 format (15-bit color).
+
+## Color Format
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph BGR555["16-bit Color Word"]
+        X["Bit 15<br/>Unused"]
+        B["Bits 14-10<br/>Blue (0-31)"]
+        G["Bits 9-5<br/>Green (0-31)"]
+        R["Bits 4-0<br/>Red (0-31)"]
+    end
+
+    style R fill:#f99,stroke:#333,color:#000
+    style G fill:#9f9,stroke:#333,color:#000
+    style B fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+```c
+// Color format: xBBBBBGGGGGRRRRR
+#define RGB(r, g, b) ((r) | ((g) << 5) | ((b) << 10))
+#define RGB2(r, g, b) (((b) << 10) | ((g) << 5) | (r))
+
+// Extract components
+#define GET_R(color) ((color) & 0x1F)
+#define GET_G(color) (((color) >> 5) & 0x1F)
+#define GET_B(color) (((color) >> 10) & 0x1F)
+
+// Common colors
+#define RGB_BLACK   RGB(0, 0, 0)
+#define RGB_WHITE   RGB(31, 31, 31)
+#define RGB_RED     RGB(31, 0, 0)
+#define RGB_GREEN   RGB(0, 31, 0)
+#define RGB_BLUE    RGB(0, 0, 31)
+```
+
+## Palette Memory
+
+```c
+// Palette RAM addresses
+#define PLTT          0x05000000  // Start of palette RAM
+#define PLTT_SIZE     0x400       // 1KB total (512 colors × 2 bytes)
+#define BG_PLTT       PLTT        // Background palette (256 colors)
+#define OBJ_PLTT      (PLTT + 0x200)  // Sprite palette (256 colors)
+
+// Access as array
+#define gPlttBufferUnfaded  ((u16 *)PLTT)
+```
+
+## Palette Organization
+
+### Background Palettes
+
+| Bank | Offset | Colors | Usage |
+|------|--------|--------|-------|
+| 0 | 0x000 | 16 | BG palette bank 0 |
+| 1 | 0x020 | 16 | BG palette bank 1 |
+| ... | ... | ... | ... |
+| 15 | 0x1E0 | 16 | BG palette bank 15 |
+
+Color 0 in each bank is transparent.
+
+### Sprite Palettes
+
+| Bank | Offset | Colors | Usage |
+|------|--------|--------|-------|
+| 0 | 0x200 | 16 | OBJ palette bank 0 |
+| 1 | 0x220 | 16 | OBJ palette bank 1 |
+| ... | ... | ... | ... |
+| 15 | 0x3E0 | 16 | OBJ palette bank 15 |
+
+## Pokemon Emerald Palette System
+
+### Palette Buffer
+
+The game uses a RAM buffer for palette operations:
+
+```c
+// Unfaded palette (original colors)
+EWRAM_DATA u16 gPlttBufferUnfaded[PLTT_BUFFER_SIZE] = {0};
+
+// Faded palette (with fade effects applied)
+EWRAM_DATA u16 gPlttBufferFaded[PLTT_BUFFER_SIZE] = {0};
+
+#define PLTT_BUFFER_SIZE 512  // 256 BG + 256 OBJ colors
+
+// Transfer buffer to hardware
+void TransferPlttBuffer(void)
+{
+    DmaCopy16(3, gPlttBufferFaded, (void *)PLTT, PLTT_SIZE);
+}
+```
+
+### Loading Palettes
+
+```c
+// Load palette to buffer
+void LoadPalette(const void *src, u16 offset, u16 size)
+{
+    CpuCopy16(src, &gPlttBufferUnfaded[offset], size);
+    CpuCopy16(src, &gPlttBufferFaded[offset], size);
+}
+
+// Example: Load a 16-color palette to BG bank 5
+LoadPalette(myPalette, 5 * 16, 32);  // offset = 80, size = 32 bytes
+```
+
+### Palette Slots
+
+```c
+// Standard palette slot assignments
+#define BG_PLTT_ID(n)   ((n) * 16)       // BG palette bank n
+#define OBJ_PLTT_ID(n)  (256 + (n) * 16) // OBJ palette bank n
+
+// Load sprite palette
+LoadSpritePalette(&spritePalette, paletteTag);
+```
+
+## Fade Effects
+
+Pokemon Emerald supports palette fading for transitions:
+
+```c
+// Start a fade effect
+void BeginNormalPaletteFade(u32 selectedPalettes, s8 delay,
+                            u8 startY, u8 targetY, u16 blendColor);
+
+// Example: Fade to black
+BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
+
+// Example: Fade from white
+BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_WHITE);
+
+// Check if fade is active
+if (!gPaletteFade.active)
+{
+    // Fade complete
+}
+```
+
+### Fade Parameters
+
+```c
+// Palette selection masks
+#define PALETTES_ALL       0xFFFFFFFF
+#define PALETTES_BG        0x0000FFFF
+#define PALETTES_OBJECTS   0xFFFF0000
+
+// Blend Y values (0 = no blend, 16 = full blend)
+// Fade to black: startY=0, targetY=16
+// Fade from black: startY=16, targetY=0
+```
+
+### Blend Colors
+
+The fade system blends between original colors and a target color:
+
+```c
+u16 BlendColor(u16 color, u16 blendColor, u8 coeff)
+{
+    u8 r = GET_R(color) + ((GET_R(blendColor) - GET_R(color)) * coeff / 16);
+    u8 g = GET_G(color) + ((GET_G(blendColor) - GET_G(color)) * coeff / 16);
+    u8 b = GET_B(color) + ((GET_B(blendColor) - GET_B(color)) * coeff / 16);
+    return RGB(r, g, b);
+}
+```
+
+## Color Cycling
+
+For animated effects like water:
+
+```c
+void AnimatePalette(u16 palOffset, u16 numColors)
+{
+    // Rotate colors
+    u16 temp = gPlttBufferUnfaded[palOffset];
+    for (int i = 0; i < numColors - 1; i++)
+    {
+        gPlttBufferUnfaded[palOffset + i] =
+            gPlttBufferUnfaded[palOffset + i + 1];
+    }
+    gPlttBufferUnfaded[palOffset + numColors - 1] = temp;
+
+    // Copy to faded buffer
+    CpuCopy16(&gPlttBufferUnfaded[palOffset],
+              &gPlttBufferFaded[palOffset],
+              numColors * 2);
+}
+```
+
+## Hardware vs Buffer
+
+Direct hardware writes vs buffered writes:
+
+```c
+// Direct write (immediate, but may cause tearing)
+((u16 *)PLTT)[0] = RGB(31, 0, 0);
+
+// Buffered write (applied during VBlank)
+gPlttBufferFaded[0] = RGB(31, 0, 0);
+// TransferPlttBuffer() called in VBlank copies buffer to hardware
+```
+
+## 256-Color Mode
+
+For backgrounds using 256 colors:
+
+```c
+// Set BGxCNT for 256-color mode
+SetGpuReg(REG_OFFSET_BG0CNT, BGCNT_256COLOR | ...);
+
+// All 256 BG colors are used from banks 0-15
+// Tile pixel values 0-255 map directly to palette indices
+// Index 0 is still transparent
+```
+
+## Related Topics
+
+- [Backgrounds](/gba-hardware/graphics/backgrounds) - How backgrounds use palettes
+- [Sprites](/gba-hardware/graphics/sprites) - How sprites use palettes
+- [IO Registers](/gba-hardware/io-registers) - Display control registers

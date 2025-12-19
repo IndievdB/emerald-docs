@@ -1,0 +1,225 @@
+---
+title: Codebase Overview
+description: High-level architecture of the pokeemerald codebase
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+This page provides a bird's-eye view of how pokeemerald is organized and how its major systems interact.
+
+## Architecture Overview
+
+Pokemon Emerald follows a **callback-driven state machine** architecture. The game runs a tight main loop that:
+
+1. Reads player input
+2. Calls registered callback functions
+3. Waits for the next frame (VBlank)
+
+<DiagramContainer title="High-Level Architecture">
+<pre class="mermaid">
+{`flowchart TD
+    subgraph MainLoop["Main Loop (60 FPS)"]
+        A[Read Keys] --> B[Check Soft Reset]
+        B --> C[Handle Link]
+        C --> D[Call callback1]
+        D --> E[Call callback2]
+        E --> F[Update Play Time]
+        F --> G[Update Music]
+        G --> H[Wait for VBlank]
+        H --> A
+    end
+
+    subgraph States["Game States (callback2)"]
+        I[Title Screen]
+        J[Overworld]
+        K[Battle]
+        L[Menu]
+        M[Cutscene]
+    end
+
+    E --> States`}
+</pre>
+</DiagramContainer>
+
+## Major Systems
+
+The codebase divides into several major subsystems:
+
+### Core Systems
+
+| System | Key Files | Purpose |
+|--------|-----------|---------|
+| Main Loop | `main.c` | Entry point, callbacks, interrupts |
+| GPU Manager | `gpu_regs.c`, `bg.c` | Graphics register management |
+| Sprites | `sprite.c` | Object rendering |
+| Tasks | `task.c` | Cooperative multitasking |
+| DMA | `dma3_manager.c` | Memory transfers |
+
+### Game Systems
+
+| System | Key Files | Purpose |
+|--------|-----------|---------|
+| Overworld | `overworld.c`, `fieldmap.c` | Field gameplay |
+| Battle | `battle_main.c`, `battle_script_commands.c` | Combat |
+| Pokemon | `pokemon.c` | Pokemon data handling |
+| Scripts | `script.c` | Event scripting VM |
+| Save | `save.c`, `load_save.c` | Persistence |
+| Menu | `menu.c`, `start_menu.c` | UI |
+
+<LearnMore title="File naming conventions" summary="How to find what you're looking for">
+The codebase follows consistent naming patterns:
+
+- `battle_*.c` - All battle-related code
+- `field_*.c` - Overworld/field-related code
+- `fldeff_*.c` - Field effects (Cut, Surf, etc.)
+- `*_menu.c` - Menu screens
+- `*_screen.c` - Full-screen UIs
+
+Constants and data live in `include/constants/` and `src/data/` respectively.
+</LearnMore>
+
+## Data Flow
+
+Understanding how data flows helps navigate the codebase:
+
+<DiagramContainer title="Data Flow">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph ROM["ROM (Read-Only)"]
+        A[Species Data]
+        B[Move Data]
+        C[Map Data]
+        D[Graphics]
+    end
+
+    subgraph RAM["RAM (Working Memory)"]
+        E[gSaveBlock1]
+        F[gSaveBlock2]
+        G[gPlayerParty]
+        H[Current Map State]
+    end
+
+    subgraph Flash["Flash Memory"]
+        I[Save File]
+    end
+
+    ROM --> RAM
+    RAM <--> Flash`}
+</pre>
+</DiagramContainer>
+
+Key data structures:
+- **gSaveBlock1** - Player progress (position, party, items, flags)
+- **gSaveBlock2** - Settings and options
+- **gPlayerParty** - Current team of 6 Pokemon
+- **gBattleMons** - Pokemon currently in battle
+
+## Control Flow Patterns
+
+### Callbacks
+
+Most game logic uses **callbacks** - function pointers called each frame:
+
+```c
+// Set what function runs each frame
+SetMainCallback2(CB2_Overworld);
+
+// The callback manages its own state
+static void CB2_Overworld(void)
+{
+    RunTasks();
+    AnimateSprites();
+    BuildOamBuffer();
+    UpdatePaletteFade();
+}
+```
+
+### State Machines
+
+Complex features use **state machines** with a state variable:
+
+```c
+static void BattleMainCB2(void)
+{
+    switch (gBattleMainFunc)
+    {
+        case STATE_TURN_START:
+            // Handle turn start
+            break;
+        case STATE_CHOOSE_ACTION:
+            // Handle action selection
+            break;
+        // ... more states
+    }
+}
+```
+
+### Tasks
+
+The **task system** provides cooperative multitasking:
+
+```c
+// Create a task that runs each frame
+u8 taskId = CreateTask(Task_FadeIn, 0);
+
+// The task manages its own lifecycle
+static void Task_FadeIn(u8 taskId)
+{
+    if (FadeFinished())
+        DestroyTask(taskId);
+}
+```
+
+<LearnMore title="Why use tasks?" summary="Async operations without threads">
+The GBA has no operating system or threading. Tasks provide a way to run multiple operations "simultaneously" by giving each a slice of each frame.
+
+Common uses:
+- Fade animations
+- Menu transitions
+- NPC movement
+- Battle animations
+
+Each task has 16 data slots for storing local state.
+</LearnMore>
+
+## Memory Layout
+
+The GBA has limited but fast memory:
+
+| Region | Address | Size | Speed | Use |
+|--------|---------|------|-------|-----|
+| IWRAM | 0x03000000 | 32 KB | Fast | Stack, critical code |
+| EWRAM | 0x02000000 | 256 KB | Slow | Heap, buffers |
+| VRAM | 0x06000000 | 96 KB | Medium | Graphics |
+| ROM | 0x08000000 | 32 MB | Varies | Code, data, assets |
+
+Code uses attributes to place data in the right region:
+
+```c
+IWRAM_DATA static u8 sCriticalBuffer[256];  // Fast memory
+EWRAM_DATA static u8 sLargeBuffer[4096];    // More space
+```
+
+## Build System
+
+The Makefile orchestrates:
+
+1. **C compilation** - Source to object files
+2. **Asset conversion** - PNG to GBA graphics format
+3. **Audio conversion** - MIDI to GBA music format
+4. **Linking** - Combining everything into a ROM
+
+Custom tools in `tools/` handle asset conversion:
+- `gbagfx` - Graphics conversion
+- `mid2agb` - MIDI to GBA music
+- `mapjson` - Map data processing
+
+## Where to Go Next
+
+Now that you have the big picture:
+
+1. **[Game Flow](/game-flow/)** - Understand the main loop in detail
+2. **[GBA Hardware](/gba-hardware/)** - Learn about the platform
+3. **[Overworld](/overworld/)** - See how field gameplay works
+4. **[Battle System](/battle/)** - Dive into combat mechanics

@@ -1,0 +1,831 @@
+---
+title: Battle AI
+description: How computer opponents make decisions in Pokemon Emerald battles
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The Battle AI system determines how computer-controlled trainers choose their actions. It uses a **scoring system** where each move is evaluated based on multiple factors, and the move with the best score is selected.
+
+## AI Architecture
+
+<DiagramContainer title="AI Decision Making Flow">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Input[Input Data]
+        Moves[Available Moves]
+        Target[Target Pokemon]
+        Field[Field Conditions]
+        Party[Party State]
+    end
+
+    subgraph Scoring[Move Scoring]
+        Base[Base Score: 100]
+        Scripts[Run AI Scripts]
+        Adjust[Apply Adjustments]
+        Final[Final Scores]
+    end
+
+    subgraph Selection[Move Selection]
+        Best[Find Best Score]
+        Tie[Handle Ties]
+        Choose[Choose Move]
+    end
+
+    Input --> Base
+    Base --> Scripts
+    Scripts --> Adjust
+    Adjust --> Final
+    Final --> Best
+    Best --> Tie
+    Tie --> Choose`}
+</pre>
+</DiagramContainer>
+
+## AI Scoring System
+
+### Base Score
+
+Every move starts with a score of 100:
+
+```c
+#define AI_SCORE_DEFAULT 100
+
+void BattleAI_SetupAIData(void)
+{
+    u8 i;
+
+    // Initialize scores for all 4 moves
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        AI_THINKING_STRUCT->score[i] = AI_SCORE_DEFAULT;
+    }
+
+    // Store move data for easy access
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        AI_THINKING_STRUCT->moveConsidered = gBattleMons[sBattler_AI].moves[i];
+    }
+}
+```
+
+### Score Adjustments
+
+AI scripts modify scores based on various factors:
+
+```c
+// Score modification constants
+#define AI_SCORE_INCREASE_LARGE     10
+#define AI_SCORE_INCREASE_MEDIUM    5
+#define AI_SCORE_INCREASE_SMALL     2
+#define AI_SCORE_DECREASE_SMALL     -2
+#define AI_SCORE_DECREASE_MEDIUM    -5
+#define AI_SCORE_DECREASE_LARGE     -10
+#define AI_SCORE_DONT_USE           -20
+
+// After all scripts run, scores might look like:
+// Move 1 (Thunderbolt): 100 + 10 (super effective) + 5 (can KO) = 115
+// Move 2 (Quick Attack): 100 - 5 (weak) = 95
+// Move 3 (Thunder Wave): 100 - 20 (target already paralyzed) = 80
+// Move 4 (Light Screen): 100 + 0 = 100
+// --> AI picks Thunderbolt
+```
+
+## AI Script System
+
+### Script Flags
+
+Each trainer can have multiple AI scripts enabled:
+
+```c
+// AI script flags
+#define AI_FLAG_CHECK_BAD_MOVE      (1 << 0)   // Don't use ineffective moves
+#define AI_FLAG_TRY_TO_FAINT        (1 << 1)   // Prioritize KO moves
+#define AI_FLAG_CHECK_VIABILITY     (1 << 2)   // Consider move usefulness
+#define AI_FLAG_SETUP_FIRST_TURN    (1 << 3)   // Use setup moves early
+#define AI_FLAG_RISKY               (1 << 4)   // Take risks (high power, low accuracy)
+#define AI_FLAG_PREFER_STRONGEST    (1 << 5)   // Use strongest move available
+#define AI_FLAG_PREFER_BATON_PASS   (1 << 6)   // Use Baton Pass strategically
+#define AI_FLAG_DOUBLE_BATTLE       (1 << 7)   // Consider partner in doubles
+#define AI_FLAG_HP_AWARE            (1 << 8)   // Factor in HP remaining
+#define AI_FLAG_HELP_PARTNER        (1 << 14)  // Support ally in doubles
+
+// Example trainer AI configuration
+const struct TrainerMon gTrainers[] = {
+    [TRAINER_BRAWLY] = {
+        .aiFlags = AI_FLAG_CHECK_BAD_MOVE
+                 | AI_FLAG_TRY_TO_FAINT
+                 | AI_FLAG_CHECK_VIABILITY,
+        // ...
+    },
+    [TRAINER_STEVEN] = {
+        .aiFlags = AI_FLAG_CHECK_BAD_MOVE
+                 | AI_FLAG_TRY_TO_FAINT
+                 | AI_FLAG_CHECK_VIABILITY
+                 | AI_FLAG_SETUP_FIRST_TURN
+                 | AI_FLAG_HP_AWARE
+                 | AI_FLAG_RISKY,
+        // ...
+    },
+};
+```
+
+### Running AI Scripts
+
+```c
+u8 BattleAI_ChooseMoveOrAction(void)
+{
+    u8 aiFlags = gTrainers[gTrainerBattleOpponent_A].aiFlags;
+
+    // Run each enabled AI script
+    if (aiFlags & AI_FLAG_CHECK_BAD_MOVE)
+        AI_CheckBadMove();
+
+    if (aiFlags & AI_FLAG_TRY_TO_FAINT)
+        AI_TryToFaint();
+
+    if (aiFlags & AI_FLAG_CHECK_VIABILITY)
+        AI_CheckViability();
+
+    if (aiFlags & AI_FLAG_SETUP_FIRST_TURN)
+        AI_SetupFirstTurn();
+
+    if (aiFlags & AI_FLAG_RISKY)
+        AI_Risky();
+
+    if (aiFlags & AI_FLAG_PREFER_STRONGEST)
+        AI_PreferStrongestMove();
+
+    if (aiFlags & AI_FLAG_HP_AWARE)
+        AI_HPAware();
+
+    if (aiFlags & AI_FLAG_DOUBLE_BATTLE)
+        AI_DoubleBattle();
+
+    // Select best move
+    return AI_ChooseMoveFromScores();
+}
+```
+
+## AI Script Implementations
+
+### AI_CheckBadMove - Filter Ineffective Moves
+
+```c
+static void AI_CheckBadMove(void)
+{
+    u8 i;
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // Don't use moves that have no effect
+        if (IsMoveMadeUselessByAbility(move, sBattler_AI, gBattlerTarget))
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+            continue;
+        }
+
+        // Check type immunities
+        u8 effectiveness = AI_GetTypeEffectiveness(move, sBattler_AI, gBattlerTarget);
+        if (effectiveness == AI_EFFECTIVENESS_x0)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+            continue;
+        }
+
+        // Don't use status moves on targets that already have status
+        if (gBattleMoves[move].effect == EFFECT_SLEEP
+         && gBattleMons[gBattlerTarget].status1 & STATUS1_ANY)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+        }
+
+        if (gBattleMoves[move].effect == EFFECT_TOXIC
+         && gBattleMons[gBattlerTarget].status1 & STATUS1_ANY)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+        }
+
+        if (gBattleMoves[move].effect == EFFECT_PARALYZE
+         && gBattleMons[gBattlerTarget].status1 & STATUS1_ANY)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+        }
+
+        // Don't try to lower stats that are already at minimum
+        if (gBattleMoves[move].effect == EFFECT_ATTACK_DOWN
+         && gBattleMons[gBattlerTarget].statStages[STAT_ATK] == MIN_STAT_STAGE)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+        }
+
+        // Don't try to raise stats that are already at maximum
+        if (gBattleMoves[move].effect == EFFECT_ATTACK_UP
+         && gBattleMons[sBattler_AI].statStages[STAT_ATK] == MAX_STAT_STAGE)
+        {
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DONT_USE;
+        }
+    }
+}
+```
+
+### AI_TryToFaint - Prioritize KO Moves
+
+```c
+static void AI_TryToFaint(void)
+{
+    u8 i;
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // Calculate potential damage
+        s32 damage = AI_CalcDamage(move, sBattler_AI, gBattlerTarget);
+
+        // Check if this move can KO
+        if (damage >= gBattleMons[gBattlerTarget].hp)
+        {
+            // Bonus for KO moves
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+
+            // Extra bonus if we go first and can secure the KO
+            if (AI_WhoIsFirst(sBattler_AI, gBattlerTarget) == AI_IS_FASTER)
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_SMALL;
+        }
+        else if (damage >= gBattleMons[gBattlerTarget].hp / 2)
+        {
+            // Good damage but not a KO
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+        }
+    }
+}
+```
+
+<DiagramContainer title="AI_TryToFaint Logic">
+<pre class="mermaid">
+{`flowchart TB
+    Start[For each move] --> Calc[Calculate damage]
+    Calc --> KO{Can KO?}
+    KO -->|Yes| Bonus[+10 score]
+    Bonus --> Speed{Faster?}
+    Speed -->|Yes| Extra[+2 more]
+    Speed -->|No| Next
+    KO -->|No| Half{50%+ damage?}
+    Half -->|Yes| Medium[+5 score]
+    Half -->|No| Next[Next move]
+    Extra --> Next
+    Medium --> Next`}
+</pre>
+</DiagramContainer>
+
+### AI_CheckViability - Move Usefulness
+
+```c
+static void AI_CheckViability(void)
+{
+    u8 i;
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // Boost super effective moves
+        u8 effectiveness = AI_GetTypeEffectiveness(move, sBattler_AI, gBattlerTarget);
+        switch (effectiveness)
+        {
+        case AI_EFFECTIVENESS_x4:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+            break;
+        case AI_EFFECTIVENESS_x2:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+            break;
+        case AI_EFFECTIVENESS_x0_5:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_MEDIUM;
+            break;
+        case AI_EFFECTIVENESS_x0_25:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_LARGE;
+            break;
+        }
+
+        // Consider STAB
+        if (IS_BATTLER_OF_TYPE(sBattler_AI, gBattleMoves[move].type))
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_SMALL;
+
+        // Prefer higher base power
+        if (gBattleMoves[move].power >= 100)
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_SMALL;
+        else if (gBattleMoves[move].power >= 70)
+            AI_THINKING_STRUCT->score[i] += 1;
+
+        // Prefer high accuracy
+        if (gBattleMoves[move].accuracy == 0 || gBattleMoves[move].accuracy == 100)
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_SMALL;
+        else if (gBattleMoves[move].accuracy < 80)
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_SMALL;
+    }
+}
+```
+
+### AI_SetupFirstTurn - Use Setup Moves Early
+
+```c
+static void AI_SetupFirstTurn(void)
+{
+    u8 i;
+
+    // Only boost setup moves on first turn
+    if (gBattleResults.battleTurnCounter != 0)
+        return;
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // Boost stat-raising moves
+        switch (gBattleMoves[move].effect)
+        {
+        case EFFECT_ATTACK_UP:
+        case EFFECT_ATTACK_UP_2:
+        case EFFECT_DEFENSE_UP:
+        case EFFECT_DEFENSE_UP_2:
+        case EFFECT_SPEED_UP:
+        case EFFECT_SPEED_UP_2:
+        case EFFECT_SPECIAL_ATTACK_UP:
+        case EFFECT_SPECIAL_ATTACK_UP_2:
+        case EFFECT_SPECIAL_DEFENSE_UP:
+        case EFFECT_SPECIAL_DEFENSE_UP_2:
+        case EFFECT_DRAGON_DANCE:
+        case EFFECT_SWORDS_DANCE:
+        case EFFECT_CALM_MIND:
+        case EFFECT_BULK_UP:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+            break;
+
+        // Boost screen moves
+        case EFFECT_REFLECT:
+        case EFFECT_LIGHT_SCREEN:
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+            break;
+
+        // Boost weather moves
+        case EFFECT_SUNNY_DAY:
+        case EFFECT_RAIN_DANCE:
+        case EFFECT_SANDSTORM:
+        case EFFECT_HAIL:
+            // Only if team benefits from the weather
+            if (AI_TeamBenefitsFromWeather(gBattleMoves[move].effect))
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+            break;
+        }
+    }
+}
+```
+
+### AI_HPAware - Consider Health Status
+
+```c
+static void AI_HPAware(void)
+{
+    u8 i;
+    u32 aiHpPercent = (gBattleMons[sBattler_AI].hp * 100)
+                    / gBattleMons[sBattler_AI].maxHP;
+    u32 targetHpPercent = (gBattleMons[gBattlerTarget].hp * 100)
+                        / gBattleMons[gBattlerTarget].maxHP;
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // At low HP, prefer healing moves
+        if (aiHpPercent < 25)
+        {
+            if (gBattleMoves[move].effect == EFFECT_SOFTBOILED
+             || gBattleMoves[move].effect == EFFECT_RECOVER
+             || gBattleMoves[move].effect == EFFECT_REST
+             || gBattleMoves[move].effect == EFFECT_ROOST)
+            {
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+            }
+        }
+
+        // At low HP, boost priority moves
+        if (aiHpPercent < 30)
+        {
+            if (gBattleMoves[move].priority > 0)
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+        }
+
+        // Target at low HP - don't waste setup moves
+        if (targetHpPercent < 25)
+        {
+            if (IsSetupMove(move))
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_LARGE;
+        }
+
+        // Boost moves that get stronger at low HP
+        if (aiHpPercent < 33)
+        {
+            if (move == MOVE_FLAIL || move == MOVE_REVERSAL)
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+        }
+    }
+}
+```
+
+### AI_DoubleBattle - Double Battle Strategy
+
+```c
+static void AI_DoubleBattle(void)
+{
+    if (!(gBattleTypeFlags & BATTLE_TYPE_DOUBLE))
+        return;
+
+    u8 i;
+    u8 aiPartner = BATTLE_PARTNER(sBattler_AI);
+
+    for (i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = gBattleMons[sBattler_AI].moves[i];
+        if (move == MOVE_NONE)
+            continue;
+
+        // Don't use Earthquake/Surf if partner is vulnerable
+        if (move == MOVE_EARTHQUAKE || move == MOVE_MAGNITUDE)
+        {
+            if (!IS_BATTLER_OF_TYPE(aiPartner, TYPE_FLYING)
+             && GetBattlerAbility(aiPartner) != ABILITY_LEVITATE)
+            {
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_LARGE;
+            }
+        }
+
+        if (move == MOVE_SURF)
+        {
+            if (!IS_BATTLER_OF_TYPE(aiPartner, TYPE_WATER)
+             && GetBattlerAbility(aiPartner) != ABILITY_WATER_ABSORB)
+            {
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_DECREASE_MEDIUM;
+            }
+        }
+
+        // Boost Helping Hand
+        if (move == MOVE_HELPING_HAND)
+            AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_MEDIUM;
+
+        // Boost moves that protect partner
+        if (move == MOVE_FOLLOW_ME || move == MOVE_RAGE_POWDER)
+        {
+            // More valuable if partner is setting up or low HP
+            if (gBattleMons[aiPartner].hp < gBattleMons[aiPartner].maxHP / 3)
+                AI_THINKING_STRUCT->score[i] += AI_SCORE_INCREASE_LARGE;
+        }
+    }
+}
+```
+
+## Move Selection
+
+After all scripts run, select the best move:
+
+```c
+u8 AI_ChooseMoveFromScores(void)
+{
+    u8 i;
+    u8 bestMoveIndex = 0;
+    s32 bestScore = AI_THINKING_STRUCT->score[0];
+    u8 numBestMoves = 1;
+    u8 bestMoves[MAX_MON_MOVES];
+
+    bestMoves[0] = 0;
+
+    // Find highest score
+    for (i = 1; i < MAX_MON_MOVES; i++)
+    {
+        if (gBattleMons[sBattler_AI].moves[i] == MOVE_NONE)
+            continue;
+
+        if (AI_THINKING_STRUCT->score[i] > bestScore)
+        {
+            bestScore = AI_THINKING_STRUCT->score[i];
+            bestMoveIndex = i;
+            numBestMoves = 1;
+            bestMoves[0] = i;
+        }
+        else if (AI_THINKING_STRUCT->score[i] == bestScore)
+        {
+            // Tie - add to candidates
+            bestMoves[numBestMoves++] = i;
+        }
+    }
+
+    // If tied, pick randomly among best moves
+    if (numBestMoves > 1)
+        bestMoveIndex = bestMoves[Random() % numBestMoves];
+
+    return bestMoveIndex;
+}
+```
+
+<DiagramContainer title="Final Move Selection">
+<pre class="mermaid">
+{`flowchart TB
+    Start[All scores calculated] --> Find[Find highest score]
+    Find --> Ties{Multiple moves tied?}
+    Ties -->|No| Pick[Pick that move]
+    Ties -->|Yes| Random[Random among tied]
+    Random --> Pick
+    Pick --> Return[Return move index]`}
+</pre>
+</DiagramContainer>
+
+## AI Damage Calculation
+
+The AI predicts damage to inform decisions:
+
+```c
+s32 AI_CalcDamage(u16 move, u8 attacker, u8 target)
+{
+    s32 damage;
+    u8 type = gBattleMoves[move].type;
+    u16 power = gBattleMoves[move].power;
+
+    // Status moves don't deal damage
+    if (power == 0)
+        return 0;
+
+    // Get stats
+    u16 attack, defense;
+    if (gBattleMoves[move].split == SPLIT_PHYSICAL)
+    {
+        attack = gBattleMons[attacker].attack;
+        defense = gBattleMons[target].defense;
+    }
+    else
+    {
+        attack = gBattleMons[attacker].spAttack;
+        defense = gBattleMons[target].spDefense;
+    }
+
+    // Apply stat stages
+    attack = ApplyStatStageModifier(attack, gBattleMons[attacker].statStages[STAT_ATK]);
+    defense = ApplyStatStageModifier(defense, gBattleMons[target].statStages[STAT_DEF]);
+
+    // Calculate base damage
+    damage = ((2 * gBattleMons[attacker].level) / 5) + 2;
+    damage = (damage * power * attack) / defense;
+    damage = (damage / 50) + 2;
+
+    // Apply STAB
+    if (IS_BATTLER_OF_TYPE(attacker, type))
+        damage = (damage * 15) / 10;
+
+    // Apply type effectiveness
+    damage = (damage * AI_GetTypeEffectivenessMultiplier(move, attacker, target)) / 10;
+
+    return damage;
+}
+```
+
+## Speed Comparison
+
+The AI considers who moves first:
+
+```c
+u8 AI_WhoIsFirst(u8 battler1, u8 battler2)
+{
+    u32 speed1 = GetBattlerTotalSpeedStat(battler1);
+    u32 speed2 = GetBattlerTotalSpeedStat(battler2);
+
+    // Consider Trick Room
+    if (gFieldStatuses & STATUS_FIELD_TRICK_ROOM)
+    {
+        if (speed1 < speed2)
+            return AI_IS_FASTER;
+        else if (speed1 > speed2)
+            return AI_IS_SLOWER;
+    }
+    else
+    {
+        if (speed1 > speed2)
+            return AI_IS_FASTER;
+        else if (speed1 < speed2)
+            return AI_IS_SLOWER;
+    }
+
+    return AI_SPEED_TIE;
+}
+```
+
+## AI Switching Logic
+
+The AI also decides when to switch Pokemon:
+
+```c
+bool8 ShouldSwitch(void)
+{
+    u8 i;
+    u8 availableToSwitch = 0;
+
+    // Count available Pokemon
+    for (i = 0; i < PARTY_SIZE; i++)
+    {
+        if (IsValidForBattle(&gEnemyParty[i])
+         && i != gBattlerPartyIndexes[sBattler_AI])
+        {
+            availableToSwitch++;
+        }
+    }
+
+    if (availableToSwitch == 0)
+        return FALSE;
+
+    // Switch if current Pokemon can't do anything
+    if (AI_HasUsableMove(sBattler_AI) == FALSE)
+        return TRUE;
+
+    // Switch if current Pokemon is at low HP and has no good moves
+    if (gBattleMons[sBattler_AI].hp < gBattleMons[sBattler_AI].maxHP / 4)
+    {
+        if (HasSuperEffectiveMove(gBattlerTarget, sBattler_AI))
+        {
+            // Opponent has SE move and we're low - switch
+            if (HasBetterMatchup())
+                return TRUE;
+        }
+    }
+
+    // Switch if completely walled
+    if (AI_AllMovesDealMinimalDamage())
+    {
+        if (HasBetterMatchup())
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+u8 GetMostSuitableMonToSwitchInto(void)
+{
+    u8 i;
+    u8 bestMon = PARTY_SIZE;  // Invalid
+    s32 bestScore = -1000;
+
+    for (i = 0; i < PARTY_SIZE; i++)
+    {
+        if (!IsValidForBattle(&gEnemyParty[i]))
+            continue;
+        if (i == gBattlerPartyIndexes[sBattler_AI])
+            continue;
+
+        s32 score = 0;
+
+        // Check type matchup
+        u8 type1 = GetMonData(&gEnemyParty[i], MON_DATA_TYPE1);
+        u8 type2 = GetMonData(&gEnemyParty[i], MON_DATA_TYPE2);
+
+        // Bonus for resisting opponent's moves
+        for (u8 j = 0; j < MAX_MON_MOVES; j++)
+        {
+            u16 oppMove = gBattleMons[gBattlerTarget].moves[j];
+            if (oppMove == MOVE_NONE)
+                continue;
+
+            u8 moveType = gBattleMoves[oppMove].type;
+            u8 eff1 = GetTypeModifier(moveType, type1);
+            u8 eff2 = GetTypeModifier(moveType, type2);
+
+            if (eff1 < TYPE_MUL_NORMAL || eff2 < TYPE_MUL_NORMAL)
+                score += 10;  // Resists
+            if (eff1 == TYPE_MUL_NO_EFFECT || eff2 == TYPE_MUL_NO_EFFECT)
+                score += 20;  // Immune
+        }
+
+        // Bonus for having SE moves
+        if (PartyMonHasSuperEffectiveMove(i, gBattlerTarget))
+            score += 15;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestMon = i;
+        }
+    }
+
+    return bestMon;
+}
+```
+
+<DiagramContainer title="AI Switch Decision">
+<pre class="mermaid">
+{`flowchart TB
+    Start[Should Switch?] --> Available{Have Pokemon to switch?}
+    Available -->|No| Stay[Don't switch]
+    Available -->|Yes| Usable{Have usable moves?}
+    Usable -->|No| Switch[Switch out]
+    Usable -->|Yes| LowHP{Low HP?}
+    LowHP -->|No| Walled{Completely walled?}
+    LowHP -->|Yes| SEMove{Opponent has SE?}
+    SEMove -->|Yes| Better1{Better matchup available?}
+    SEMove -->|No| Walled
+    Better1 -->|Yes| Switch
+    Better1 -->|No| Stay
+    Walled -->|Yes| Better2{Better matchup available?}
+    Walled -->|No| Stay
+    Better2 -->|Yes| Switch
+    Better2 -->|No| Stay`}
+</pre>
+</DiagramContainer>
+
+## AI Data Structures
+
+```c
+struct AI_ThinkingStruct
+{
+    u8 aiState;                          // Current AI state
+    u8 movesetIndex;                     // Which move being considered
+    u16 moveConsidered;                  // Current move ID
+    s16 score[MAX_MON_MOVES];           // Score for each move
+    u32 funcResult;                      // Result of AI function
+    u32 aiFlags;                         // Active AI flags
+    u8 aiAction;                         // Chosen action type
+    u8 aiLogicId;                        // Which AI script running
+    u8 filler[6];
+    u8 simulatedDamage[2];              // Predicted damage
+    u8 effectiveness[MAX_MON_MOVES];    // Type effectiveness
+};
+
+struct AI_SavedBattleMon
+{
+    u16 hp;
+    u16 maxHP;
+    u16 speed;
+    u16 moves[MAX_MON_MOVES];
+    u8 level;
+    u8 status1;
+    u32 status2;
+    u8 statStages[NUM_BATTLE_STATS];
+    u8 type1;
+    u8 type2;
+    u16 ability;
+    u16 item;
+};
+```
+
+## AI Scripts Per Trainer Class
+
+Different trainer types use different AI configurations:
+
+| Trainer Class | AI Flags | Description |
+|---------------|----------|-------------|
+| Youngster | CHECK_BAD_MOVE | Basic AI, avoids obvious mistakes |
+| Ace Trainer | CHECK_BAD_MOVE, TRY_TO_FAINT, CHECK_VIABILITY | Smart battler |
+| Gym Leader | All basic + SETUP_FIRST_TURN + HP_AWARE | Strategic play |
+| Elite Four | All flags | Maximum intelligence |
+| Champion | All flags + RISKY | Takes calculated risks |
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `BattleAI_ChooseMoveOrAction()` | battle_ai.c | Main AI entry point |
+| `AI_CheckBadMove()` | battle_ai.c | Filter useless moves |
+| `AI_TryToFaint()` | battle_ai.c | Prioritize KO moves |
+| `AI_CheckViability()` | battle_ai.c | Evaluate move usefulness |
+| `AI_ChooseMoveFromScores()` | battle_ai.c | Select best scoring move |
+| `AI_CalcDamage()` | battle_ai.c | Predict damage output |
+| `ShouldSwitch()` | battle_ai_switch.c | Decide whether to switch |
+| `GetMostSuitableMonToSwitchInto()` | battle_ai_switch.c | Pick best switch-in |
+
+## Debugging AI
+
+To debug AI decisions, you can:
+
+```c
+// Add debug logging
+#ifdef DEBUG_AI
+void LogAIDecision(void)
+{
+    for (u8 i = 0; i < MAX_MON_MOVES; i++)
+    {
+        DebugPrintf("Move %d: %s, Score: %d\n",
+            i,
+            gMoveNames[gBattleMons[sBattler_AI].moves[i]],
+            AI_THINKING_STRUCT->score[i]);
+    }
+}
+#endif
+```

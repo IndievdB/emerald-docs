@@ -1,0 +1,479 @@
+---
+title: "Deep Dive: Callback Pattern"
+description: Comprehensive guide to pokeemerald's callback system for state management
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The callback pattern is fundamental to how pokeemerald organizes code. Rather than a traditional game loop with explicit state management, the game uses function pointers (callbacks) that get swapped to change behavior.
+
+## Core Concept
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph MainLoop["Main Loop"]
+        Read["ReadKeys()"]
+        CB2["callback2()"]
+        CB1["callback1()"]
+        Tasks["RunTasks()"]
+        VB["WaitForVBlank()"]
+    end
+
+    subgraph Callbacks["Active Callbacks"]
+        CB2_Func["CB2_Overworld"]
+        CB1_Func["CB1_Normal"]
+    end
+
+    CB2 --> CB2_Func
+    CB1 --> CB1_Func
+
+    Read --> CB2 --> CB1 --> Tasks --> VB
+
+    style CB2 fill:#9f9,stroke:#333,color:#000
+    style CB1 fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## The Main Structure
+
+```c
+typedef void (*MainCallback)(void);
+typedef void (*IntrCallback)(void);
+
+struct Main
+{
+    MainCallback callback1;        // Secondary callback
+    MainCallback callback2;        // Primary state machine
+    MainCallback savedCallback;    // For temporary transitions
+
+    IntrCallback vblankCallback;   // VBlank interrupt handler
+    IntrCallback hblankCallback;   // HBlank interrupt handler
+    IntrCallback vcountCallback;   // VCount interrupt handler
+    IntrCallback serialCallback;   // Serial interrupt handler
+
+    vu8 state;                     // General state variable
+
+    vu16 heldKeysRaw;              // Currently held buttons
+    vu16 newKeysRaw;               // Just pressed this frame
+    u16 heldKeys;                  // Held keys (debounced)
+    u16 newKeys;                   // New keys (debounced)
+    u16 newAndRepeatedKeys;        // For menu navigation
+
+    vu32 vblankCounter1;           // Frame counter
+    vu32 vblankCounter2;           // Secondary counter
+
+    vu16 intrCheck;                // Interrupt flags
+
+    // ... more fields
+};
+
+struct Main gMain;
+```
+
+## Callback Hierarchy
+
+### callback2 - Primary State Machine
+
+The main game state controller. Each major game mode has its own callback2:
+
+```c
+// Overworld exploration
+void CB2_Overworld(void)
+{
+    RunOverworldScripts();
+    UpdatePlayerMovement();
+    UpdateCameraPosition();
+    ProcessOverworldEvents();
+}
+
+// Battle system
+void CB2_Battle(void)
+{
+    RunBattleMainController();
+    AnimateBattleSprites();
+}
+
+// Menu/UI
+void CB2_StartMenu(void)
+{
+    RunStartMenuStateMachine();
+}
+```
+
+### callback1 - Secondary Processing
+
+Additional per-frame processing, often used for animations or transitions:
+
+```c
+// Standard callback1 - updates overworld graphics
+void CB1_Overworld(void)
+{
+    DrawOverworldObjects();
+    UpdateMapScrolling();
+}
+
+// During fades - minimal processing
+void CB1_FadeOut(void)
+{
+    // Just wait for fade
+}
+```
+
+## State Transitions
+
+<DiagramContainer>
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> TitleScreen
+    TitleScreen --> MainMenu: Press Start
+    MainMenu --> Overworld: Continue
+    MainMenu --> NewGame: New Game
+    NewGame --> Overworld: Intro Complete
+    Overworld --> Battle: Wild Encounter
+    Overworld --> BagMenu: Open Bag
+    Overworld --> PokemonMenu: Open Party
+    Battle --> Overworld: Battle End
+    BagMenu --> Overworld: Close
+    PokemonMenu --> Overworld: Close`}
+</pre>
+</DiagramContainer>
+
+## Changing Callbacks
+
+### SetMainCallback2
+
+```c
+void SetMainCallback2(MainCallback callback)
+{
+    gMain.callback2 = callback;
+    gMain.state = 0;  // Reset state machine
+}
+
+// Example: Enter battle from overworld
+void StartWildBattle(void)
+{
+    // Save current state
+    gMain.savedCallback = gMain.callback2;
+
+    // Initialize battle
+    CreateBattleStartTask();
+
+    // Switch to battle callback
+    SetMainCallback2(CB2_InitBattle);
+}
+```
+
+### SetMainCallback1
+
+```c
+void SetMainCallback1(MainCallback callback)
+{
+    gMain.callback1 = callback;
+}
+
+// Example: Setup for animation
+SetMainCallback1(CB1_AnimateTransition);
+```
+
+## Common Callback Patterns
+
+### State Machine Pattern
+
+```c
+void CB2_SomeMenu(void)
+{
+    switch (gMain.state)
+    {
+    case 0:
+        // Initialize
+        InitMenuGraphics();
+        LoadMenuPalettes();
+        gMain.state++;
+        break;
+
+    case 1:
+        // Wait for graphics
+        if (IsGraphicsLoadComplete())
+            gMain.state++;
+        break;
+
+    case 2:
+        // Main menu loop
+        HandleMenuInput();
+        break;
+    }
+
+    // Common per-frame updates
+    AnimateSprites();
+    BuildOamBuffer();
+    RunTasks();
+    UpdatePaletteFade();
+}
+```
+
+### Fade Transition Pattern
+
+```c
+void CB2_InitSomeScreen(void)
+{
+    switch (gMain.state)
+    {
+    case 0:
+        SetVBlankCallback(NULL);  // Disable during setup
+        ResetBGsAndClearDma3BusyFlags();
+        gMain.state++;
+        break;
+
+    case 1:
+        ResetPaletteFade();
+        ResetSpriteData();
+        ResetTasks();
+        gMain.state++;
+        break;
+
+    case 2:
+        LoadGraphics();
+        gMain.state++;
+        break;
+
+    case 3:
+        SetVBlankCallback(VBlankCB_Normal);
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_BLACK);
+        SetMainCallback2(CB2_SomeScreenMain);
+        break;
+    }
+}
+
+void CB2_ExitSomeScreen(void)
+{
+    BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
+    SetMainCallback2(CB2_ExitFadeWait);
+}
+
+void CB2_ExitFadeWait(void)
+{
+    if (!gPaletteFade.active)
+    {
+        // Return to saved callback
+        SetMainCallback2(gMain.savedCallback);
+    }
+
+    UpdatePaletteFade();
+}
+```
+
+### Saved Callback Pattern
+
+```c
+// Enter a sub-screen, remembering where to return
+void OpenSubScreen(void)
+{
+    gMain.savedCallback = gMain.callback2;
+    SetMainCallback2(CB2_SubScreen);
+}
+
+// Return to previous screen
+void CloseSubScreen(void)
+{
+    SetMainCallback2(gMain.savedCallback);
+}
+```
+
+## VBlank Callback
+
+Critical for synchronized graphics updates:
+
+```c
+void SetVBlankCallback(IntrCallback callback)
+{
+    gMain.vblankCallback = callback;
+}
+
+// Called from VBlank interrupt
+static void VBlankIntr(void)
+{
+    // ... interrupt handling ...
+
+    if (gMain.vblankCallback)
+        gMain.vblankCallback();
+
+    // ... more processing ...
+}
+
+// Typical VBlank callback
+void VBlankCB_Battle(void)
+{
+    LoadOam();                    // Copy sprites to OAM
+    ProcessSpriteCopyRequests();  // Async sprite loading
+    TransferPlttBuffer();         // Copy palettes
+}
+```
+
+## Callback Integration
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant ML as Main Loop
+    participant CB2 as callback2
+    participant CB1 as callback1
+    participant Tasks as RunTasks
+    participant VB as VBlankIntr
+    participant VBCB as vblankCallback
+
+    loop Every Frame
+        ML->>ML: ReadKeys()
+        ML->>CB2: gMain.callback2()
+        CB2->>CB2: State machine logic
+        ML->>CB1: gMain.callback1()
+        CB1->>CB1: Render updates
+        ML->>Tasks: RunTasks()
+        Tasks->>Tasks: Execute task queue
+        ML->>ML: AnimateSprites()
+        ML->>ML: BuildOamBuffer()
+        ML->>ML: WaitForVBlank()
+
+        Note over VB: Hardware VBlank
+        VB->>VB: Interrupt fires
+        VB->>VBCB: gMain.vblankCallback()
+        VBCB->>VBCB: Transfer to hardware
+    end`}
+</pre>
+</DiagramContainer>
+
+## Common Callbacks by Context
+
+### Overworld
+
+```c
+// Main callbacks
+CB2_Overworld           // Exploration state machine
+CB2_LoadMap             // Map loading
+CB2_DoChangeMap         // Map transition
+
+// VBlank
+VBlankCB_Main           // Standard VBlank
+VBlankCB_Overworld      // Overworld-specific
+
+// Callback1
+CB1_Overworld           // Scroll and render
+CB1_OverworldFadeIn     // Fade from black
+CB1_OverworldFadeOut    // Fade to black
+```
+
+### Battle
+
+```c
+// Main callbacks
+CB2_InitBattle          // Setup battle
+CB2_HandleStartBattle   // Start animation
+CB2_Battle              // Main battle loop
+CB2_EndBattle           // Cleanup
+
+// VBlank
+VBlankCB_Battle         // Battle graphics sync
+```
+
+### Menus
+
+```c
+// Main callbacks
+CB2_InitStartMenu       // Pause menu
+CB2_PartyMenu           // Pokemon menu
+CB2_Bag                 // Item bag
+CB2_PokedexScreen       // Pokedex
+
+// Most menus use a single VBlank callback
+VBlankCB_Generic        // Generic UI VBlank
+```
+
+## Best Practices
+
+### Clean State Transitions
+
+```c
+// GOOD: Clear reset before new state
+void EnterNewGameMode(void)
+{
+    // Disable interrupts during setup
+    SetVBlankCallback(NULL);
+
+    // Reset all systems
+    ResetBGsAndClearDma3BusyFlags();
+    ResetPaletteFade();
+    ResetSpriteData();
+    ResetTasks();
+
+    // Setup new state
+    InitNewMode();
+
+    // Re-enable
+    SetVBlankCallback(VBlankCB_NewMode);
+    SetMainCallback2(CB2_NewMode);
+}
+```
+
+### Null Safety
+
+```c
+// Main loop checks for NULL
+void DoMainLoop(void)
+{
+    if (gMain.callback2)
+        gMain.callback2();
+
+    if (gMain.callback1)
+        gMain.callback1();
+}
+```
+
+### Avoiding Callback Loops
+
+```c
+// BAD: Can cause infinite loops
+void CB2_StateA(void)
+{
+    if (condition)
+        SetMainCallback2(CB2_StateB);
+}
+
+void CB2_StateB(void)
+{
+    if (!condition)
+        SetMainCallback2(CB2_StateA);  // Immediate switch back!
+}
+
+// GOOD: Use state variable for delays
+void CB2_StateA(void)
+{
+    switch (gMain.state)
+    {
+    case 0:
+        if (condition)
+        {
+            gMain.state++;
+        }
+        break;
+    case 1:
+        SetMainCallback2(CB2_StateB);
+        break;
+    }
+}
+```
+
+## Callback vs Task
+
+| Aspect | Callback | Task |
+|--------|----------|------|
+| Quantity | Single active | Up to 16 concurrent |
+| Purpose | Game state control | Independent operations |
+| State | gMain.state or internal | data[0-15] fields |
+| Priority | Fixed order | Configurable priority |
+| Lifecycle | Manual swap | Create/Destroy |
+
+## Related Topics
+
+- [Main Loop](/game-flow/main-loop) - Callback execution context
+- [Task System](/deep-dives/task-system) - Concurrent operations
+- [State Machine](/game-flow/state-machine) - State management overview

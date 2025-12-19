@@ -1,0 +1,520 @@
+---
+title: Stats Calculation
+description: How Pokemon battle stats are calculated from base stats, IVs, EVs, level, and nature
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon stats are not stored directly in the save data. Instead, they are calculated from several components: base stats (species-specific), IVs (random), EVs (earned through battle), level, and nature. This page documents the exact formulas used.
+
+## Stat Formula Overview
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph Inputs["Stat Inputs"]
+        BS["Base Stat<br/>(Species)"]
+        IV["IV<br/>(0-31)"]
+        EV["EV<br/>(0-255)"]
+        LV["Level<br/>(1-100)"]
+        NT["Nature<br/>(25 types)"]
+    end
+
+    subgraph Calc["Calculation"]
+        F["Stat Formula"]
+    end
+
+    subgraph Output["Output"]
+        ST["Final Stat"]
+    end
+
+    BS --> F
+    IV --> F
+    EV --> F
+    LV --> F
+    NT --> F
+    F --> ST
+
+    style BS fill:#f99,stroke:#333,color:#000
+    style IV fill:#9f9,stroke:#333,color:#000
+    style EV fill:#99f,stroke:#333,color:#000
+    style LV fill:#ff9,stroke:#333,color:#000
+    style NT fill:#f9f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## HP Formula
+
+HP uses a unique formula different from other stats:
+
+```
+HP = floor((2 * Base + IV + floor(EV/4)) * Level / 100) + Level + 10
+```
+
+**Exception:** Shedinja always has exactly 1 HP regardless of level, IVs, or EVs.
+
+### Code Implementation
+
+```c
+if (species == SPECIES_SHEDINJA)
+{
+    newMaxHP = 1;
+}
+else
+{
+    s32 n = 2 * gSpeciesInfo[species].baseHP + hpIV;
+    newMaxHP = (((n + hpEV / 4) * level) / 100) + level + 10;
+}
+```
+
+### Example Calculation
+
+For a level 50 Pikachu (Base HP: 35) with 31 IV and 252 EVs:
+
+```
+HP = floor((2*35 + 31 + floor(252/4)) * 50 / 100) + 50 + 10
+   = floor((70 + 31 + 63) * 50 / 100) + 60
+   = floor(164 * 50 / 100) + 60
+   = floor(8200 / 100) + 60
+   = 82 + 60
+   = 142
+```
+
+## Other Stats Formula
+
+Attack, Defense, Speed, Sp. Attack, and Sp. Defense all use this formula:
+
+```
+Stat = floor((floor((2 * Base + IV + floor(EV/4)) * Level / 100) + 5) * Nature)
+```
+
+Where Nature is 1.1, 1.0, or 0.9 depending on the nature.
+
+### Code Implementation
+
+```c
+#define CALC_STAT(base, iv, ev, statIndex, field)               \
+{                                                               \
+    u8 baseStat = gSpeciesInfo[species].base;                   \
+    s32 n = (((2 * baseStat + iv + ev / 4) * level) / 100) + 5; \
+    u8 nature = GetNature(mon);                                 \
+    n = ModifyStatByNature(nature, n, statIndex);               \
+    SetMonData(mon, field, &n);                                 \
+}
+```
+
+### Nature Modifier
+
+```c
+u16 ModifyStatByNature(u8 nature, u16 stat, u8 statIndex)
+{
+    u16 retVal;
+
+    // Don't modify HP, Accuracy, or Evasion by nature
+    if (statIndex <= STAT_HP || statIndex > NUM_NATURE_STATS)
+        return stat;
+
+    switch (gNatureStatTable[nature][statIndex - 1])
+    {
+    case 1:   // Boosted stat
+        retVal = stat * 110;
+        retVal /= 100;
+        break;
+    case -1:  // Hindered stat
+        retVal = stat * 90;
+        retVal /= 100;
+        break;
+    default:  // Neutral
+        retVal = stat;
+        break;
+    }
+
+    return retVal;
+}
+```
+
+## Nature Effects
+
+Each nature boosts one stat by 10% and reduces another by 10%. Five natures are neutral (no effect):
+
+```c
+const s8 gNatureStatTable[NUM_NATURES][NUM_NATURE_STATS] =
+{                      // Attack  Defense  Speed  Sp.Atk  Sp.Def
+    [NATURE_HARDY]   = {    0,      0,      0,      0,      0   },
+    [NATURE_LONELY]  = {   +1,     -1,      0,      0,      0   },
+    [NATURE_BRAVE]   = {   +1,      0,     -1,      0,      0   },
+    [NATURE_ADAMANT] = {   +1,      0,      0,     -1,      0   },
+    [NATURE_NAUGHTY] = {   +1,      0,      0,      0,     -1   },
+    [NATURE_BOLD]    = {   -1,     +1,      0,      0,      0   },
+    [NATURE_DOCILE]  = {    0,      0,      0,      0,      0   },
+    [NATURE_RELAXED] = {    0,     +1,     -1,      0,      0   },
+    [NATURE_IMPISH]  = {    0,     +1,      0,     -1,      0   },
+    [NATURE_LAX]     = {    0,     +1,      0,      0,     -1   },
+    [NATURE_TIMID]   = {   -1,      0,     +1,      0,      0   },
+    [NATURE_HASTY]   = {    0,     -1,     +1,      0,      0   },
+    [NATURE_SERIOUS] = {    0,      0,      0,      0,      0   },
+    [NATURE_JOLLY]   = {    0,      0,     +1,     -1,      0   },
+    [NATURE_NAIVE]   = {    0,      0,     +1,      0,     -1   },
+    [NATURE_MODEST]  = {   -1,      0,      0,     +1,      0   },
+    [NATURE_MILD]    = {    0,     -1,      0,     +1,      0   },
+    [NATURE_QUIET]   = {    0,      0,     -1,     +1,      0   },
+    [NATURE_BASHFUL] = {    0,      0,      0,      0,      0   },
+    [NATURE_RASH]    = {    0,      0,      0,     +1,     -1   },
+    [NATURE_CALM]    = {   -1,      0,      0,      0,     +1   },
+    [NATURE_GENTLE]  = {    0,     -1,      0,      0,     +1   },
+    [NATURE_SASSY]   = {    0,      0,     -1,      0,     +1   },
+    [NATURE_CAREFUL] = {    0,      0,      0,     -1,     +1   },
+    [NATURE_QUIRKY]  = {    0,      0,      0,      0,      0   },
+};
+```
+
+### Nature Reference Table
+
+| Nature | +10% | -10% |
+|--------|------|------|
+| Hardy | - | - |
+| Lonely | Attack | Defense |
+| Brave | Attack | Speed |
+| Adamant | Attack | Sp. Atk |
+| Naughty | Attack | Sp. Def |
+| Bold | Defense | Attack |
+| Docile | - | - |
+| Relaxed | Defense | Speed |
+| Impish | Defense | Sp. Atk |
+| Lax | Defense | Sp. Def |
+| Timid | Speed | Attack |
+| Hasty | Speed | Defense |
+| Serious | - | - |
+| Jolly | Speed | Sp. Atk |
+| Naive | Speed | Sp. Def |
+| Modest | Sp. Atk | Attack |
+| Mild | Sp. Atk | Defense |
+| Quiet | Sp. Atk | Speed |
+| Bashful | - | - |
+| Rash | Sp. Atk | Sp. Def |
+| Calm | Sp. Def | Attack |
+| Gentle | Sp. Def | Defense |
+| Sassy | Sp. Def | Speed |
+| Careful | Sp. Def | Sp. Atk |
+| Quirky | - | - |
+
+### Nature from Personality
+
+Nature is derived from the personality value:
+
+```c
+#define GetNatureFromPersonality(personality) ((personality) % NUM_NATURES)
+
+// NUM_NATURES = 25
+u8 nature = personality % 25;
+```
+
+## Individual Values (IVs)
+
+IVs are random values (0-31) assigned when a Pokemon is created. They provide hidden stat variation between Pokemon of the same species.
+
+### IV Storage
+
+IVs are packed into a single 32-bit value in Substruct 3:
+
+```c
+u32 hpIV:5;        // Bits 0-4
+u32 attackIV:5;    // Bits 5-9
+u32 defenseIV:5;   // Bits 10-14
+u32 speedIV:5;     // Bits 15-19
+u32 spAttackIV:5;  // Bits 20-24
+u32 spDefenseIV:5; // Bits 25-29
+u32 isEgg:1;       // Bit 30
+u32 abilityNum:1;  // Bit 31
+```
+
+### IV Generation
+
+When a Pokemon is created, IVs can be random or fixed:
+
+```c
+// Random IVs (wild Pokemon, bred Pokemon)
+for (i = 0; i < NUM_STATS; i++)
+    SetMonData(mon, MON_DATA_HP_IV + i, &Random());
+
+// Fixed IVs (e.g., gift Pokemon, legendaries in some games)
+void CreateMon(..., u8 fixedIV, ...)
+{
+    if (fixedIV < MAX_PER_STAT_IVS)
+    {
+        for (i = 0; i < NUM_STATS; i++)
+            SetBoxMonData(boxMon, MON_DATA_HP_IV + i, &fixedIV);
+    }
+    else  // Random
+    {
+        u32 iv;
+        for (i = 0; i < NUM_STATS; i++)
+        {
+            iv = Random() % (MAX_PER_STAT_IVS + 1);
+            SetBoxMonData(boxMon, MON_DATA_HP_IV + i, &iv);
+        }
+    }
+}
+```
+
+### IV Impact
+
+The difference between 0 and 31 IVs at level 100:
+
+```
+Stat difference = floor(31 * 100 / 100) = 31 points
+```
+
+At level 50:
+
+```
+Stat difference = floor(31 * 50 / 100) = 15 points
+```
+
+## Effort Values (EVs)
+
+EVs are earned by defeating Pokemon and provide significant stat boosts.
+
+### EV Limits
+
+```c
+#define MAX_PER_STAT_EVS  255   // Max EVs in one stat
+#define MAX_TOTAL_EVS     510   // Max total EVs across all stats
+#define EV_EFFECTIVE_CAP  252   // EVs above 252 have no effect
+```
+
+EVs above 252 waste points because:
+```
+floor(255/4) = 63
+floor(252/4) = 63   // Same result
+```
+
+### EV Impact
+
+The maximum stat boost from EVs at level 100:
+
+```
+EV contribution = floor(252/4) = 63 points
+```
+
+At level 50:
+
+```
+EV contribution = floor(63 * 50 / 100) = 31 points
+```
+
+## The CalculateMonStats Function
+
+This is the complete function that recalculates all stats:
+
+```c
+void CalculateMonStats(struct Pokemon *mon)
+{
+    // Get current values
+    s32 oldMaxHP = GetMonData(mon, MON_DATA_MAX_HP, NULL);
+    s32 currentHP = GetMonData(mon, MON_DATA_HP, NULL);
+
+    // Get all IVs
+    s32 hpIV = GetMonData(mon, MON_DATA_HP_IV, NULL);
+    s32 attackIV = GetMonData(mon, MON_DATA_ATK_IV, NULL);
+    s32 defenseIV = GetMonData(mon, MON_DATA_DEF_IV, NULL);
+    s32 speedIV = GetMonData(mon, MON_DATA_SPEED_IV, NULL);
+    s32 spAttackIV = GetMonData(mon, MON_DATA_SPATK_IV, NULL);
+    s32 spDefenseIV = GetMonData(mon, MON_DATA_SPDEF_IV, NULL);
+
+    // Get all EVs
+    s32 hpEV = GetMonData(mon, MON_DATA_HP_EV, NULL);
+    s32 attackEV = GetMonData(mon, MON_DATA_ATK_EV, NULL);
+    s32 defenseEV = GetMonData(mon, MON_DATA_DEF_EV, NULL);
+    s32 speedEV = GetMonData(mon, MON_DATA_SPEED_EV, NULL);
+    s32 spAttackEV = GetMonData(mon, MON_DATA_SPATK_EV, NULL);
+    s32 spDefenseEV = GetMonData(mon, MON_DATA_SPDEF_EV, NULL);
+
+    // Get species and calculate level from EXP
+    u16 species = GetMonData(mon, MON_DATA_SPECIES, NULL);
+    s32 level = GetLevelFromMonExp(mon);
+    s32 newMaxHP;
+
+    // Update stored level
+    SetMonData(mon, MON_DATA_LEVEL, &level);
+
+    // Calculate HP (special case for Shedinja)
+    if (species == SPECIES_SHEDINJA)
+    {
+        newMaxHP = 1;
+    }
+    else
+    {
+        s32 n = 2 * gSpeciesInfo[species].baseHP + hpIV;
+        newMaxHP = (((n + hpEV / 4) * level) / 100) + level + 10;
+    }
+
+    // Update max HP
+    SetMonData(mon, MON_DATA_MAX_HP, &newMaxHP);
+
+    // Calculate other stats using the CALC_STAT macro
+    CALC_STAT(baseAttack, attackIV, attackEV, STAT_ATK, MON_DATA_ATK)
+    CALC_STAT(baseDefense, defenseIV, defenseEV, STAT_DEF, MON_DATA_DEF)
+    CALC_STAT(baseSpeed, speedIV, speedEV, STAT_SPEED, MON_DATA_SPEED)
+    CALC_STAT(baseSpAttack, spAttackIV, spAttackEV, STAT_SPATK, MON_DATA_SPATK)
+    CALC_STAT(baseSpDefense, spDefenseIV, spDefenseEV, STAT_SPDEF, MON_DATA_SPDEF)
+
+    // Handle HP changes
+    if (species == SPECIES_SHEDINJA)
+    {
+        if (currentHP != 0 || oldMaxHP == 0)
+            currentHP = 1;
+        else
+            return;
+    }
+    else
+    {
+        if (currentHP == 0 && oldMaxHP == 0)
+        {
+            // New Pokemon: full HP
+            currentHP = newMaxHP;
+        }
+        else if (currentHP != 0)
+        {
+            // Existing Pokemon: adjust HP proportionally
+            // BUG: Can become negative (Pomeg glitch)
+            currentHP += newMaxHP - oldMaxHP;
+        }
+        else
+        {
+            // Fainted: stay fainted
+            return;
+        }
+    }
+
+    SetMonData(mon, MON_DATA_HP, &currentHP);
+}
+```
+
+## When Stats Are Recalculated
+
+Stats are recalculated whenever relevant data changes:
+
+```c
+// After creating a new Pokemon
+CreateMon(mon, species, level, ...);  // Calls CalculateMonStats internally
+
+// After modifying IVs
+SetMonData(mon, MON_DATA_HP_IV, &newIV);
+CalculateMonStats(mon);
+
+// After gaining EVs
+SetMonData(mon, MON_DATA_ATK_EV, &newEV);
+CalculateMonStats(mon);
+
+// After leveling up (level derived from EXP)
+SetMonData(mon, MON_DATA_EXP, &newExp);
+CalculateMonStats(mon);
+
+// After using stat-boosting items (Rare Candy, vitamins)
+CalculateMonStats(mon);
+
+// When withdrawing from PC (stats aren't stored in BoxPokemon)
+void BoxMonToMon(struct BoxPokemon *src, struct Pokemon *dest)
+{
+    dest->box = *src;
+    CalculateMonStats(dest);
+}
+```
+
+## Level Calculation
+
+Level is not stored directly—it's calculated from EXP:
+
+```c
+u8 GetLevelFromMonExp(struct Pokemon *mon)
+{
+    u16 species = GetMonData(mon, MON_DATA_SPECIES, NULL);
+    u32 exp = GetMonData(mon, MON_DATA_EXP, NULL);
+    s32 level = 1;
+
+    // Find highest level where required EXP <= current EXP
+    while (level <= MAX_LEVEL &&
+           gExperienceTables[gSpeciesInfo[species].growthRate][level] <= exp)
+        level++;
+
+    return level - 1;
+}
+```
+
+## The Pomeg Glitch
+
+A notable bug in the stat calculation:
+
+```c
+else if (currentHP != 0)
+{
+    // BUG: currentHP can become <= 0 if newMaxHP < oldMaxHP
+    currentHP += newMaxHP - oldMaxHP;
+
+    #ifdef BUGFIX
+    if (currentHP <= 0)
+        currentHP = 1;
+    #endif
+}
+```
+
+If you reduce HP EVs (using Pomeg Berry) when the Pokemon has low HP, the formula can produce negative HP. The game doesn't check for this, allowing Pokemon to enter battles with 0 or "negative" HP (wrapping to large positive values due to unsigned arithmetic).
+
+## Stat Caps
+
+While the formulas have no explicit caps, practical limits exist:
+
+| Stat | Theoretical Max | Practical Max |
+|------|-----------------|---------------|
+| HP | ~715 (Blissey) | Blissey, Lv.100, 31 IV, 252 EV |
+| Attack | ~504 | Deoxys-Attack form (not in Emerald) |
+| Defense | ~505 | Shuckle |
+| Speed | ~504 | Deoxys-Speed form (not in Emerald) |
+| Sp. Atk | ~504 | Deoxys-Attack form |
+| Sp. Def | ~505 | Shuckle |
+
+In base Emerald (without form changes), the highest stats come from:
+- **HP**: Blissey (255 base)
+- **Attack**: Slaking (160 base)
+- **Defense**: Shuckle (230 base)
+- **Speed**: Ninjask (160 base)
+- **Sp. Atk**: Alakazam (135 base)
+- **Sp. Def**: Shuckle (230 base)
+
+## Complete Example
+
+Calculate all stats for a level 50 Pikachu:
+- IVs: All 31
+- EVs: 252 Speed, 252 Sp.Atk, 4 HP
+- Nature: Timid (+Speed, -Attack)
+
+**Base Stats:** HP 35, Atk 55, Def 30, Spd 90, SpA 50, SpD 40
+
+```
+HP  = floor((2*35 + 31 + 1) * 50/100) + 50 + 10
+    = floor(102 * 0.5) + 60 = 51 + 60 = 111
+
+Atk = floor((2*55 + 31 + 0) * 50/100 + 5) * 0.9
+    = floor(141 * 0.5 + 5) * 0.9 = 75 * 0.9 = 67
+
+Def = floor((2*30 + 31 + 0) * 50/100 + 5) * 1.0
+    = floor(91 * 0.5 + 5) = 50
+
+Spd = floor((2*90 + 31 + 63) * 50/100 + 5) * 1.1
+    = floor(274 * 0.5 + 5) * 1.1 = 142 * 1.1 = 156
+
+SpA = floor((2*50 + 31 + 63) * 50/100 + 5) * 1.0
+    = floor(194 * 0.5 + 5) = 102
+
+SpD = floor((2*40 + 31 + 0) * 50/100 + 5) * 1.0
+    = floor(111 * 0.5 + 5) = 60
+```
+
+**Final Stats:** HP 111, Atk 67, Def 50, Spd 156, SpA 102, SpD 60
+
+## Related Topics
+
+- [Pokemon Data Structures](/pokemon/data-structures) - Where IVs and EVs are stored
+- [Species Data](/pokemon/species-data) - Base stats and growth rates
+- [Encryption](/pokemon/encryption) - How Pokemon data is protected

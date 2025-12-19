@@ -1,0 +1,418 @@
+---
+title: "Deep Dive: RNG System"
+description: Random number generation in pokeemerald - LCRNG algorithm, seeding, and manipulation
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon Emerald uses a Linear Congruential Random Number Generator (LCRNG) for all randomness. Understanding this system is essential for RNG manipulation, speedrunning, and accurate emulation.
+
+## The Algorithm
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph LCRNG["Linear Congruential Generator"]
+        Seed["Current Seed<br/>gRngValue"]
+        Mult["× 1103515245"]
+        Add["+ 24691"]
+        Mod["mod 2³²"]
+        Shift[">> 16"]
+        Result["Return Value<br/>(0-65535)"]
+    end
+
+    Seed --> Mult --> Add --> Mod --> Seed
+    Mod --> Shift --> Result
+
+    style Seed fill:#9f9,stroke:#333,color:#000
+    style Result fill:#99f,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Core Implementation
+
+```c
+// Global RNG state (32-bit seed)
+EWRAM_DATA static u32 gRngValue = 0;
+
+// Main RNG function
+u16 Random(void)
+{
+    gRngValue = gRngValue * 1103515245 + 24691;
+    return gRngValue >> 16;  // Return high 16 bits
+}
+```
+
+### Mathematical Properties
+
+| Property | Value |
+|----------|-------|
+| Multiplier | 1103515245 (0x41C64E6D) |
+| Increment | 24691 (0x6073) |
+| Modulus | 2³² (implicit via u32 overflow) |
+| Period | 2³² (4,294,967,296 states) |
+| Output range | 0-65535 (16-bit) |
+
+## RNG Advancement
+
+The RNG advances once per call to `Random()`:
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Game
+    participant RNG as gRngValue
+
+    Note over RNG: Seed: 0x00000000
+    Game->>RNG: Random()
+    Note over RNG: 0x00000000 * 0x41C64E6D + 0x6073
+    Note over RNG: Seed: 0x00006073
+    RNG-->>Game: Return 0x0000
+
+    Game->>RNG: Random()
+    Note over RNG: 0x00006073 * 0x41C64E6D + 0x6073
+    Note over RNG: Seed: 0xE97E7B6A
+    RNG-->>Game: Return 0xE97E`}
+</pre>
+</DiagramContainer>
+
+## Seeding
+
+### Initial Seed
+
+```c
+void SeedRng(u32 seed)
+{
+    gRngValue = seed;
+}
+
+// Alternative seeding function
+void SeedRngAndSteps(u32 seed, u16 steps)
+{
+    gRngValue = seed;
+    while (steps--)
+        Random();  // Advance by steps
+}
+```
+
+### Frame-Based Seeding
+
+At game start, the seed is influenced by timing:
+
+```c
+void InitRng(void)
+{
+    // Seed from RTC and frame timing
+    u32 seed = (gSaveBlock1Ptr->timePlayed.hours << 24) |
+               (gSaveBlock1Ptr->timePlayed.minutes << 16) |
+               (gSaveBlock1Ptr->timePlayed.seconds << 8) |
+               gMain.vblankCounter1;
+
+    SeedRng(seed);
+}
+```
+
+## Utility Functions
+
+### Random in Range
+
+```c
+// Get random number from 0 to limit-1
+u16 Random32(void)
+{
+    return Random();
+}
+
+// Get random number from 0 to range-1
+u16 RandomInRange(u16 range)
+{
+    return Random() % range;
+}
+
+// More uniform distribution (avoids modulo bias)
+u16 RandomUniformRange(u16 range)
+{
+    u32 rand;
+    u32 limit = (0x10000 / range) * range;
+
+    do {
+        rand = Random();
+    } while (rand >= limit);
+
+    return rand % range;
+}
+```
+
+### Random Percentage
+
+```c
+// Returns TRUE with probability percent/100
+bool8 RandomChance(u8 percent)
+{
+    return Random() % 100 < percent;
+}
+```
+
+## RNG Usage Examples
+
+### Wild Encounter Check
+
+```c
+bool8 DoWildEncounterCheck(u16 rate)
+{
+    // Encounter rate is 0-2880 typically
+    u16 rand = Random() % 2880;
+
+    if (rand < rate)
+        return TRUE;  // Encounter happens
+
+    return FALSE;
+}
+```
+
+### Damage Calculation
+
+```c
+u32 CalculateDamageRandomFactor(u32 damage)
+{
+    // Damage varies 85-100%
+    u16 rand = Random() % 16;  // 0-15
+    u32 factor = 85 + rand;    // 85-100
+
+    return (damage * factor) / 100;
+}
+```
+
+### Shiny Determination
+
+```c
+bool8 IsShinyOtIdPersonality(u32 otId, u32 personality)
+{
+    // XOR components
+    u16 p1 = personality >> 16;
+    u16 p2 = personality & 0xFFFF;
+    u16 t1 = otId >> 16;
+    u16 t2 = otId & 0xFFFF;
+
+    // Shiny if (p1 ^ p2 ^ t1 ^ t2) < 8
+    return (p1 ^ p2 ^ t1 ^ t2) < 8;
+}
+```
+
+### Nature Calculation
+
+```c
+u8 GetNatureFromPersonality(u32 personality)
+{
+    // Nature is personality % 25
+    return personality % 25;
+}
+```
+
+## RNG Manipulation
+
+### Predicting Future Values
+
+Since LCRNG is deterministic, future values can be predicted:
+
+```c
+// Calculate N steps ahead without modifying state
+u32 PeekRng(u32 seed, u32 advances)
+{
+    while (advances--)
+    {
+        seed = seed * 1103515245 + 24691;
+    }
+    return seed >> 16;
+}
+```
+
+### Reverse Calculation
+
+Find previous seed from current:
+
+```c
+// Inverse multiplier for reversal
+#define RNG_INVERSE_MULT 0xEEB9EB65u
+
+u32 ReverseRng(u32 seed)
+{
+    // Work backwards one step
+    return (seed - 24691) * RNG_INVERSE_MULT;
+}
+```
+
+### RNG Frame Table
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Frames["RNG Advancement Per Frame"]
+        VBlank["VBlank: +1 (Random call)"]
+        BGM["Sound processing: +0-3"]
+        Overworld["Overworld: +1-5 (NPCs, grass)"]
+        Battle["Battle: varies by action"]
+    end
+
+    subgraph Predictable["Predictable Sources"]
+        Timer["Frame counter"]
+        Input["No input: deterministic"]
+    end
+
+    subgraph Unpredictable["Variable Sources"]
+        NPC["NPC movement"]
+        AI["AI decisions"]
+    end
+
+    style VBlank fill:#9f9,stroke:#333,color:#000
+    style Unpredictable fill:#f99,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## Secondary RNG (RNG2)
+
+A second RNG instance exists for specific uses:
+
+```c
+EWRAM_DATA static u32 gRng2Value = 0;
+
+// Second independent RNG
+u16 Random2(void)
+{
+    gRng2Value = gRng2Value * 1103515245 + 24691;
+    return gRng2Value >> 16;
+}
+
+void SeedRng2(u32 seed)
+{
+    gRng2Value = seed;
+}
+```
+
+Used primarily for:
+- Pokemon generation during eggs
+- Certain battle calculations
+- Features that shouldn't affect main RNG
+
+## Battle RNG
+
+Special handling for multiplayer fairness:
+
+```c
+// In link battles, RNG syncs between devices
+u16 BattleRandom(void)
+{
+    if (gBattleTypeFlags & BATTLE_TYPE_LINK)
+    {
+        // Use synced RNG for link battles
+        return SyncedBattleRandom();
+    }
+
+    return Random();
+}
+```
+
+## Common RNG Patterns
+
+### Weighted Random Selection
+
+```c
+u8 WeightedRandom(const u8 *weights, u8 count)
+{
+    u16 total = 0;
+
+    // Sum all weights
+    for (u8 i = 0; i < count; i++)
+        total += weights[i];
+
+    // Pick random point
+    u16 rand = Random() % total;
+
+    // Find which bucket
+    total = 0;
+    for (u8 i = 0; i < count; i++)
+    {
+        total += weights[i];
+        if (rand < total)
+            return i;
+    }
+
+    return count - 1;
+}
+```
+
+### Shuffle Array
+
+```c
+void ShuffleArray(u8 *array, u8 count)
+{
+    for (u8 i = count - 1; i > 0; i--)
+    {
+        u8 j = Random() % (i + 1);
+
+        // Swap
+        u8 temp = array[i];
+        array[i] = array[j];
+        array[j] = temp;
+    }
+}
+```
+
+### Random Element Selection
+
+```c
+u8 RandomArrayElement(const u8 *array, u8 count)
+{
+    return array[Random() % count];
+}
+```
+
+## RNG State Diagram
+
+<DiagramContainer>
+<pre class="mermaid">
+{`stateDiagram-v2
+    state "Seed N" as S0
+    state "Seed N+1" as S1
+    state "Seed N+2" as S2
+    state "..." as DOTS
+    state "Seed N+k" as SK
+
+    [*] --> S0: SeedRng(seed)
+    S0 --> S1: Random() returns S0>>16
+    S1 --> S2: Random() returns S1>>16
+    S2 --> DOTS: Random()
+    DOTS --> SK: Random()
+    SK --> S0: After 2^32 calls (full period)`}
+</pre>
+</DiagramContainer>
+
+## Debugging RNG
+
+```c
+// Log RNG calls for debugging
+u16 RandomDebug(void)
+{
+    u32 oldSeed = gRngValue;
+    u16 result = Random();
+
+    mgba_printf("RNG: 0x%08X -> 0x%08X, returned 0x%04X",
+                oldSeed, gRngValue, result);
+
+    return result;
+}
+```
+
+## Known Seed Sequences
+
+| Starting Seed | Sequence (first 5 values) |
+|---------------|---------------------------|
+| 0x00000000 | 0x0000, 0xE97E, 0x0D15, 0xC4AB, 0x8C7F |
+| 0x00000001 | 0x41C6, 0x2B4B, 0x4EC0, 0x0637, 0xCE0A |
+| 0xFFFFFFFF | 0xBE39, 0x7382, 0xDEEA, 0x3B54, 0x0375 |
+
+## Related Topics
+
+- [Pokemon Data](/pokemon/encryption) - Uses RNG for PID generation
+- [Battle System](/battle-system/damage-calculation) - RNG in damage formulas
+- [Wild Encounters](/overworld/wild-encounters) - Encounter rate calculations

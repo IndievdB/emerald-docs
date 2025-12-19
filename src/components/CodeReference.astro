@@ -1,0 +1,31 @@
+---
+interface Props {
+	file: string;
+	startLine?: number;
+	endLine?: number;
+	title?: string;
+}
+
+const { file, startLine, endLine, title } = Astro.props;
+const displayTitle = title || file;
+
+// Construct GitHub URL
+const baseUrl = 'https://github.com/pret/pokeemerald/blob/master/';
+let githubUrl = baseUrl + file;
+if (startLine) {
+	githubUrl += `#L${startLine}`;
+	if (endLine) {
+		githubUrl += `-L${endLine}`;
+	}
+}
+---
+
+<div class="code-reference">
+	<div class="code-reference-header">
+		<span class="code-reference-title">{displayTitle}</span>
+		<a href={githubUrl} target="_blank" rel="noopener noreferrer" class="code-reference-link">
+			View on GitHub
+		</a>
+	</div>
+	<slot />
+</div>

@@ -1,0 +1,295 @@
+---
+title: Sprites
+description: Object rendering on the GBA - OAM, sprite management, and animation
+---
+
+import DiagramContainer from '../../../../components/DiagramContainer.astro';
+
+The GBA displays sprites (officially called OBJs) through the Object Attribute Memory (OAM). Pokemon Emerald wraps this in a high-level sprite system with animation support.
+
+## Hardware Limits
+
+| Resource | Limit |
+|----------|-------|
+| OAM Entries | 128 sprites |
+| OBJ VRAM | 32KB (16KB per bank) |
+| Sprites per scanline | 128 pixels max |
+| Affine matrices | 32 |
+| Max sprite size | 64×64 pixels |
+
+## OAM Structure
+
+Each OAM entry is 8 bytes (3 attributes + rotation data):
+
+```c
+struct OamData
+{
+    // Attribute 0 (2 bytes)
+    u16 y:8;              // Y position (0-255, wraps)
+    u16 affineMode:2;     // 0=normal, 1=affine, 2=disabled, 3=double-size affine
+    u16 objMode:2;        // 0=normal, 1=semi-transparent, 2=OBJ window
+    u16 mosaic:1;         // Mosaic enable
+    u16 bpp:1;            // 0=4bpp (16 colors), 1=8bpp (256 colors)
+    u16 shape:2;          // 0=square, 1=horizontal, 2=vertical
+
+    // Attribute 1 (2 bytes)
+    u16 x:9;              // X position (0-511, wraps)
+    u16 matrixNum:5;      // Affine matrix index (or flip flags)
+    u16 size:2;           // Size within shape
+
+    // Attribute 2 (2 bytes)
+    u16 tileNum:10;       // Starting tile index
+    u16 priority:2;       // 0=highest, 3=lowest
+    u16 paletteNum:4;     // Palette bank (4bpp mode)
+
+    // Attribute 3 (2 bytes) - affine matrix data when not using affine
+    u16 affineParam;
+};
+```
+
+### Sprite Sizes
+
+| Shape | Size 0 | Size 1 | Size 2 | Size 3 |
+|-------|--------|--------|--------|--------|
+| Square | 8×8 | 16×16 | 32×32 | 64×64 |
+| Horizontal | 16×8 | 32×8 | 32×16 | 64×32 |
+| Vertical | 8×16 | 8×32 | 16×32 | 32×64 |
+
+## Pokemon Emerald Sprite System
+
+### Sprite Structure
+
+```c
+struct Sprite
+{
+    struct OamData oam;           // Hardware attributes
+    struct SpriteTemplate *template;
+    struct SubspriteTable *subspriteTables;
+    SpriteCallback callback;      // Per-frame callback
+
+    // Position
+    s16 x, y;                     // Screen position
+    s16 x2, y2;                   // Offset
+    s16 centerToCornerVecX;
+    s16 centerToCornerVecY;
+
+    // Animation
+    u8 animNum;                   // Current animation
+    u8 animCmdIndex;              // Current frame
+    u8 animDelayCounter;          // Frame timing
+
+    // Flags
+    u16 invisible:1;
+    u16 hFlip:1;
+    u16 vFlip:1;
+    u16 animPaused:1;
+
+    // User data
+    s16 data[8];                  // 8 16-bit values for callbacks
+};
+```
+
+### Creating Sprites
+
+```c
+// Sprite template
+const struct SpriteTemplate mySpriteTemplate = {
+    .tileTag = TAG_MY_TILES,
+    .paletteTag = TAG_MY_PALETTE,
+    .oam = &myOamData,
+    .anims = myAnimTable,
+    .images = NULL,
+    .affineAnims = gDummySpriteAffineAnimTable,
+    .callback = SpriteCallbackDummy,
+};
+
+// Create sprite
+u8 spriteId = CreateSprite(&mySpriteTemplate, x, y, subpriority);
+
+// Access sprite
+struct Sprite *sprite = &gSprites[spriteId];
+sprite->callback = MyCallback;
+```
+
+### Sprite Callbacks
+
+Called every frame for each active sprite:
+
+```c
+void MySpriteCallback(struct Sprite *sprite)
+{
+    // Move sprite
+    sprite->x += 1;
+
+    // Check animation
+    if (sprite->animEnded)
+        DestroySprite(sprite);
+
+    // Use data fields for state
+    sprite->data[0]++;  // Timer
+}
+```
+
+### Animations
+
+```c
+// Animation command structure
+const union AnimCmd myAnim[] = {
+    ANIMCMD_FRAME(0, 5),    // Tile 0, 5 frames
+    ANIMCMD_FRAME(1, 5),    // Tile 1, 5 frames
+    ANIMCMD_FRAME(2, 5),    // Tile 2, 5 frames
+    ANIMCMD_LOOP(0),        // Loop from start
+};
+
+const union AnimCmd *const myAnimTable[] = {
+    myAnim,
+    // More animations...
+};
+
+// Play animation
+StartSpriteAnim(sprite, animNum);
+```
+
+## Tile Management
+
+### Loading Tiles
+
+```c
+// Sprite sheet definition
+const struct SpriteSheet mySpriteSheet = {
+    .data = myTileData,
+    .size = 512,         // Size in bytes
+    .tag = TAG_MY_TILES,
+};
+
+// Load to VRAM
+LoadSpriteSheet(&mySpriteSheet);
+```
+
+### Tile Tags
+
+The game uses tags to reference graphics:
+
+```c
+#define TAG_MON_SPRITE_BASE  30000
+
+// Find tile index by tag
+u16 tileNum = GetSpriteTileStartByTag(TAG_MY_TILES);
+```
+
+## Palette Management
+
+```c
+// Sprite palette definition
+const struct SpritePalette myPalette = {
+    .data = myPaletteData,
+    .tag = TAG_MY_PALETTE,
+};
+
+// Load palette
+LoadSpritePalette(&myPalette);
+
+// Get palette index
+u8 palNum = IndexOfSpritePaletteTag(TAG_MY_PALETTE);
+```
+
+## OAM Buffer
+
+The game double-buffers OAM:
+
+```c
+// RAM buffer
+struct OamData gOamBuffer[MAX_SPRITES];
+
+// Build OAM from sprites
+void BuildOamBuffer(void)
+{
+    int i, oamIndex = 0;
+
+    for (i = 0; i < MAX_SPRITES; i++)
+    {
+        struct Sprite *sprite = &gSprites[i];
+        if (sprite->inUse && !sprite->invisible)
+        {
+            gOamBuffer[oamIndex] = sprite->oam;
+            // Apply position
+            gOamBuffer[oamIndex].x = sprite->x + sprite->x2;
+            gOamBuffer[oamIndex].y = sprite->y + sprite->y2;
+            oamIndex++;
+        }
+    }
+
+    // Clear remaining entries
+    for (; oamIndex < MAX_SPRITES; oamIndex++)
+        gOamBuffer[oamIndex].affineMode = ST_OAM_AFFINE_OFF;
+}
+
+// Copy to hardware during VBlank
+void LoadOam(void)
+{
+    DmaCopy32(3, gOamBuffer, (void *)OAM, sizeof(gOamBuffer));
+}
+```
+
+## Affine Sprites
+
+For rotation and scaling:
+
+```c
+// Affine animation commands
+const union AffineAnimCmd myAffineAnim[] = {
+    AFFINEANIMCMD_FRAME(256, 256, 0, 0),  // Scale 1x, no rotation
+    AFFINEANIMCMD_FRAME(0, 0, 4, 16),     // Rotate 90° over 16 frames
+    AFFINEANIMCMD_END,
+};
+
+// Set affine mode
+sprite->oam.affineMode = ST_OAM_AFFINE_NORMAL;
+sprite->oam.matrixNum = GetSpriteMatrixNum(sprite);
+```
+
+## Priority and Sorting
+
+Sprites are sorted by:
+1. Priority (oam.priority, 0-3)
+2. OAM index (lower = on top)
+
+```c
+// Set sprite priority
+sprite->oam.priority = 2;  // Behind priority 0-1 sprites
+
+// Subpriority affects OAM ordering
+sprite->subpriority = 10;
+```
+
+## Common Patterns
+
+### Following Player
+
+```c
+void FollowerSpriteCallback(struct Sprite *sprite)
+{
+    struct ObjectEvent *follower = &gObjectEvents[sprite->data[0]];
+    sprite->x = follower->currentCoords.x * 16 + 8;
+    sprite->y = follower->currentCoords.y * 16 + 8;
+}
+```
+
+### Particle Effects
+
+```c
+void SparkleCallback(struct Sprite *sprite)
+{
+    sprite->data[0]++;  // Timer
+    sprite->y--;        // Float up
+
+    if (sprite->data[0] > 30)
+        DestroySprite(sprite);
+}
+```
+
+## Related Topics
+
+- [Palettes](/gba-hardware/graphics/palettes) - Sprite color management
+- [Backgrounds](/gba-hardware/graphics/backgrounds) - Layer interaction
+- [Sprite System](/deep-dives/sprite-system) - Detailed sprite engine analysis

@@ -1,0 +1,469 @@
+---
+title: Tilesets
+description: Tileset system, metatiles, behaviors, and animations in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Tilesets define the visual appearance of maps. Each map uses two tilesets - a **primary** (shared) and **secondary** (map-specific) - which combine to provide all the graphics needed.
+
+## Tileset Hierarchy
+
+<DiagramContainer title="Tileset Composition">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Tileset["Tileset Structure"]
+        Tiles["8x8 Tiles<br/>(Raw Graphics)"]
+        Metatiles["16x16 Metatiles<br/>(4 tiles each)"]
+        Behaviors["Metatile Behaviors<br/>(Collision, Effects)"]
+        Palettes["Color Palettes<br/>(16 colors each)"]
+        Animations["Tile Animations<br/>(Water, Flowers)"]
+    end
+
+    subgraph Usage["In Maps"]
+        Primary["Primary Tileset<br/>(General tiles)"]
+        Secondary["Secondary Tileset<br/>(Specific tiles)"]
+        MapGrid["Map Grid<br/>(Metatile IDs)"]
+    end
+
+    Tiles --> Metatiles
+    Metatiles --> MapGrid
+    Behaviors --> MapGrid
+    Primary --> MapGrid
+    Secondary --> MapGrid`}
+</pre>
+</DiagramContainer>
+
+## Tileset Structure
+
+```c
+struct Tileset
+{
+    /* 0x00 */ bool8 isCompressed;      // Are tiles LZ77 compressed?
+    /* 0x01 */ bool8 isSecondary;       // Primary (0) or Secondary (1)
+    /* 0x02 */ u8 padding[2];
+    /* 0x04 */ const u32 *tiles;        // 8x8 tile graphics
+    /* 0x08 */ const u16 (*palettes)[16]; // Color palettes
+    /* 0x0C */ const u16 *metatiles;    // Metatile definitions
+    /* 0x10 */ const u16 *metatileAttributes; // Behavior/layer data
+    /* 0x14 */ TilesetCB callback;      // Animation callback
+};
+```
+
+### Primary vs Secondary Tilesets
+
+<DiagramContainer title="Tileset Memory Layout">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph VRAM["VRAM Tile Space (1024 tiles)"]
+        direction TB
+        Primary["Primary Tileset<br/>Tiles 0-511<br/>(512 tiles)"]
+        Secondary["Secondary Tileset<br/>Tiles 512-1023<br/>(512 tiles)"]
+    end
+
+    subgraph Palettes["Palette Slots (13)"]
+        direction TB
+        PrimaryPal["Primary Palettes<br/>Slots 0-5<br/>(6 palettes)"]
+        SecondaryPal["Secondary Palettes<br/>Slots 6-12<br/>(7 palettes)"]
+    end`}
+</pre>
+</DiagramContainer>
+
+| Type | Tiles | Palettes | Purpose |
+|------|-------|----------|---------|
+| Primary | 0-511 | 0-5 | Shared across many maps (grass, paths, water) |
+| Secondary | 512-1023 | 6-12 | Map-specific (buildings, unique features) |
+
+```c
+// Constants
+#define NUM_TILES_IN_PRIMARY    512
+#define NUM_TILES_IN_SECONDARY  512
+#define NUM_PALS_IN_PRIMARY     6
+#define NUM_PALS_IN_SECONDARY   7
+```
+
+<LearnMore title="Why split into two tilesets?" summary="Memory efficiency">
+Splitting allows:
+- Common tiles shared across all maps (less ROM usage)
+- Unique tiles only loaded when needed
+- 1024 total tiles per map (enough for varied visuals)
+
+Examples:
+- Primary: General grass, water, paths (used everywhere)
+- Secondary: Petalburg-specific buildings, Rustboro-specific rocks
+</LearnMore>
+
+## 8x8 Tiles
+
+The base unit of graphics is an 8x8 pixel tile. Each tile uses 4 bits per pixel (16 colors from a palette):
+
+```c
+// Each tile is 32 bytes (8x8 pixels × 4 bits)
+// Stored as raw or LZ77 compressed
+
+// Tile graphics pointer
+const u32 gTileset_General_Tiles[] = {
+    // Raw 4bpp tile data
+};
+```
+
+### Tile Format
+
+```
+One 8x8 tile = 32 bytes
+- 8 rows × 4 bytes per row
+- Each byte contains 2 pixels (4 bits each)
+- Pixel value indexes into 16-color palette
+```
+
+## Metatiles
+
+Metatiles are **16x16 pixel** blocks composed of **four 8x8 tiles**. They are the actual units placed on maps.
+
+<DiagramContainer title="Metatile Composition">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Metatile["One Metatile (16x16)"]
+        direction LR
+        subgraph Bottom["Bottom Layer"]
+            BL[Tile 0]
+            BR[Tile 1]
+            BL2[Tile 2]
+            BR2[Tile 3]
+        end
+        subgraph Top["Top Layer"]
+            TL[Tile 4]
+            TR[Tile 5]
+            TL2[Tile 6]
+            TR2[Tile 7]
+        end
+    end
+
+    Bottom --> |"BG2"| Display
+    Top --> |"BG1"| Display`}
+</pre>
+</DiagramContainer>
+
+### Metatile Data Format
+
+Each metatile uses 16 bytes (8 tile entries × 2 bytes each):
+
+```c
+// One metatile entry (2 bytes)
+// Bits 0-9:   Tile number (0-1023)
+// Bits 10:    X flip
+// Bits 11:    Y flip
+// Bits 12-15: Palette number (0-15)
+
+#define METATILE_TILE_MASK     0x03FF
+#define METATILE_XFLIP_MASK    0x0400
+#define METATILE_YFLIP_MASK    0x0800
+#define METATILE_PALETTE_MASK  0xF000
+```
+
+Example metatile (grass):
+
+```c
+// data/tilesets/primary/general/metatiles.bin
+// Metatile 0x001 - Grass
+{
+    // Bottom layer (BG2)
+    {.tile = 0x10, .xflip = 0, .yflip = 0, .palette = 1}, // Top-left
+    {.tile = 0x11, .xflip = 0, .yflip = 0, .palette = 1}, // Top-right
+    {.tile = 0x12, .xflip = 0, .yflip = 0, .palette = 1}, // Bottom-left
+    {.tile = 0x13, .xflip = 0, .yflip = 0, .palette = 1}, // Bottom-right
+    // Top layer (BG1)
+    {.tile = 0x00, .xflip = 0, .yflip = 0, .palette = 0}, // Transparent
+    {.tile = 0x00, .xflip = 0, .yflip = 0, .palette = 0},
+    {.tile = 0x00, .xflip = 0, .yflip = 0, .palette = 0},
+    {.tile = 0x00, .xflip = 0, .yflip = 0, .palette = 0},
+}
+```
+
+### Layer Types
+
+Metatiles have three layer types controlling which backgrounds they use:
+
+```c
+enum {
+    METATILE_LAYER_TYPE_NORMAL,  // Middle (BG2) + Top (BG1)
+    METATILE_LAYER_TYPE_COVERED, // Bottom (BG3) + Middle (BG2)
+    METATILE_LAYER_TYPE_SPLIT,   // Bottom (BG3) + Top (BG1)
+};
+```
+
+<LearnMore title="When to use each layer type?" summary="Controlling visual depth">
+- **NORMAL**: Default for most tiles (ground, buildings)
+- **COVERED**: Player appears above the tile (bridges, overhangs)
+- **SPLIT**: Special layering (player partially behind tile)
+
+This creates the illusion of depth - walking behind trees, under bridges, etc.
+</LearnMore>
+
+## Metatile Behaviors
+
+Each metatile has a 16-bit attribute defining its behavior:
+
+```c
+// Metatile attribute format
+// Bits 0-7:   Behavior byte
+// Bits 8-11:  Unused
+// Bits 12-15: Layer type
+
+u16 GetMetatileAttribute(u16 metatileId)
+{
+    return tileset->metatileAttributes[metatileId];
+}
+
+u8 GetMetatileBehavior(u16 metatileId)
+{
+    return GetMetatileAttribute(metatileId) & 0xFF;
+}
+```
+
+### Common Behaviors
+
+```c
+// Movement behaviors (metatile_behaviors.h)
+#define MB_NORMAL                    0x00  // Walkable
+#define MB_TALL_GRASS                0x02  // Wild encounters, rustling
+#define MB_LONG_GRASS                0x03  // Very tall grass
+#define MB_SAND                      0x06  // Footprints in sand
+#define MB_DEEP_SAND                 0x07  // Slower movement
+#define MB_SHALLOW_WATER             0x16  // Splashing sounds
+#define MB_POND_WATER                0x17  // Swimming water
+#define MB_OCEAN_WATER               0x21  // Surfing water
+#define MB_ICE                       0x20  // Slippery sliding
+
+// Collision behaviors
+#define MB_IMPASSABLE_SOUTH          0x10  // One-way north
+#define MB_IMPASSABLE_NORTH          0x11  // One-way south
+#define MB_IMPASSABLE_WEST           0x12  // One-way east
+#define MB_IMPASSABLE_EAST           0x13  // One-way west
+
+// Ledge behaviors
+#define MB_JUMP_SOUTH                0x38  // Jump down
+#define MB_JUMP_NORTH                0x39  // Jump up (unused)
+#define MB_JUMP_WEST                 0x3A  // Jump left
+#define MB_JUMP_EAST                 0x3B  // Jump right
+
+// Interaction behaviors
+#define MB_COUNTER                   0x80  // Talk across (shop counters)
+#define MB_PC                        0x83  // Computer
+#define MB_WARP_DOOR                 0x69  // Door warp
+#define MB_WARP_STAIRS               0x6A  // Stair warp
+#define MB_WARP_CAVE                 0x61  // Cave entrance
+```
+
+### Behavior Checks
+
+```c
+// Check if metatile is walkable
+bool8 MetatileBehavior_IsMovementBlockedByMetatile(u8 behavior)
+{
+    return behavior == MB_BLOCKED || behavior == MB_BLOCKED_SOUTH_EAST || ...;
+}
+
+// Check if metatile triggers wild encounters
+bool8 MetatileBehavior_IsTallGrass(u8 behavior)
+{
+    return behavior == MB_TALL_GRASS;
+}
+
+// Check if metatile is surfable water
+bool8 MetatileBehavior_IsSurfableWaterOrUnderwater(u8 behavior)
+{
+    return behavior == MB_POND_WATER ||
+           behavior == MB_OCEAN_WATER ||
+           behavior == MB_UNDERWATER;
+}
+```
+
+## Tileset Animations
+
+Tilesets can have animated tiles (water, flowers, etc.) through callbacks:
+
+```c
+// Tileset animation callback type
+typedef void (*TilesetCB)(void);
+
+// Example tileset with animation
+const struct Tileset gTileset_General = {
+    .isCompressed = TRUE,
+    .isSecondary = FALSE,
+    .tiles = gTileset_General_Tiles,
+    .palettes = gTileset_General_Palettes,
+    .metatiles = gTileset_General_Metatiles,
+    .metatileAttributes = gTileset_General_MetatileAttributes,
+    .callback = InitTilesetAnim_General,  // Animation init
+};
+```
+
+### Animation System
+
+```c
+// Update tileset animations (called every frame)
+void UpdateTilesetAnimations(void)
+{
+    if (gTilesetAnimContext.animType == TILESET_ANIM_PRIMARY)
+    {
+        gTilesetAnimContext.primaryTilesetCB();
+    }
+    else if (gTilesetAnimContext.animType == TILESET_ANIM_SECONDARY)
+    {
+        gTilesetAnimContext.secondaryTilesetCB();
+    }
+}
+```
+
+### Common Animations
+
+| Animation | Tileset | Effect |
+|-----------|---------|--------|
+| Water flow | General | Water tiles cycle through frames |
+| Flowers | General | Flowers sway back and forth |
+| Waterfall | General | Falling water animation |
+| Sand flow | Mauville | Desert sand movement |
+| Lava bubbles | Cave | Bubbling lava pools |
+
+<DiagramContainer title="Water Animation Example">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Frame as Frame Counter
+    participant Anim as Animation System
+    participant VRAM as Tile VRAM
+
+    loop Every 16 frames
+        Frame->>Anim: Counter tick
+        Anim->>Anim: Advance animation frame
+        Anim->>VRAM: Copy new tile graphics
+        Note over VRAM: Water tiles<br/>update in place
+    end`}
+</pre>
+</DiagramContainer>
+
+## Loading Tilesets
+
+When a map loads, its tilesets are copied to VRAM:
+
+```c
+void CopyMapTilesetsToVram(struct MapLayout const *mapLayout)
+{
+    // Load primary tileset
+    if (mapLayout->primaryTileset->isCompressed)
+        LZ77UnCompVram(mapLayout->primaryTileset->tiles, (void*)BG_VRAM);
+    else
+        CpuFastCopy(mapLayout->primaryTileset->tiles, (void*)BG_VRAM, NUM_TILES_IN_PRIMARY * 32);
+
+    // Load secondary tileset (offset by 512 tiles)
+    if (mapLayout->secondaryTileset->isCompressed)
+        LZ77UnCompVram(mapLayout->secondaryTileset->tiles, (void*)(BG_VRAM + NUM_TILES_IN_PRIMARY * 32));
+    else
+        CpuFastCopy(mapLayout->secondaryTileset->tiles, (void*)(BG_VRAM + NUM_TILES_IN_PRIMARY * 32), NUM_TILES_IN_SECONDARY * 32);
+}
+
+void LoadMapTilesetPalettes(struct MapLayout const *mapLayout)
+{
+    // Load primary palettes (slots 0-5)
+    LoadPalette(mapLayout->primaryTileset->palettes, 0, NUM_PALS_IN_PRIMARY * 32);
+
+    // Load secondary palettes (slots 6-12)
+    LoadPalette(mapLayout->secondaryTileset->palettes, NUM_PALS_IN_PRIMARY * 16, NUM_PALS_IN_SECONDARY * 32);
+}
+```
+
+## Palettes
+
+Each tileset provides color palettes. The GBA uses 15-bit color (BGR555):
+
+```c
+// Palette format: 16 colors, each 2 bytes
+// Color format: 0BBBBBGGGGGRRRRR
+
+const u16 gTileset_General_Palettes[][16] = {
+    // Palette 0 - General colors
+    {
+        RGB(0, 0, 0),      // Transparent
+        RGB(31, 31, 31),   // White
+        RGB(16, 24, 8),    // Grass green
+        // ... 13 more colors
+    },
+    // Palette 1 - Grass variations
+    { ... },
+    // ... more palettes
+};
+
+#define RGB(r, g, b) ((r) | ((g) << 5) | ((b) << 10))
+```
+
+### Palette Allocation
+
+```
+Slot 0:  Primary palette 0 (general)
+Slot 1:  Primary palette 1 (grass)
+Slot 2:  Primary palette 2 (paths)
+Slot 3:  Primary palette 3 (water)
+Slot 4:  Primary palette 4 (trees)
+Slot 5:  Primary palette 5 (misc)
+Slot 6:  Secondary palette 0
+Slot 7:  Secondary palette 1
+...
+Slot 12: Secondary palette 6
+```
+
+## Creating Custom Tilesets
+
+To create a new tileset:
+
+### 1. Create Tile Graphics
+
+```
+data/tilesets/secondary/my_tileset/
+├── tiles.png          # 8x8 tile graphics (128px wide)
+├── metatiles.bin      # Metatile definitions
+├── metatile_attributes.bin  # Behaviors
+└── palettes/
+    ├── 00.pal         # Palette 0
+    ├── 01.pal         # Palette 1
+    └── ...
+```
+
+### 2. Define Tileset Structure
+
+```c
+// data/tilesets/secondary/my_tileset.h
+const struct Tileset gTileset_MyTileset = {
+    .isCompressed = TRUE,
+    .isSecondary = TRUE,
+    .tiles = gTileset_MyTileset_Tiles,
+    .palettes = gTileset_MyTileset_Palettes,
+    .metatiles = gTileset_MyTileset_Metatiles,
+    .metatileAttributes = gTileset_MyTileset_MetatileAttributes,
+    .callback = NULL,  // Or animation callback
+};
+```
+
+### 3. Reference in Map Layout
+
+```c
+const struct MapLayout MyMap_Layout = {
+    .width = 20,
+    .height = 20,
+    .border = MyMap_Border,
+    .map = MyMap_MapData,
+    .primaryTileset = &gTileset_General,
+    .secondaryTileset = &gTileset_MyTileset,
+};
+```
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `CopyMapTilesetsToVram()` | fieldmap.c | Load tiles to VRAM |
+| `LoadMapTilesetPalettes()` | fieldmap.c | Load palettes |
+| `UpdateTilesetAnimations()` | tileset_anims.c | Run animations |
+| `GetMetatileAttribute()` | fieldmap.c | Get behavior data |
+| `MetatileBehavior_Is*()` | metatile_behavior.c | Behavior checks |
+| `InitTilesetAnim_*()` | tileset_anims.c | Animation init |

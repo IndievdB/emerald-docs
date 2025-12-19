@@ -1,0 +1,590 @@
+---
+title: Pokemon Data Structures
+description: BoxPokemon and Pokemon structs - how Pokemon data is stored in memory
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Pokemon data uses a sophisticated two-tier structure system designed for the GBA's memory constraints. The `BoxPokemon` structure stores the core data that persists in PC boxes, while the `Pokemon` structure extends this with calculated battle stats for the party.
+
+## Structure Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    struct Pokemon (100 bytes)                │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │           struct BoxPokemon (80 bytes)              │    │
+│  ├─────────────────────────────────────────────────────┤    │
+│  │  personality (4 bytes)                              │    │
+│  │  otId (4 bytes)                                     │    │
+│  │  nickname (10 bytes)                                │    │
+│  │  language (1 byte)                                  │    │
+│  │  flags (1 byte) - isEgg, hasSpecies, isObedient     │    │
+│  │  otName (7 bytes)                                   │    │
+│  │  markings (1 byte)                                  │    │
+│  │  checksum (2 bytes)                                 │    │
+│  │  ─────────────────────────────────────────────────  │    │
+│  │  ENCRYPTED DATA (48 bytes)                          │    │
+│  │  ┌─────────────┬─────────────┬─────────────┬─────┐  │    │
+│  │  │ Substruct A │ Substruct B │ Substruct C │  D  │  │    │
+│  │  │  12 bytes   │  12 bytes   │  12 bytes   │ 12  │  │    │
+│  │  └─────────────┴─────────────┴─────────────┴─────┘  │    │
+│  │  (Order determined by personality % 24)             │    │
+│  └─────────────────────────────────────────────────────┘    │
+├─────────────────────────────────────────────────────────────┤
+│  CALCULATED STATS (20 bytes)                                │
+│  status, level, hp, maxHP, attack, defense, speed,          │
+│  spAttack, spDefense                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## BoxPokemon Structure
+
+The `BoxPokemon` structure (80 bytes) is the fundamental storage format for all Pokemon data:
+
+```c
+struct BoxPokemon
+{
+    u32 personality;           // Determines nature, ability, gender, shininess
+    u32 otId;                  // Original trainer ID (OTID | (OTSID << 16))
+    u8 nickname[POKEMON_NAME_LENGTH + 1];  // 10 characters + terminator
+    u8 language;               // Language of origin
+    u8 isBadEgg:1;             // Corrupted data flag
+    u8 hasSpecies:1;           // Has been assigned a species
+    u8 isEgg:1;                // Is currently an egg
+    u8 blockBoxRS:1;           // Ruby/Sapphire box compatibility
+    u8 unused:4;               // Unused bits
+    u8 otName[PLAYER_NAME_LENGTH + 1];  // OT name (7 chars + terminator)
+    u8 markings;               // Circle, square, triangle, heart marks
+    u16 checksum;              // Validation checksum
+    u16 unknown;               // Padding
+
+    // Encrypted substruct data (48 bytes)
+    union
+    {
+        u32 raw[12];           // Raw encrypted data
+        struct PokemonSubstruct substructs[4];  // Decrypted view
+    } secure;
+};
+```
+
+### Header Fields
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| `personality` | 0x00 | 4 | Personality value - determines many characteristics |
+| `otId` | 0x04 | 4 | Trainer ID (lower 16) + Secret ID (upper 16) |
+| `nickname` | 0x08 | 10 | Pokemon nickname in game encoding |
+| `language` | 0x12 | 1 | Language ID (1=JPN, 2=ENG, etc.) |
+| `flags` | 0x13 | 1 | Status flags (isBadEgg, hasSpecies, isEgg) |
+| `otName` | 0x14 | 7 | Original trainer name |
+| `markings` | 0x1B | 1 | PC box markings |
+| `checksum` | 0x1C | 2 | Data integrity checksum |
+| `secure` | 0x20 | 48 | Encrypted substruct data |
+
+### Personality Value
+
+The personality value is a 32-bit random number that determines:
+
+```c
+// Nature (affects stat growth)
+u8 nature = personality % NUM_NATURES;  // 0-24
+
+// Ability slot (normal vs hidden ability)
+u8 abilityNum = (personality & 1);
+
+// Gender (species-dependent threshold)
+u8 genderValue = personality & 0xFF;
+bool isFemale = genderValue < species->genderRatio;
+
+// Unown form (letter A-Z, ! and ?)
+u8 unownLetter = ((personality & 0x3) |
+                  ((personality >> 8) & 0x3) << 2 |
+                  ((personality >> 16) & 0x3) << 4 |
+                  ((personality >> 24) & 0x3) << 6) % 28;
+
+// Wurmple evolution
+bool evolvesToSilcoon = (personality >> 16) % 10 < 5;
+
+// Spinda spots pattern
+u32 spindaSpots = personality;  // All 32 bits used
+```
+
+### Shininess
+
+A Pokemon is shiny when the XOR of specific values produces a small number:
+
+```c
+#define SHINY_THRESHOLD 8
+
+bool IsShiny(struct BoxPokemon *mon)
+{
+    u32 otId = mon->otId;
+    u16 trainerId = otId & 0xFFFF;
+    u16 secretId = otId >> 16;
+    u16 personalityHi = mon->personality >> 16;
+    u16 personalityLo = mon->personality & 0xFFFF;
+
+    u16 shinyValue = trainerId ^ secretId ^ personalityHi ^ personalityLo;
+    return shinyValue < SHINY_THRESHOLD;
+}
+```
+
+## The Four Substructs
+
+The encrypted portion contains four 12-byte substructures, each holding different data:
+
+### Substruct 0: Growth Data
+
+```c
+struct PokemonSubstruct0  // 12 bytes
+{
+    u16 species;           // Pokemon species ID
+    u16 heldItem;          // Held item ID
+    u32 experience;        // Total experience points
+    u8 ppBonuses;          // PP Up bonuses (2 bits per move)
+    u8 friendship;         // Happiness value (0-255)
+    u16 filler;            // Unused
+};
+```
+
+**PP Bonuses Format:**
+```
+Bits: 7 6 | 5 4 | 3 2 | 1 0
+      ─────┴─────┴─────┴─────
+      Move4 Move3 Move2 Move1
+
+Each 2-bit value = number of PP Ups used (0-3)
+```
+
+### Substruct 1: Attacks
+
+```c
+struct PokemonSubstruct1  // 12 bytes
+{
+    u16 moves[4];          // Four move IDs
+    u8 pp[4];              // Current PP for each move
+};
+```
+
+### Substruct 2: EVs and Contest Stats
+
+```c
+struct PokemonSubstruct2  // 12 bytes
+{
+    u8 hpEV;               // HP effort value (0-255)
+    u8 attackEV;           // Attack EV
+    u8 defenseEV;          // Defense EV
+    u8 speedEV;            // Speed EV
+    u8 spAttackEV;         // Sp. Attack EV
+    u8 spDefenseEV;        // Sp. Defense EV
+    u8 cool;               // Contest: Cool stat
+    u8 beauty;             // Contest: Beauty stat
+    u8 cute;               // Contest: Cute stat
+    u8 smart;              // Contest: Smart stat
+    u8 tough;              // Contest: Tough stat
+    u8 sheen;              // Contest: Sheen (pokeblock fill)
+};
+```
+
+**EV Constraints:**
+- Each EV: 0-255
+- Total EVs: Maximum 510
+- EVs exceeding 252 have no additional effect
+
+### Substruct 3: Miscellaneous
+
+```c
+struct PokemonSubstruct3  // 12 bytes
+{
+    u8 pokerus;            // Pokerus strain and duration
+    u8 metLocation;        // Location ID where caught
+    u16 metLevel:7;        // Level when caught (0-127)
+    u16 metGame:4;         // Game of origin
+    u16 pokeball:4;        // Poke Ball type used
+    u16 otGender:1;        // Original trainer gender
+    u32 hpIV:5;            // HP individual value (0-31)
+    u32 attackIV:5;        // Attack IV
+    u32 defenseIV:5;       // Defense IV
+    u32 speedIV:5;         // Speed IV
+    u32 spAttackIV:5;      // Sp. Attack IV
+    u32 spDefenseIV:5;     // Sp. Defense IV
+    u32 isEgg:1;           // Is an egg (redundant with header)
+    u32 abilityNum:1;      // Ability slot (0 or 1)
+    u32 coolRibbon:3;      // Cool contest ribbon level
+    u32 beautyRibbon:3;    // Beauty contest ribbon
+    u32 cuteRibbon:3;      // Cute contest ribbon
+    u32 smartRibbon:3;     // Smart contest ribbon
+    u32 toughRibbon:3;     // Tough contest ribbon
+    u32 championRibbon:1;  // Pokemon League Champion
+    u32 winningRibbon:1;   // Battle Tower 50 streak
+    u32 victoryRibbon:1;   // Battle Tower 100 streak
+    u32 artistRibbon:1;    // Contest Master
+    u32 effortRibbon:1;    // Effort ribbon (max EVs)
+    u32 marineRibbon:1;    // Event ribbon
+    u32 landRibbon:1;      // Event ribbon
+    u32 skyRibbon:1;       // Event ribbon
+    u32 countryRibbon:1;   // Event ribbon
+    u32 nationalRibbon:1;  // Event ribbon
+    u32 earthRibbon:1;     // Event ribbon
+    u32 worldRibbon:1;     // Event ribbon
+    u32 eventLegal:4;      // Obedience (Mew/Deoxys)
+};
+```
+
+**IV Storage (32 bits packed):**
+```
+Bits: 31 30 | 29-25 | 24-20 | 19-15 | 14-10 | 9-5 | 4-0
+      ──────┴───────┴───────┴───────┴───────┴─────┴─────
+      Flags  SpDef   SpAtk   Speed   Defense Atk   HP
+
+Bit 30: isEgg
+Bit 31: abilityNum
+```
+
+**Pokerus Format:**
+```
+Byte: SSSS DDDD
+      ────┬────
+      │   └─ Days remaining (0-15), 0 = cured/immune
+      └───── Strain (0-15), determines duration when infected
+```
+
+## Substruct Ordering
+
+The four substructs are stored in an order determined by `personality % 24`:
+
+```c
+static const u8 sSubstructOrder[24][4] = {
+    {0, 1, 2, 3},  // 0     {2, 0, 3, 1},  // 12
+    {0, 1, 3, 2},  // 1     {3, 0, 1, 2},  // 13
+    {0, 2, 1, 3},  // 2     {2, 0, 1, 3},  // 14
+    {0, 3, 1, 2},  // 3     {3, 0, 2, 1},  // 15
+    {0, 2, 3, 1},  // 4     {2, 1, 0, 3},  // 16
+    {0, 3, 2, 1},  // 5     {3, 1, 0, 2},  // 17
+    {1, 0, 2, 3},  // 6     {2, 3, 0, 1},  // 18
+    {1, 0, 3, 2},  // 7     {3, 2, 0, 1},  // 19
+    {2, 0, 1, 3},  // 8     {2, 1, 3, 0},  // 20
+    {3, 0, 1, 2},  // 9     {3, 1, 2, 0},  // 21
+    {2, 0, 3, 1},  // 10    {2, 3, 1, 0},  // 22
+    {3, 0, 2, 1},  // 11    {3, 2, 1, 0},  // 23
+};
+
+// Get pointer to specific substruct
+struct PokemonSubstruct *GetSubstruct(struct BoxPokemon *mon, u8 substructType)
+{
+    u8 orderIndex = mon->personality % 24;
+    u8 *order = sSubstructOrder[orderIndex];
+
+    for (int i = 0; i < 4; i++)
+    {
+        if (order[i] == substructType)
+            return &mon->secure.substructs[i];
+    }
+}
+```
+
+## Pokemon Structure (Party Pokemon)
+
+The full `Pokemon` structure (100 bytes) extends `BoxPokemon` with calculated stats:
+
+```c
+struct Pokemon
+{
+    struct BoxPokemon box;  // 80 bytes - core data
+    u32 status;             // Status condition flags
+    u8 level;               // Current level (1-100)
+    u8 mail;                // Attached mail ID
+    u16 hp;                 // Current HP
+    u16 maxHP;              // Maximum HP
+    u16 attack;             // Attack stat
+    u16 defense;            // Defense stat
+    u16 speed;              // Speed stat
+    u16 spAttack;           // Sp. Attack stat
+    u16 spDefense;          // Sp. Defense stat
+};
+```
+
+### Status Condition Flags
+
+```c
+#define STATUS1_NONE        0
+#define STATUS1_SLEEP       0x7        // Bits 0-2: sleep turns
+#define STATUS1_POISON      (1 << 3)   // Bit 3: poisoned
+#define STATUS1_BURN        (1 << 4)   // Bit 4: burned
+#define STATUS1_FREEZE      (1 << 5)   // Bit 5: frozen
+#define STATUS1_PARALYSIS   (1 << 6)   // Bit 6: paralyzed
+#define STATUS1_TOXIC_POISON (1 << 7)  // Bit 7: badly poisoned
+
+// Sleep turns stored in lower 3 bits
+u8 sleepTurns = status & STATUS1_SLEEP;
+```
+
+### Stat Calculation
+
+Stats are recalculated when Pokemon data changes:
+
+```c
+void CalculateMonStats(struct Pokemon *mon)
+{
+    // Get data from substructs (requires decryption)
+    u16 species = GetMonData(mon, MON_DATA_SPECIES);
+    u8 level = GetMonData(mon, MON_DATA_LEVEL);
+
+    // Get base stats, IVs, EVs, nature
+    // Calculate each stat using the standard formula
+    // Store results in mon->maxHP, mon->attack, etc.
+}
+```
+
+The actual stat formula is detailed in [Stats Calculation](/pokemon/stats-calculation).
+
+## Memory Layout Diagram
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph TB
+    subgraph Pokemon["struct Pokemon (100 bytes)"]
+        subgraph BoxPokemon["struct BoxPokemon (80 bytes)"]
+            Header["Header (32 bytes)<br/>personality, otId, nickname,<br/>language, flags, otName, markings, checksum"]
+            subgraph Encrypted["Encrypted Secure Data (48 bytes)"]
+                S0["Substruct 0<br/>Growth<br/>(12 bytes)"]
+                S1["Substruct 1<br/>Attacks<br/>(12 bytes)"]
+                S2["Substruct 2<br/>EVs/Contest<br/>(12 bytes)"]
+                S3["Substruct 3<br/>Misc/IVs<br/>(12 bytes)"]
+            end
+        end
+        Stats["Calculated Stats (20 bytes)<br/>status, level, hp, maxHP,<br/>attack, defense, speed, spAtk, spDef"]
+    end
+
+    Header --> Encrypted
+    Encrypted --> Stats
+
+    style Encrypted fill:#f9d,stroke:#333
+    style Header fill:#9df,stroke:#333
+    style Stats fill:#9fd,stroke:#333`}
+</pre>
+</DiagramContainer>
+
+## Data Access API
+
+Pokemon data is accessed through getter/setter functions that handle encryption:
+
+```c
+// Get any piece of Pokemon data
+u32 GetMonData(struct Pokemon *mon, s32 field, u8 *data);
+u32 GetBoxMonData(struct BoxPokemon *boxMon, s32 field, u8 *data);
+
+// Set Pokemon data
+void SetMonData(struct Pokemon *mon, s32 field, const void *data);
+void SetBoxMonData(struct BoxPokemon *boxMon, s32 field, const void *data);
+```
+
+### Common Data Fields
+
+```c
+// Species and basic info
+MON_DATA_SPECIES          // u16 - Species ID
+MON_DATA_SPECIES_OR_EGG   // u16 - Returns SPECIES_EGG if egg
+MON_DATA_HELD_ITEM        // u16 - Held item ID
+MON_DATA_EXPERIENCE       // u32 - Total EXP
+MON_DATA_LEVEL            // u8  - Current level
+
+// Stats and combat
+MON_DATA_HP               // u16 - Current HP
+MON_DATA_MAX_HP           // u16 - Maximum HP
+MON_DATA_ATK              // u16 - Attack stat
+MON_DATA_DEF              // u16 - Defense stat
+MON_DATA_SPEED            // u16 - Speed stat
+MON_DATA_SPATK            // u16 - Sp. Attack
+MON_DATA_SPDEF            // u16 - Sp. Defense
+MON_DATA_STATUS           // u32 - Status conditions
+
+// IVs
+MON_DATA_HP_IV            // u8  - HP IV (0-31)
+MON_DATA_ATK_IV           // u8  - Attack IV
+MON_DATA_DEF_IV           // u8  - Defense IV
+MON_DATA_SPEED_IV         // u8  - Speed IV
+MON_DATA_SPATK_IV         // u8  - Sp. Attack IV
+MON_DATA_SPDEF_IV         // u8  - Sp. Defense IV
+
+// EVs
+MON_DATA_HP_EV            // u8  - HP EV (0-255)
+MON_DATA_ATK_EV           // u8  - Attack EV
+MON_DATA_DEF_EV           // u8  - Defense EV
+MON_DATA_SPEED_EV         // u8  - Speed EV
+MON_DATA_SPATK_EV         // u8  - Sp. Attack EV
+MON_DATA_SPDEF_EV         // u8  - Sp. Defense EV
+
+// Moves
+MON_DATA_MOVE1            // u16 - First move
+MON_DATA_MOVE2            // u16 - Second move
+MON_DATA_MOVE3            // u16 - Third move
+MON_DATA_MOVE4            // u16 - Fourth move
+MON_DATA_PP1              // u8  - First move PP
+MON_DATA_PP2              // u8  - Second move PP
+MON_DATA_PP3              // u8  - Third move PP
+MON_DATA_PP4              // u8  - Fourth move PP
+
+// Personality-derived
+MON_DATA_PERSONALITY      // u32 - Personality value
+MON_DATA_NATURE           // u8  - Nature ID
+MON_DATA_ABILITY_NUM      // u8  - Ability slot (0/1)
+MON_DATA_IS_EGG           // bool - Is egg
+MON_DATA_FRIENDSHIP       // u8  - Happiness
+
+// Trainer info
+MON_DATA_OT_ID            // u32 - Full OT ID
+MON_DATA_OT_NAME          // str - OT name
+MON_DATA_OT_GENDER        // u8  - OT gender
+MON_DATA_NICKNAME         // str - Nickname
+MON_DATA_LANGUAGE         // u8  - Language ID
+```
+
+### Example: Reading Pokemon Data
+
+```c
+void PrintPokemonInfo(struct Pokemon *mon)
+{
+    u16 species = GetMonData(mon, MON_DATA_SPECIES, NULL);
+    u8 level = GetMonData(mon, MON_DATA_LEVEL, NULL);
+    u16 hp = GetMonData(mon, MON_DATA_HP, NULL);
+    u16 maxHp = GetMonData(mon, MON_DATA_MAX_HP, NULL);
+
+    u8 nickname[POKEMON_NAME_LENGTH + 1];
+    GetMonData(mon, MON_DATA_NICKNAME, nickname);
+
+    // Print: "PIKACHU Lv.25 HP: 50/65"
+    ConsolePrintf("%s Lv.%d HP: %d/%d",
+                  nickname, level, hp, maxHp);
+}
+```
+
+### Example: Modifying Pokemon Data
+
+```c
+void GiveItemToPokemon(struct Pokemon *mon, u16 itemId)
+{
+    // This handles encryption/decryption automatically
+    SetMonData(mon, MON_DATA_HELD_ITEM, &itemId);
+}
+
+void HealPokemon(struct Pokemon *mon)
+{
+    // Get max HP and restore current HP
+    u16 maxHp = GetMonData(mon, MON_DATA_MAX_HP, NULL);
+    SetMonData(mon, MON_DATA_HP, &maxHp);
+
+    // Clear status conditions
+    u32 noStatus = STATUS1_NONE;
+    SetMonData(mon, MON_DATA_STATUS, &noStatus);
+
+    // Restore all PP
+    for (int i = 0; i < MAX_MON_MOVES; i++)
+    {
+        u16 move = GetMonData(mon, MON_DATA_MOVE1 + i, NULL);
+        if (move != MOVE_NONE)
+        {
+            u8 maxPP = gMovesInfo[move].pp;
+            // Add PP bonus
+            u8 ppBonus = GetMonData(mon, MON_DATA_PP_BONUSES, NULL);
+            maxPP += (maxPP * ((ppBonus >> (i * 2)) & 3)) / 5;
+            SetMonData(mon, MON_DATA_PP1 + i, &maxPP);
+        }
+    }
+}
+```
+
+## Box Storage
+
+PC boxes store Pokemon as `BoxPokemon` structures to save space:
+
+```c
+#define IN_BOX_COUNT 30     // Pokemon per box
+#define TOTAL_BOXES_COUNT 14
+
+struct PokemonStorage
+{
+    u8 currentBox;
+    struct BoxPokemon boxes[TOTAL_BOXES_COUNT][IN_BOX_COUNT];
+    u8 boxNames[TOTAL_BOXES_COUNT][BOX_NAME_LENGTH + 1];
+    u8 boxWallpapers[TOTAL_BOXES_COUNT];
+};
+```
+
+**Storage Calculation:**
+- BoxPokemon: 80 bytes
+- Per box: 80 × 30 = 2,400 bytes
+- All boxes: 2,400 × 14 = 33,600 bytes
+- With metadata: ~34 KB total
+
+When a Pokemon is withdrawn from the PC, its calculated stats are regenerated:
+
+```c
+void CopyBoxMonToMon(struct BoxPokemon *src, struct Pokemon *dst)
+{
+    // Copy box data
+    dst->box = *src;
+
+    // Calculate and fill in battle stats
+    CalculateMonStats(dst);
+}
+```
+
+## Data Integrity
+
+### Checksum
+
+The checksum validates the encrypted data hasn't been corrupted:
+
+```c
+u16 CalculateBoxMonChecksum(struct BoxPokemon *boxMon)
+{
+    u16 checksum = 0;
+    u16 *data = (u16 *)boxMon->secure.raw;
+
+    // Sum all 24 u16 words in the encrypted data
+    for (int i = 0; i < 24; i++)
+        checksum += data[i];
+
+    return checksum;
+}
+
+bool IsValidBoxMon(struct BoxPokemon *boxMon)
+{
+    // Decrypt, calculate checksum, compare
+    DecryptBoxMon(boxMon);
+    u16 calculated = CalculateBoxMonChecksum(boxMon);
+    EncryptBoxMon(boxMon);
+
+    return calculated == boxMon->checksum;
+}
+```
+
+### Bad Egg Detection
+
+If the checksum fails, the Pokemon becomes a "Bad Egg":
+
+```c
+void CheckBoxMonSanity(struct BoxPokemon *boxMon)
+{
+    if (!IsValidBoxMon(boxMon))
+    {
+        boxMon->isBadEgg = TRUE;
+        boxMon->isEgg = TRUE;
+    }
+}
+```
+
+Bad Eggs cannot:
+- Be withdrawn from the PC
+- Be released
+- Be traded
+- Hatch
+
+## Related Topics
+
+- [Encryption System](/pokemon/encryption) - How Pokemon data is encrypted
+- [Species Data](/pokemon/species-data) - Base stats and species information
+- [Stats Calculation](/pokemon/stats-calculation) - How battle stats are computed

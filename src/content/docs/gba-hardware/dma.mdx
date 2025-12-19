@@ -1,0 +1,445 @@
+---
+title: DMA
+description: Direct Memory Access on the GBA - fast hardware memory transfers
+---
+
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Direct Memory Access (DMA) is a GBA hardware feature that transfers data between memory regions without CPU intervention. Pokemon Emerald uses DMA extensively for graphics updates, sound streaming, and bulk data operations.
+
+## DMA Overview
+
+<DiagramContainer>
+<pre class="mermaid">
+{`graph LR
+    subgraph CPU["ARM7TDMI CPU"]
+        Code["Game Code"]
+    end
+
+    subgraph DMA["DMA Controller"]
+        CH0["Channel 0<br/>Special"]
+        CH1["Channel 1<br/>Sound A"]
+        CH2["Channel 2<br/>Sound B"]
+        CH3["Channel 3<br/>General"]
+    end
+
+    subgraph Memory["Memory Regions"]
+        EWRAM["EWRAM<br/>256KB"]
+        IWRAM["IWRAM<br/>32KB"]
+        VRAM["VRAM<br/>96KB"]
+        PAL["Palette<br/>1KB"]
+        OAM["OAM<br/>1KB"]
+    end
+
+    Code -->|"Configure"| DMA
+    DMA -->|"Transfer"| Memory
+    DMA -->|"Transfer"| VRAM
+    DMA -->|"Transfer"| PAL
+    DMA -->|"Transfer"| OAM
+
+    style CH3 fill:#9f9,stroke:#333,color:#000
+    style CH1 fill:#f99,stroke:#333,color:#000
+    style CH2 fill:#f99,stroke:#333,color:#000`}
+</pre>
+</DiagramContainer>
+
+## DMA Channels
+
+The GBA has four DMA channels with different capabilities:
+
+| Channel | Priority | Common Use | Notes |
+|---------|----------|------------|-------|
+| DMA0 | Highest | Special timing | Can only access internal memory |
+| DMA1 | High | Sound FIFO A | Automatic sound streaming |
+| DMA2 | Medium | Sound FIFO B | Automatic sound streaming |
+| DMA3 | Lowest | General purpose | Most flexible, used by game code |
+
+### Channel Priority
+
+When multiple DMA channels are active, lower-numbered channels have priority:
+- DMA0 can interrupt DMA1-3
+- DMA1 can interrupt DMA2-3
+- DMA2 can interrupt DMA3
+
+## DMA Registers
+
+Each DMA channel has three registers:
+
+```c
+// DMA3 registers (most commonly used)
+#define REG_DMA3SAD   *(vu32 *)0x040000D4  // Source Address
+#define REG_DMA3DAD   *(vu32 *)0x040000D8  // Destination Address
+#define REG_DMA3CNT   *(vu32 *)0x040000DC  // Control + Count
+
+// Control register breakdown (upper 16 bits of CNT)
+#define DMA_DST_INC      (0 << 5)   // Increment destination
+#define DMA_DST_DEC      (1 << 5)   // Decrement destination
+#define DMA_DST_FIXED    (2 << 5)   // Fixed destination
+#define DMA_DST_RELOAD   (3 << 5)   // Increment, reload on repeat
+
+#define DMA_SRC_INC      (0 << 7)   // Increment source
+#define DMA_SRC_DEC      (1 << 7)   // Decrement source
+#define DMA_SRC_FIXED    (2 << 7)   // Fixed source
+
+#define DMA_REPEAT       (1 << 9)   // Repeat on trigger
+#define DMA_16BIT        (0 << 10)  // 16-bit transfers
+#define DMA_32BIT        (1 << 10)  // 32-bit transfers
+
+#define DMA_START_NOW    (0 << 12)  // Start immediately
+#define DMA_START_VBLANK (1 << 12)  // Start at VBlank
+#define DMA_START_HBLANK (2 << 12)  // Start at HBlank
+#define DMA_START_SPECIAL (3 << 12) // Channel-specific trigger
+
+#define DMA_INTR_ENABLE  (1 << 14)  // Raise interrupt on completion
+#define DMA_ENABLE       (1 << 15)  // Enable the DMA channel
+```
+
+## Direct DMA Macros
+
+Pokemon Emerald provides macros for immediate DMA transfers:
+
+```c
+// Copy data using DMA
+#define DmaCopy16(dmaNum, src, dest, size) \
+    DmaSet(dmaNum, src, dest, \
+        (DMA_ENABLE | DMA_START_NOW | DMA_16BIT | DMA_SRC_INC | DMA_DEST_INC) << 16 \
+        | ((size) / 2))
+
+#define DmaCopy32(dmaNum, src, dest, size) \
+    DmaSet(dmaNum, src, dest, \
+        (DMA_ENABLE | DMA_START_NOW | DMA_32BIT | DMA_SRC_INC | DMA_DEST_INC) << 16 \
+        | ((size) / 4))
+
+// Fill memory with a value
+#define DmaFill16(dmaNum, value, dest, size) \
+    DmaSet(dmaNum, &(value), dest, \
+        (DMA_ENABLE | DMA_START_NOW | DMA_16BIT | DMA_SRC_FIXED | DMA_DEST_INC) << 16 \
+        | ((size) / 2))
+
+#define DmaFill32(dmaNum, value, dest, size) \
+    DmaSet(dmaNum, &(value), dest, \
+        (DMA_ENABLE | DMA_START_NOW | DMA_32BIT | DMA_SRC_FIXED | DMA_DEST_INC) << 16 \
+        | ((size) / 4))
+```
+
+### DmaSet Implementation
+
+```c
+#define DmaSet(dmaNum, src, dest, control) \
+{                                          \
+    vu32 *dmaRegs = (vu32 *)REG_ADDR_DMA##dmaNum; \
+    dmaRegs[0] = (vu32)(src);              \
+    dmaRegs[1] = (vu32)(dest);             \
+    dmaRegs[2] = (vu32)(control);          \
+    dmaRegs[2];  // Dummy read for timing  \
+}
+```
+
+## DMA3 Manager System
+
+For safe, queued DMA transfers during VBlank, Pokemon Emerald uses a DMA3 manager:
+
+### Request Structure
+
+```c
+struct Dma3Request
+{
+    const void *src;  // Source address (for copy)
+    void *dest;       // Destination address
+    u16 size;         // Transfer size in bytes
+    u16 mode;         // Transfer mode
+    u32 value;        // Fill value (for fill operations)
+};
+
+#define MAX_DMA_REQUESTS 128
+
+static struct Dma3Request sDma3Requests[MAX_DMA_REQUESTS];
+static u8 sDma3RequestCursor;
+static vbool8 sDma3ManagerLocked;
+```
+
+### Request Modes
+
+```c
+#define DMA_REQUEST_COPY32 1
+#define DMA_REQUEST_FILL32 2
+#define DMA_REQUEST_COPY16 3
+#define DMA_REQUEST_FILL16 4
+```
+
+### Requesting a DMA Transfer
+
+```c
+// Copy data via DMA3 manager (returns request index, or -1 if queue full)
+s16 RequestDma3Copy(const void *src, void *dest, u16 size, u8 mode)
+{
+    int cursor = sDma3RequestCursor;
+    int i = 0;
+
+    sDma3ManagerLocked = TRUE;
+
+    while (i < MAX_DMA_REQUESTS)
+    {
+        if (sDma3Requests[cursor].size == 0)  // Empty slot found
+        {
+            sDma3Requests[cursor].src = src;
+            sDma3Requests[cursor].dest = dest;
+            sDma3Requests[cursor].size = size;
+            sDma3Requests[cursor].mode = (mode == 1) ?
+                DMA_REQUEST_COPY32 : DMA_REQUEST_COPY16;
+
+            sDma3ManagerLocked = FALSE;
+            return cursor;
+        }
+        if (++cursor >= MAX_DMA_REQUESTS)
+            cursor = 0;
+        i++;
+    }
+
+    sDma3ManagerLocked = FALSE;
+    return -1;  // Queue full
+}
+
+// Fill memory via DMA3 manager
+s16 RequestDma3Fill(s32 value, void *dest, u16 size, u8 mode)
+{
+    // Similar to RequestDma3Copy, but stores fill value
+    // ...
+}
+```
+
+### Processing DMA Requests
+
+During VBlank, queued requests are processed:
+
+```c
+void ProcessDma3Requests(void)
+{
+    u16 bytesTransferred = 0;
+
+    if (sDma3ManagerLocked)
+        return;
+
+    while (sDma3Requests[sDma3RequestCursor].size != 0)
+    {
+        bytesTransferred += sDma3Requests[sDma3RequestCursor].size;
+
+        // Safety limits
+        if (bytesTransferred > 40 * 1024)
+            return;  // Don't transfer more than 40 KiB per VBlank
+        if (*(u8 *)REG_ADDR_VCOUNT > 224)
+            return;  // About to leave VBlank
+
+        // Execute the transfer
+        switch (sDma3Requests[sDma3RequestCursor].mode)
+        {
+        case DMA_REQUEST_COPY32:
+            Dma3CopyLarge32_(src, dest, size);
+            break;
+        case DMA_REQUEST_FILL32:
+            Dma3FillLarge32_(value, dest, size);
+            break;
+        case DMA_REQUEST_COPY16:
+            Dma3CopyLarge16_(src, dest, size);
+            break;
+        case DMA_REQUEST_FILL16:
+            Dma3FillLarge16_(value, dest, size);
+            break;
+        }
+
+        // Clear the processed request
+        sDma3Requests[sDma3RequestCursor].size = 0;
+        sDma3RequestCursor++;
+
+        if (sDma3RequestCursor >= MAX_DMA_REQUESTS)
+            sDma3RequestCursor = 0;
+    }
+}
+```
+
+### Large Transfer Macros
+
+For transfers larger than 4KB (DMA hardware limit):
+
+```c
+#define MAX_DMA_BLOCK_SIZE 0x1000  // 4KB
+
+#define Dma3CopyLarge32_(src, dest, size) \
+{                                         \
+    const void *_src = src;               \
+    void *_dest = dest;                   \
+    u32 _size = size;                     \
+    while (1)                             \
+    {                                     \
+        if (_size <= MAX_DMA_BLOCK_SIZE)  \
+        {                                 \
+            DmaCopy32(3, _src, _dest, _size); \
+            break;                        \
+        }                                 \
+        DmaCopy32(3, _src, _dest, MAX_DMA_BLOCK_SIZE); \
+        _src += MAX_DMA_BLOCK_SIZE;       \
+        _dest += MAX_DMA_BLOCK_SIZE;      \
+        _size -= MAX_DMA_BLOCK_SIZE;      \
+    }                                     \
+}
+```
+
+## VBlank DMA Flow
+
+<DiagramContainer>
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Game as Game Loop
+    participant Queue as DMA3 Queue
+    participant VBlank as VBlank Handler
+    participant HW as DMA Hardware
+
+    Game->>Queue: RequestDma3Copy(src, dest, size)
+    Note over Queue: Request queued
+
+    Game->>Queue: RequestDma3Copy(src2, dest2, size2)
+    Note over Queue: Another request queued
+
+    Note over VBlank: VBlank interrupt fires
+
+    VBlank->>Queue: ProcessDma3Requests()
+    loop While requests pending
+        Queue->>HW: Configure DMA3
+        HW->>HW: Transfer data
+        Note over Queue: Mark request complete
+    end
+
+    Note over Game: Next frame begins`}
+</pre>
+</DiagramContainer>
+
+## Common Use Cases
+
+### Copying Tiles to VRAM
+
+```c
+// Copy tileset graphics to VRAM
+void LoadTileset(const u8 *tiles, u16 numTiles)
+{
+    RequestDma3Copy(tiles,
+                    (void *)BG_VRAM,
+                    numTiles * 32,  // 32 bytes per 4bpp tile
+                    1);  // 32-bit mode
+}
+```
+
+### Copying Palette Data
+
+```c
+// Load a 16-color palette
+void LoadPalette(const u16 *palette, u16 paletteNum)
+{
+    DmaCopy16(3,
+              palette,
+              (void *)(PLTT + paletteNum * 32),
+              32);  // 16 colors × 2 bytes
+}
+```
+
+### Clearing VRAM
+
+```c
+// Clear a background tilemap
+void ClearBgTilemap(u8 bg)
+{
+    u16 zero = 0;
+    DmaFill16(3, zero, GetBgTilemapBuffer(bg), 0x800);
+}
+```
+
+### OAM Updates
+
+```c
+// Copy sprite attributes to OAM
+void CopyBufferedOamToOam(void)
+{
+    DmaCopy32(3, gOamBuffer, (void *)OAM, sizeof(gOamBuffer));
+}
+```
+
+## Sound DMA
+
+DMA1 and DMA2 are configured for automatic sound streaming:
+
+```c
+// Sound FIFO DMA setup (done by sound driver)
+void SetupSoundDma(void)
+{
+    // DMA1 feeds Sound FIFO A
+    REG_DMA1SAD = (u32)soundBufferA;
+    REG_DMA1DAD = (u32)REG_ADDR_FIFO_A;
+    REG_DMA1CNT = DMA_ENABLE | DMA_START_SPECIAL |
+                  DMA_32BIT | DMA_REPEAT |
+                  DMA_SRC_INC | DMA_DEST_FIXED;
+
+    // DMA2 feeds Sound FIFO B
+    REG_DMA2SAD = (u32)soundBufferB;
+    REG_DMA2DAD = (u32)REG_ADDR_FIFO_B;
+    REG_DMA2CNT = DMA_ENABLE | DMA_START_SPECIAL |
+                  DMA_32BIT | DMA_REPEAT |
+                  DMA_SRC_INC | DMA_DEST_FIXED;
+}
+```
+
+With `DMA_START_SPECIAL`, these DMAs trigger automatically when the sound FIFOs need more data.
+
+## HBlank DMA (Scanline Effects)
+
+DMA can trigger at each HBlank for per-scanline effects:
+
+```c
+// Setup for scanline-based register updates
+#define SCANLINE_EFFECT_DMACNT_16BIT \
+    (((DMA_ENABLE | DMA_START_HBLANK | DMA_REPEAT | \
+       DMA_SRC_INC | DMA_DEST_RELOAD | DMA_16BIT) << 16) | 1)
+
+// Update a register every scanline (e.g., for wave effects)
+void SetupScanlineEffect(u16 *srcBuffer, vu16 *destReg)
+{
+    // srcBuffer has 160 values (one per scanline)
+    DmaSet(0, srcBuffer, destReg, SCANLINE_EFFECT_DMACNT_16BIT);
+}
+```
+
+## Performance Considerations
+
+### DMA Speed
+
+| Transfer Type | Speed |
+|---------------|-------|
+| DMA to VRAM | 16 cycles per 16-bit |
+| DMA to OAM | 16 cycles per 16-bit |
+| DMA to EWRAM | 2 cycles per 16-bit |
+| DMA to IWRAM | 1 cycle per 16-bit |
+
+### Best Practices
+
+1. **Use 32-bit transfers** when possible (half the operations)
+2. **Align data** to 4-byte boundaries for 32-bit DMA
+3. **Avoid DMA during active display** (compete with video hardware)
+4. **Use the DMA3 manager** for safe VBlank transfers
+5. **Keep transfers under 40KB** per VBlank for reliability
+
+### DMA vs CPU Copy
+
+```c
+// DMA: ~1 cycle per 16-bit word (to IWRAM)
+DmaCopy32(3, src, dest, 1024);
+
+// CPU: ~6 cycles per word (load + store + loop overhead)
+CpuCopy32(src, dest, 1024);
+
+// For small transfers (<64 bytes), CPU may be faster due to DMA setup overhead
+```
+
+## Related Topics
+
+- [Interrupts](/gba-hardware/interrupts) - VBlank interrupt handling
+- [IO Registers](/gba-hardware/io-registers) - Memory-mapped register overview
+- [Backgrounds](/gba-hardware/graphics/backgrounds) - Background graphics system
+- [Sprites](/gba-hardware/graphics/sprites) - OAM and sprite system

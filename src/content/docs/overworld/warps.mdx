@@ -1,0 +1,822 @@
+---
+title: Warps
+description: Map transitions, doors, teleportation, and escape ropes in pokeemerald
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+Warps handle all map transitions in the game - doors, cave entrances, stairs, teleportation, and special events like Fly and Escape Rope. The warp system manages destination data, transition animations, and the complex process of unloading and loading maps.
+
+## Warp System Architecture
+
+<DiagramContainer title="Warp System Overview">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Triggers["Warp Triggers"]
+        Door[Door Tile]
+        Stair[Stair Tile]
+        Cave[Cave Entrance]
+        Script[Script Warp]
+        Fly[Fly/Teleport]
+        Escape[Escape Rope]
+    end
+
+    subgraph Processing["Warp Processing"]
+        SetWarp[SetWarpDestination]
+        DoWarp[DoWarp]
+        Fade[Screen Fade]
+        Unload[Unload Current Map]
+        Load[Load New Map]
+    end
+
+    subgraph Destinations["Destination Types"]
+        WarpEvent[Warp Event<br/>warpId lookup]
+        Dynamic[Dynamic Warp<br/>x,y coordinates]
+        LastWarp[Last Warp<br/>return destination]
+    end
+
+    Triggers --> SetWarp
+    SetWarp --> Destinations
+    Destinations --> DoWarp
+    DoWarp --> Fade
+    Fade --> Unload
+    Unload --> Load`}
+</pre>
+</DiagramContainer>
+
+## Warp Data Structures
+
+### WarpData
+
+The primary structure storing a warp destination:
+
+```c
+struct WarpData
+{
+    s8 mapGroup;    // Target map group (0-32)
+    s8 mapNum;      // Target map number within group
+    s8 warpId;      // Target warp ID (-1 for dynamic x,y)
+    s16 x;          // Target X coordinate (if warpId == -1)
+    s16 y;          // Target Y coordinate (if warpId == -1)
+};
+```
+
+<LearnMore title="What's the difference between warpId and x,y?" summary="Two ways to specify destinations">
+Warps can specify destinations in two ways:
+
+1. **warpId reference**: Set `warpId` to a valid index (0+). The destination coordinates are looked up from the target map's warp event at that index.
+
+2. **Direct coordinates**: Set `warpId` to `-1` and specify exact `x,y` coordinates. Used for script warps and Fly destinations.
+
+The warpId method is preferred for door-to-door connections since it automatically gets coordinates from the destination warp event.
+</LearnMore>
+
+### Map Warp Events
+
+Each map defines warp events - tiles that trigger warps:
+
+```c
+// From data/maps/PetalburgCity/events.inc
+static const struct WarpEvent sPetalburgCity_WarpEvents[] = {
+    // Warp 0 - Gym entrance
+    {
+        .x = 16,
+        .y = 7,
+        .elevation = 0,
+        .warpId = 0,
+        .mapNum = MAP_NUM(PETALBURG_CITY_GYM),
+        .mapGroup = MAP_GROUP(PETALBURG_CITY_GYM),
+    },
+    // Warp 1 - Player's house
+    {
+        .x = 4,
+        .y = 8,
+        .elevation = 0,
+        .warpId = 0,
+        .mapNum = MAP_NUM(PETALBURG_CITY_MAYS_HOUSE_1F),
+        .mapGroup = MAP_GROUP(PETALBURG_CITY_MAYS_HOUSE_1F),
+    },
+    // ... more warp events
+};
+```
+
+### WarpEvent Structure
+
+```c
+struct WarpEvent
+{
+    s16 x, y;           // Position of warp tile on this map
+    u8 elevation;       // Required elevation (0 = any)
+    u8 warpId;          // Target warp ID on destination map
+    u8 mapNum;          // Destination map number
+    u8 mapGroup;        // Destination map group
+};
+```
+
+## Global Warp State
+
+The game maintains several global warp variables:
+
+```c
+// Current destination
+EWRAM_DATA static struct WarpData sWarpDestination = {0};
+
+// Last warp used (for returning)
+EWRAM_DATA static struct WarpData gLastUsedWarp = {0};
+
+// Saved warps for special features
+EWRAM_DATA static struct WarpData sSavedWarpDestination = {0};  // Dive return
+EWRAM_DATA static struct WarpData sSafeWarpDestination = {0};   // Whiteout
+
+// Position history for Escape Rope
+EWRAM_DATA static struct WarpData sWarpDestinationHistory[4] = {0};
+```
+
+<DiagramContainer title="Warp State Flow">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Current["Current State"]
+        sWarpDestination[sWarpDestination<br/>Next destination]
+    end
+
+    subgraph History["History"]
+        gLastUsedWarp[gLastUsedWarp<br/>Previous warp]
+        History1[History 0]
+        History2[History 1]
+        History3[History 2]
+        History4[History 3]
+    end
+
+    subgraph Special["Special Saves"]
+        sDive[sSavedWarpDestination<br/>Dive return point]
+        sSafe[sSafeWarpDestination<br/>Whiteout destination]
+    end
+
+    sWarpDestination --> gLastUsedWarp
+    gLastUsedWarp --> History1
+    History1 --> History2`}
+</pre>
+</DiagramContainer>
+
+## Setting Warp Destinations
+
+### SetWarpDestination
+
+The primary function for setting where to warp:
+
+```c
+void SetWarpDestination(s8 mapGroup, s8 mapNum, s8 warpId, s8 x, s8 y)
+{
+    sWarpDestination.mapGroup = mapGroup;
+    sWarpDestination.mapNum = mapNum;
+    sWarpDestination.warpId = warpId;
+    sWarpDestination.x = x;
+    sWarpDestination.y = y;
+}
+
+// Convenience macros
+#define SetWarpDestinationToMapWarp(mapGroup, mapNum, warpId) \
+    SetWarpDestination(mapGroup, mapNum, warpId, -1, -1)
+
+#define SetWarpDestinationToLocation(mapGroup, mapNum, x, y) \
+    SetWarpDestination(mapGroup, mapNum, -1, x, y)
+```
+
+### SetWarpDestinationFromWarpEvent
+
+Used when stepping on a warp tile:
+
+```c
+void SetWarpDestinationFromWarpEvent(const struct WarpEvent *warpEvent)
+{
+    SetWarpDestination(
+        warpEvent->mapGroup,
+        warpEvent->mapNum,
+        warpEvent->warpId,
+        -1,  // x (will be looked up from target warp)
+        -1   // y (will be looked up from target warp)
+    );
+}
+```
+
+## Warp Triggers
+
+### Metatile Behavior Warps
+
+Certain metatile behaviors automatically trigger warps:
+
+```c
+// Check if player stepped on warp tile
+void CheckWarpTrigger(void)
+{
+    u8 behavior = GetPlayerCurrentMetatileBehavior();
+
+    if (MetatileBehavior_IsWarpDoor(behavior))
+    {
+        // Door warp - look up warp event at player position
+        DoWarpDoor();
+    }
+    else if (MetatileBehavior_IsWarpStairs(behavior))
+    {
+        // Stair warp
+        DoWarpStairs();
+    }
+    else if (MetatileBehavior_IsWarpCave(behavior))
+    {
+        // Cave entrance
+        DoWarpCave();
+    }
+    else if (MetatileBehavior_IsWarpArrow(behavior))
+    {
+        // Arrow warp (walk to edge of map)
+        DoWarpArrow();
+    }
+}
+```
+
+### Warp Metatile Behaviors
+
+```c
+// Door behaviors
+#define MB_WARP_DOOR                0x69
+#define MB_WARP_DOOR_AUTOMATIC      0x6A  // Opens automatically
+
+// Stair behaviors
+#define MB_WARP_STAIRS_RIGHT        0x6B
+#define MB_WARP_STAIRS_LEFT         0x6C
+#define MB_WARP_STAIRS_UP           0x6D
+#define MB_WARP_STAIRS_DOWN         0x6E
+
+// Cave/entrance behaviors
+#define MB_WARP_CAVE                0x61
+#define MB_WARP_LADDER              0x62
+
+// Arrow warps (map edge transitions)
+#define MB_WARP_ARROW_UP            0x63
+#define MB_WARP_ARROW_DOWN          0x64
+#define MB_WARP_ARROW_LEFT          0x65
+#define MB_WARP_ARROW_RIGHT         0x66
+
+// Special warps
+#define MB_WARP_TELEPORTER          0x67  // Spin teleporter
+#define MB_WARP_FALL                0x68  // Fall through floor
+```
+
+### Finding Warp Events
+
+When a warp is triggered, the system looks up the warp event:
+
+```c
+// Find warp event at player's current position
+const struct WarpEvent *GetWarpEventAtPlayerPosition(void)
+{
+    s16 x = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x;
+    s16 y = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y;
+
+    return GetWarpEventAtPosition(gMapHeader.events, x, y);
+}
+
+const struct WarpEvent *GetWarpEventAtPosition(
+    const struct MapEvents *events, s16 x, s16 y)
+{
+    u8 i;
+
+    for (i = 0; i < events->warpCount; i++)
+    {
+        const struct WarpEvent *warp = &events->warps[i];
+
+        if (warp->x == x - MAP_OFFSET &&
+            warp->y == y - MAP_OFFSET)
+        {
+            return warp;
+        }
+    }
+
+    return NULL;  // No warp at this position
+}
+```
+
+## Executing Warps
+
+<DiagramContainer title="Warp Execution Sequence">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Player
+    participant Warp as Warp System
+    participant Fade as Fade Manager
+    participant Map as Map Loader
+
+    Player->>Warp: Step on warp tile
+    Warp->>Warp: SetWarpDestination()
+    Warp->>Warp: SaveLastUsedWarp()
+    Warp->>Fade: BeginWarpFade()
+    Fade->>Fade: Fade to black
+
+    Fade->>Map: UnloadCurrentMap()
+    Map->>Map: Free map data
+    Map->>Map: Clear object events
+
+    Map->>Map: LoadNewMap()
+    Map->>Map: Load tilesets
+    Map->>Map: Spawn objects
+    Map->>Map: Position player
+
+    Map->>Fade: Fade from black
+    Fade->>Player: Control restored`}
+</pre>
+</DiagramContainer>
+
+### DoWarp
+
+The main warp execution function:
+
+```c
+void DoWarp(void)
+{
+    // Save current warp as last used
+    SaveLastUsedWarp();
+
+    // Push to history (for Escape Rope)
+    PushWarpToHistory();
+
+    // Start the warp transition
+    SetMainCallback2(CB2_DoWarp);
+}
+
+static void CB2_DoWarp(void)
+{
+    switch (gMain.state)
+    {
+    case 0:
+        // Start fade out
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
+        gMain.state++;
+        break;
+
+    case 1:
+        // Wait for fade
+        if (!gPaletteFade.active)
+        {
+            // Unload current map
+            FreeAllObjectEventPalettes();
+            ResetAllObjectEventsExceptPlayer();
+
+            gMain.state++;
+        }
+        break;
+
+    case 2:
+        // Load destination map
+        LoadNewMapFromWarp();
+        gMain.state++;
+        break;
+
+    case 3:
+        // Position player at destination
+        SetPlayerPositionFromWarp();
+        gMain.state++;
+        break;
+
+    case 4:
+        // Start fade in
+        BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_BLACK);
+        gMain.state++;
+        break;
+
+    case 5:
+        // Wait for fade, then restore control
+        if (!gPaletteFade.active)
+        {
+            SetMainCallback2(CB2_Overworld);
+        }
+        break;
+    }
+}
+```
+
+### Resolving Warp Destinations
+
+When loading the destination, warpId is resolved to coordinates:
+
+```c
+void SetPlayerPositionFromWarp(void)
+{
+    s16 x, y;
+
+    if (sWarpDestination.warpId == -1)
+    {
+        // Direct coordinates
+        x = sWarpDestination.x;
+        y = sWarpDestination.y;
+    }
+    else
+    {
+        // Look up from target map's warp event
+        const struct MapEvents *events = gMapHeader.events;
+        const struct WarpEvent *warp = &events->warps[sWarpDestination.warpId];
+
+        x = warp->x + MAP_OFFSET;
+        y = warp->y + MAP_OFFSET;
+    }
+
+    // Set player position
+    gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x = x;
+    gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y = y;
+
+    // Center camera on player
+    CenterCameraOnPlayer();
+}
+```
+
+## Warp Types
+
+### Door Warps
+
+Standard door transitions with opening animation:
+
+```c
+void DoWarpDoor(void)
+{
+    const struct WarpEvent *warp = GetWarpEventAtPlayerPosition();
+
+    if (warp != NULL)
+    {
+        PlaySE(SE_EXIT);
+
+        // Play door opening animation
+        StartDoorOpenAnimation();
+
+        // Set destination
+        SetWarpDestinationFromWarpEvent(warp);
+
+        // Player walks into door
+        PlayerWalkIntoWarp();
+    }
+}
+
+static void StartDoorOpenAnimation(void)
+{
+    s16 x = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x;
+    s16 y = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y - 1;  // Door is above player
+
+    // Animate the door metatile
+    CreateTask(Task_AnimateDoorOpen, 1);
+}
+```
+
+### Stair Warps
+
+Stairs use different entry/exit animations:
+
+```c
+void DoWarpStairs(void)
+{
+    const struct WarpEvent *warp = GetWarpEventAtPlayerPosition();
+
+    if (warp != NULL)
+    {
+        u8 behavior = GetPlayerCurrentMetatileBehavior();
+
+        // Determine animation based on stair direction
+        if (MetatileBehavior_IsWarpStairsUp(behavior))
+        {
+            // Walk up off screen
+            PlayerWalkUpStairs();
+        }
+        else if (MetatileBehavior_IsWarpStairsDown(behavior))
+        {
+            // Walk down
+            PlayerWalkDownStairs();
+        }
+
+        SetWarpDestinationFromWarpEvent(warp);
+        DoWarp();
+    }
+}
+```
+
+### Cave Warps
+
+Cave entrances have a distinct fade effect:
+
+```c
+void DoWarpCave(void)
+{
+    const struct WarpEvent *warp = GetWarpEventAtPlayerPosition();
+
+    if (warp != NULL)
+    {
+        PlaySE(SE_CAVE_ENTER);
+
+        // Use cave-specific fade (darker)
+        BeginCaveFade();
+
+        SetWarpDestinationFromWarpEvent(warp);
+        DoWarp();
+    }
+}
+```
+
+### Teleporter Warps
+
+Spin teleporter effect (used in gyms):
+
+```c
+void DoWarpTeleporter(void)
+{
+    const struct WarpEvent *warp = GetWarpEventAtPlayerPosition();
+
+    if (warp != NULL)
+    {
+        PlaySE(SE_WARP);
+
+        // Spin animation
+        StartPlayerSpinAnimation();
+
+        SetWarpDestinationFromWarpEvent(warp);
+
+        // Warp after spin completes
+        CreateTask(Task_WarpAfterSpin, 1);
+    }
+}
+```
+
+### Fall Warps
+
+Falling through floor (e.g., Mt. Pyre, trick tiles):
+
+```c
+void DoWarpFall(void)
+{
+    const struct WarpEvent *warp = GetWarpEventAtPlayerPosition();
+
+    if (warp != NULL)
+    {
+        PlaySE(SE_FALL);
+
+        // Fall animation
+        StartPlayerFallAnimation();
+
+        SetWarpDestinationFromWarpEvent(warp);
+
+        // Warp after fall
+        CreateTask(Task_WarpAfterFall, 1);
+    }
+}
+```
+
+## Special Warps
+
+### Fly/Teleport
+
+Field move warps use direct coordinates:
+
+```c
+void DoFlyWarp(void)
+{
+    // Fly destinations are predefined coordinates
+    const struct FlyDestination *dest = GetSelectedFlyDestination();
+
+    // Use direct coordinates, not warpId
+    SetWarpDestination(
+        dest->mapGroup,
+        dest->mapNum,
+        -1,          // No warpId
+        dest->x,
+        dest->y
+    );
+
+    // Special fly animation and transition
+    DoFlyTransition();
+}
+
+// Fly destination data
+const struct FlyDestination sFlyDestinations[] = {
+    [FLY_LITTLEROOT_TOWN] = {
+        .mapGroup = MAP_GROUP(LITTLEROOT_TOWN),
+        .mapNum = MAP_NUM(LITTLEROOT_TOWN),
+        .x = 6,
+        .y = 9,
+    },
+    [FLY_OLDALE_TOWN] = {
+        .mapGroup = MAP_GROUP(OLDALE_TOWN),
+        .mapNum = MAP_NUM(OLDALE_TOWN),
+        .x = 7,
+        .y = 10,
+    },
+    // ... more destinations
+};
+```
+
+### Escape Rope
+
+Escape Rope returns to the last "safe" outdoor location:
+
+```c
+void DoEscapeRopeWarp(void)
+{
+    // Get last outdoor warp from history
+    struct WarpData *escapeWarp = GetEscapeRopeWarp();
+
+    if (escapeWarp != NULL)
+    {
+        // Play escape animation
+        PlaySE(SE_ESCAPE_ROPE);
+        StartEscapeRopeAnimation();
+
+        // Set destination from history
+        sWarpDestination = *escapeWarp;
+
+        // Execute warp
+        CreateTask(Task_DoEscapeRopeWarp, 1);
+    }
+}
+
+// Get the most recent outdoor warp
+struct WarpData *GetEscapeRopeWarp(void)
+{
+    // Search history for outdoor map
+    for (int i = 0; i < 4; i++)
+    {
+        if (IsMapOutdoor(sWarpDestinationHistory[i].mapGroup,
+                         sWarpDestinationHistory[i].mapNum))
+        {
+            return &sWarpDestinationHistory[i];
+        }
+    }
+    return NULL;
+}
+```
+
+### Dive Warps
+
+Diving saves and restores surface position:
+
+```c
+// When diving
+void SetDiveSurfaceWarp(void)
+{
+    // Save current position for surfacing
+    sSavedWarpDestination.mapGroup = gSaveBlock1Ptr->location.mapGroup;
+    sSavedWarpDestination.mapNum = gSaveBlock1Ptr->location.mapNum;
+    sSavedWarpDestination.warpId = -1;
+    sSavedWarpDestination.x = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x;
+    sSavedWarpDestination.y = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y;
+}
+
+// When surfacing
+void DoDiveSurfaceWarp(void)
+{
+    sWarpDestination = sSavedWarpDestination;
+    DoWarp();
+}
+```
+
+### Whiteout Warp
+
+When all Pokemon faint:
+
+```c
+void DoWhiteoutWarp(void)
+{
+    // Get last heal location (Pokemon Center)
+    sWarpDestination = GetHealLocation();
+
+    // Reset money (lose half)
+    ApplyWhiteoutPenalty();
+
+    // Heal all Pokemon
+    HealPlayerParty();
+
+    // Warp to Pokemon Center
+    DoWarp();
+}
+
+// Heal locations are set when using Pokemon Centers
+void SetLastHealLocationWarp(u8 healLocationId)
+{
+    const struct HealLocation *loc = &sHealLocations[healLocationId];
+
+    sSafeWarpDestination.mapGroup = loc->mapGroup;
+    sSafeWarpDestination.mapNum = loc->mapNum;
+    sSafeWarpDestination.warpId = -1;
+    sSafeWarpDestination.x = loc->x;
+    sSafeWarpDestination.y = loc->y;
+}
+```
+
+## Script Warps
+
+Scripts can trigger warps programmatically:
+
+```c
+// Script command: warp MAP_PETALBURG_CITY, 5, 10
+bool8 ScrCmd_warp(struct ScriptContext *ctx)
+{
+    u8 mapGroup = ScriptReadByte(ctx);
+    u8 mapNum = ScriptReadByte(ctx);
+    u8 warpId = ScriptReadByte(ctx);
+    u16 x = VarGet(ScriptReadHalfword(ctx));
+    u16 y = VarGet(ScriptReadHalfword(ctx));
+
+    SetWarpDestination(mapGroup, mapNum, warpId, x, y);
+    DoWarp();
+
+    return TRUE;  // Script waits for warp
+}
+
+// Script command: warpsilent (no transition effects)
+bool8 ScrCmd_warpsilent(struct ScriptContext *ctx)
+{
+    // ... read parameters
+
+    SetWarpDestination(mapGroup, mapNum, warpId, x, y);
+    DoWarpSilent();  // No fade, instant transition
+
+    return TRUE;
+}
+
+// Script command: warpmossdeep (special spinning warp)
+bool8 ScrCmd_warpmossdeep(struct ScriptContext *ctx)
+{
+    // ... read parameters
+
+    SetWarpDestination(mapGroup, mapNum, warpId, x, y);
+    DoMossdeepGymWarp();  // Special gym teleporter
+
+    return TRUE;
+}
+```
+
+### Common Script Warp Commands
+
+| Command | Purpose |
+|---------|---------|
+| `warp` | Standard warp with fade |
+| `warpsilent` | Instant warp, no fade |
+| `warpdoor` | Warp with door animation |
+| `warphole` | Fall through hole |
+| `warpteleport` | Teleport with spin effect |
+| `warp3` | Warp with walk animation |
+| `warp4` | Warp for union room |
+| `warp5` | Warp for battle frontier |
+
+## Warp History
+
+The system maintains a history for Escape Rope and Dig:
+
+```c
+void PushWarpToHistory(void)
+{
+    // Only save outdoor warps
+    if (!IsCurrentMapOutdoor())
+        return;
+
+    // Shift history
+    for (int i = 3; i > 0; i--)
+    {
+        sWarpDestinationHistory[i] = sWarpDestinationHistory[i - 1];
+    }
+
+    // Save current as most recent
+    sWarpDestinationHistory[0].mapGroup = gSaveBlock1Ptr->location.mapGroup;
+    sWarpDestinationHistory[0].mapNum = gSaveBlock1Ptr->location.mapNum;
+    sWarpDestinationHistory[0].warpId = -1;
+    sWarpDestinationHistory[0].x = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.x;
+    sWarpDestinationHistory[0].y = gObjectEvents[gPlayerAvatar.objectEventId].currentCoords.y;
+}
+```
+
+<DiagramContainer title="Warp History Stack">
+<pre class="mermaid">
+{`flowchart LR
+    subgraph Stack["History Stack (4 entries)"]
+        H0["[0] Most Recent<br/>Route 104"]
+        H1["[1] Petalburg City"]
+        H2["[2] Oldale Town"]
+        H3["[3] Oldest<br/>Littleroot Town"]
+    end
+
+    NewWarp["Enter Cave<br/>(Outdoor warp)"] --> H0
+    H0 --> H1
+    H1 --> H2
+    H2 --> H3
+    H3 --> Discard["Discarded"]`}
+</pre>
+</DiagramContainer>
+
+## Key Functions Reference
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `SetWarpDestination()` | overworld.c | Set warp target |
+| `DoWarp()` | overworld.c | Execute warp |
+| `GetWarpEventAtPosition()` | overworld.c | Find warp on map |
+| `SaveLastUsedWarp()` | overworld.c | Save for returning |
+| `SetWarpDestinationFromWarpEvent()` | overworld.c | Set from warp event |
+| `SetDiveSurfaceWarp()` | overworld.c | Save dive return |
+| `DoEscapeRopeWarp()` | overworld.c | Escape Rope warp |
+| `DoWhiteoutWarp()` | overworld.c | Whiteout return |
+| `ScrCmd_warp()` | scrcmd.c | Script warp command |
+| `PushWarpToHistory()` | overworld.c | Save to history |

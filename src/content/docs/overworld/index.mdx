@@ -1,0 +1,377 @@
+---
+title: Overworld Overview
+description: Field gameplay in Pokemon Emerald - walking, NPCs, maps, and exploration
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+import DeepDiveLink from '../../../components/DeepDiveLink.astro';
+
+The overworld system handles all gameplay outside of battles - walking around, talking to NPCs, entering buildings, and exploring the Pokemon world. It's one of the largest subsystems in pokeemerald, spanning dozens of source files.
+
+## Architecture Overview
+
+The overworld operates through a **callback-driven state machine** that runs every frame at 60 FPS. The main components work together to create the field gameplay experience:
+
+<DiagramContainer title="Overworld System Architecture">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Callbacks["Main Callbacks"]
+        CB1[CB1_Overworld<br/>Input Processing]
+        CB2[CB2_Overworld<br/>Render & Update]
+    end
+
+    subgraph Systems["Core Systems"]
+        Player[Player Avatar<br/>field_player_avatar.c]
+        Objects[Object Events<br/>event_object_movement.c]
+        Map[Field Map<br/>fieldmap.c]
+        Scripts[Script Engine<br/>script.c]
+    end
+
+    subgraph Data["Map Data"]
+        Header[Map Header]
+        Layout[Map Layout]
+        Events[Map Events]
+        Tilesets[Tilesets]
+    end
+
+    CB1 --> Player
+    CB2 --> Objects
+    CB2 --> Map
+    CB2 --> Scripts
+
+    Header --> Layout
+    Header --> Events
+    Layout --> Tilesets`}
+</pre>
+</DiagramContainer>
+
+## Key Source Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/overworld.c` | ~3,200 | Main overworld controller, map loading, warps |
+| `src/fieldmap.c` | ~940 | Map rendering, metatile access |
+| `src/field_player_avatar.c` | ~2,240 | Player movement and collision |
+| `src/event_object_movement.c` | ~9,000 | NPC movement and animation |
+| `src/field_control_avatar.c` | ~900 | Input processing, interactions |
+| `src/script.c` | ~500 | Script VM for map events |
+
+## Frame Update Flow
+
+Every frame, the overworld processes input, updates game state, and renders. Here's the sequence:
+
+<DiagramContainer title="Per-Frame Update Sequence">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant CB1 as CB1_Overworld
+    participant Input as Input Processing
+    participant Player as Player Avatar
+    participant CB2 as CB2_Overworld
+    participant World as World Update
+
+    CB1->>Input: Read keys
+    Input->>Input: Check menus/dialogs
+    Input->>Player: PlayerStep(direction)
+    Player->>Player: Check collision
+    Player->>Player: Update position
+
+    CB2->>World: ScriptContext_RunScript()
+    CB2->>World: RunTasks()
+    CB2->>World: AnimateSprites()
+    CB2->>World: CameraUpdate()
+    CB2->>World: BuildOamBuffer()
+    CB2->>World: UpdateTilesetAnimations()`}
+</pre>
+</DiagramContainer>
+
+### CB1_Overworld - Input Processing
+
+The first callback handles player input each frame:
+
+```c
+static void CB1_Overworld(void)
+{
+    DoCB1_Overworld(gMain.newKeys, gMain.heldKeys);
+}
+
+static void DoCB1_Overworld(u16 newKeys, u16 heldKeys)
+{
+    struct FieldInput inputStruct;
+
+    UpdatePlayerAvatarTransitionState();
+    FieldClearPlayerInput(&inputStruct);
+    FieldGetPlayerInput(&inputStruct, newKeys, heldKeys);
+
+    if (!ArePlayerFieldControlsLocked())
+    {
+        if (!ProcessPlayerFieldInput(&inputStruct))
+            PlayerStep(inputStruct.dpadDirection, newKeys, heldKeys);
+    }
+}
+```
+
+<LearnMore title="What locks player controls?" summary="Menus, dialogs, and scripted events">
+Player controls are locked during:
+- Start menu / Bag / Pokemon menu
+- Text boxes and dialogs
+- Scripted cutscenes
+- Map transitions
+- Battle transitions
+
+The lock prevents input from moving the player while other systems are active.
+</LearnMore>
+
+### CB2_Overworld - World Update
+
+The second callback updates everything else:
+
+```c
+static void CB2_Overworld(void)
+{
+    if (gFieldCallback2)
+        gFieldCallback2();
+    else
+        OverworldBasic();
+}
+
+static void OverworldBasic(void)
+{
+    ScriptContext_RunScript();      // Execute map scripts
+    RunTasks();                     // Process all tasks
+    AnimateSprites();               // Update sprite animations
+    CameraUpdate();                 // Follow player
+    UpdateCameraPanning();          // Smooth camera movement
+    BuildOamBuffer();               // Prepare sprites for rendering
+    UpdatePaletteFade();            // Handle fade effects
+    UpdateTilesetAnimations();      // Animate water, flowers, etc.
+    DoScheduledBgTilemapCopiesToVram();
+}
+```
+
+## Core Data Structures
+
+### gPlayerAvatar
+
+The player's state is stored in a global struct:
+
+```c
+struct PlayerAvatar
+{
+    u8 flags;              // PLAYER_AVATAR_FLAG_* (on foot, bike, surf, etc.)
+    u8 transitionFlags;    // State transition flags
+    u8 runningState;       // NOT_MOVING, TURN_DIRECTION, MOVING
+    u8 tileTransitionState;// T_NOT_MOVING, T_TILE_TRANSITION, T_TILE_CENTER
+    u8 spriteId;           // OAM sprite index
+    u8 objectEventId;      // Index into gObjectEvents[]
+    bool8 preventStep;     // Lock movement temporarily
+    u8 gender;             // MALE or FEMALE
+    u8 acroBikeState;      // Wheelie state for acro bike
+    u8 newDirBackup;
+    u8 bikeFrameCounter;
+    u8 bikeSpeed;
+    u32 directionHistory;  // Recent directions (for tricks)
+    // ... more fields
+};
+
+struct PlayerAvatar gPlayerAvatar;
+```
+
+### gObjectEvents
+
+All NPCs and the player share this array:
+
+```c
+struct ObjectEvent gObjectEvents[OBJECT_EVENTS_COUNT]; // 16 slots
+
+struct ObjectEvent
+{
+    // Flags (bitfields)
+    u32 active:1;
+    u32 singleMovementActive:1;
+    u32 frozen:1;
+    u32 facingDirectionLocked:1;
+    u32 isPlayer:1;
+    u32 hasReflection:1;
+    // ... more flags
+
+    u8 spriteId;
+    u8 graphicsId;         // Which sprite graphics to use
+    u8 movementType;       // How this NPC moves
+    u8 localId;            // Unique ID within map
+    u8 mapNum, mapGroup;   // Which map this belongs to
+
+    struct Coords16 initialCoords;
+    struct Coords16 currentCoords;
+    struct Coords16 previousCoords;
+
+    u8 facingDirection:4;
+    u8 movementDirection:4;
+    u8 currentElevation:4;
+    u8 previousElevation:4;
+
+    u8 movementActionId;   // Current animation
+    u8 currentMetatileBehavior;
+    // ... more fields
+};
+```
+
+<LearnMore title="Why 16 object slots?" summary="GBA memory constraints">
+The GBA has limited RAM and OAM (sprite) slots. 16 object events allows for:
+- 1 player
+- Up to 15 NPCs visible at once
+
+Maps with more NPCs only spawn those currently on-screen. As the camera moves, off-screen NPCs despawn and new ones spawn in.
+</LearnMore>
+
+## Map System Overview
+
+Maps are defined by several interconnected structures:
+
+<DiagramContainer title="Map Data Hierarchy">
+<pre class="mermaid">
+{`flowchart TD
+    MapHeader --> MapLayout
+    MapHeader --> MapEvents
+    MapHeader --> MapScripts
+    MapHeader --> MapConnections
+
+    MapLayout --> PrimaryTileset
+    MapLayout --> SecondaryTileset
+    MapLayout --> MapGrid[Map Grid Data]
+
+    MapEvents --> ObjectTemplates[Object Event Templates]
+    MapEvents --> WarpEvents[Warp Events]
+    MapEvents --> CoordEvents[Coord Events]
+    MapEvents --> BgEvents[BG Events]
+
+    PrimaryTileset --> Tiles[8x8 Tiles]
+    PrimaryTileset --> Metatiles[16x16 Metatiles]
+    PrimaryTileset --> Palettes
+    PrimaryTileset --> Behaviors[Metatile Behaviors]`}
+</pre>
+</DiagramContainer>
+
+### MapHeader
+
+Every map has a header defining its properties:
+
+```c
+struct MapHeader
+{
+    const struct MapLayout *mapLayout;
+    const struct MapEvents *events;
+    const u8 *mapScripts;
+    const struct MapConnections *connections;
+    u16 music;
+    u16 mapLayoutId;
+    u8 regionMapSectionId;
+    u8 cave;
+    u8 weather;
+    u8 mapType;
+    u8 allowCycling:1;
+    u8 allowEscaping:1;
+    u8 allowRunning:1;
+    u8 showMapName:5;
+    u8 battleType;
+};
+```
+
+### MapLayout
+
+Defines the map's dimensions and tile data:
+
+```c
+struct MapLayout
+{
+    s32 width;                              // Width in metatiles
+    s32 height;                             // Height in metatiles
+    const u16 *border;                      // Border metatiles (4 tiles)
+    const u16 *map;                         // Map grid data
+    const struct Tileset *primaryTileset;
+    const struct Tileset *secondaryTileset;
+};
+```
+
+## Movement and Collision
+
+Player movement goes through several checks before actually moving:
+
+<DiagramContainer title="Movement Decision Flow">
+<pre class="mermaid">
+{`flowchart TD
+    A[Player presses direction] --> B{Controls locked?}
+    B -->|Yes| Z[No movement]
+    B -->|No| C{Forced movement?}
+    C -->|Yes| D[Apply ice/current/slope]
+    C -->|No| E{Check collision}
+    E --> F{Collision type?}
+    F -->|NONE| G[Move normally]
+    F -->|LEDGE| H[Jump ledge]
+    F -->|OBJECT| I[Bump into NPC]
+    F -->|IMPASSABLE| J[Can't move]
+    F -->|ELEVATION| K[Wrong height]
+
+    G --> L[Update position]
+    H --> L
+    D --> L`}
+</pre>
+</DiagramContainer>
+
+### Collision Types
+
+```c
+enum {
+    COLLISION_NONE,              // Can move freely
+    COLLISION_OUTSIDE_RANGE,     // Off map edge
+    COLLISION_IMPASSABLE,        // Wall/obstacle
+    COLLISION_ELEVATION_MISMATCH,// Different height
+    COLLISION_OBJECT_EVENT,      // NPC blocking
+    COLLISION_STOP_SURFING,      // Land while surfing
+    COLLISION_LEDGE_JUMP,        // Jump down ledge
+    COLLISION_PUSHED_BOULDER,    // Strength boulder
+    COLLISION_ROTATING_GATE,     // Secret base gate
+    COLLISION_WHEELIE_HOP,       // Acro bike rail
+    // ... more types
+};
+```
+
+## Topics
+
+Explore each subsystem in detail:
+
+<DeepDiveLink
+  href="/overworld/maps"
+  title="Maps & Layouts"
+  description="Map headers, layouts, grids, and connections"
+/>
+
+<DeepDiveLink
+  href="/overworld/tilesets"
+  title="Tilesets"
+  description="Tiles, metatiles, behaviors, and animations"
+/>
+
+<DeepDiveLink
+  href="/overworld/object-events"
+  title="Object Events"
+  description="NPCs, movement types, and spawning"
+/>
+
+<DeepDiveLink
+  href="/overworld/player-movement"
+  title="Player Movement"
+  description="Walking, running, biking, surfing, and collision"
+/>
+
+<DeepDiveLink
+  href="/overworld/warps"
+  title="Warps"
+  description="Map transitions, doors, and teleportation"
+/>
+
+<DeepDiveLink
+  href="/overworld/field-callbacks"
+  title="Field Callbacks"
+  description="State management and nested callbacks"
+/>

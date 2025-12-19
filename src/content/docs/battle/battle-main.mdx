@@ -1,0 +1,1046 @@
+---
+title: Battle Main
+description: The core battle state machine driving Pokemon Emerald's battle flow
+---
+
+import LearnMore from '../../../components/LearnMore.astro';
+import DiagramContainer from '../../../components/DiagramContainer.astro';
+
+The battle system runs as a **state machine** in `battle_main.c`. Every frame, a function pointer (`gBattleMainFunc`) is called, and this pointer changes as the battle progresses through different phases. This design allows complex multi-step sequences without blocking the game loop.
+
+## State Machine Architecture
+
+<DiagramContainer title="Battle State Machine Overview">
+<pre class="mermaid">
+{`stateDiagram-v2
+    [*] --> BattleIntro: CB2_InitBattle
+
+    state BattleIntro {
+        [*] --> LoadGraphics
+        LoadGraphics --> SendOutMons
+        SendOutMons --> IntroMessage
+    }
+
+    BattleIntro --> TurnStart: Intro complete
+
+    state TurnStart {
+        [*] --> PreTurnEffects
+        PreTurnEffects --> ActionSelection
+    }
+
+    state ActionSelection {
+        [*] --> WaitForInput
+        WaitForInput --> ProcessChoice
+        ProcessChoice --> AllChosen: All battlers ready
+        ProcessChoice --> WaitForInput: More choices needed
+    }
+
+    ActionSelection --> TurnExecution: Actions chosen
+
+    state TurnExecution {
+        [*] --> SortBySpeed
+        SortBySpeed --> ExecuteAction
+        ExecuteAction --> NextAction: More actions
+        ExecuteAction --> TurnEnd: All done
+    }
+
+    TurnExecution --> TurnEnd
+
+    state TurnEnd {
+        [*] --> EndTurnEffects
+        EndTurnEffects --> CheckFainting
+        CheckFainting --> HandleExp
+    }
+
+    TurnEnd --> TurnStart: Battle continues
+    TurnEnd --> BattleEnd: Win/Lose/Run
+    BattleEnd --> [*]: Return to overworld`}
+</pre>
+</DiagramContainer>
+
+## The Main Battle Callback
+
+The primary entry point every frame:
+
+```c
+// Called every frame during battle
+void BattleMainCB2(void)
+{
+    AnimateSprites();
+    BuildOamBuffer();
+
+    // Execute current state function
+    gBattleMainFunc();
+
+    // Run tasks (animations, UI updates, etc.)
+    RunTasks();
+}
+
+// The function pointer that changes between states
+void (*gBattleMainFunc)(void);
+```
+
+The `gBattleMainFunc` pointer changes as the battle progresses:
+
+```c
+// Example state transitions
+gBattleMainFunc = BattleIntroOpponent1SendsOutMonAnimation;
+// ... after animation completes ...
+gBattleMainFunc = BattleIntroPlayer1SendsOutMonAnimation;
+// ... after player sends out ...
+gBattleMainFunc = TryDoEventsBeforeFirstTurn;
+// ... after pre-turn effects ...
+gBattleMainFunc = HandleTurnActionSelectionState;
+```
+
+## Introduction Phase
+
+### Opponent Send-Out
+
+```c
+static void BattleIntroOpponent1SendsOutMonAnimation(void)
+{
+    // Animate opponent's Pokemon appearing
+    if (gBattleControllerExecFlags == 0)
+    {
+        // Get opponent's battler ID
+        u8 battlerId = GetBattlerAtPosition(B_POSITION_OPPONENT_LEFT);
+
+        // Request send-out animation from controller
+        BtlController_EmitIntroTrainerBallThrow(battlerId, BUFFER_A);
+        MarkBattlerForControllerExec(battlerId);
+
+        // Move to next state
+        gBattleMainFunc = BattleIntroOpponent2SendsOutMonAnimation;
+    }
+}
+
+// For doubles, send out second opponent
+static void BattleIntroOpponent2SendsOutMonAnimation(void)
+{
+    if (gBattleControllerExecFlags == 0)
+    {
+        if (gBattleTypeFlags & BATTLE_TYPE_DOUBLE)
+        {
+            u8 battlerId = GetBattlerAtPosition(B_POSITION_OPPONENT_RIGHT);
+            BtlController_EmitIntroTrainerBallThrow(battlerId, BUFFER_A);
+            MarkBattlerForControllerExec(battlerId);
+        }
+        gBattleMainFunc = BattleIntroPlayer1SendsOutMonAnimation;
+    }
+}
+```
+
+### Player Send-Out
+
+```c
+static void BattleIntroPlayer1SendsOutMonAnimation(void)
+{
+    if (gBattleControllerExecFlags == 0)
+    {
+        u8 battlerId = GetBattlerAtPosition(B_POSITION_PLAYER_LEFT);
+
+        // Play "Go! [Pokemon]!" message
+        PrepareStringBattle(STRINGID_INTROSENDOUT, battlerId);
+
+        // Animate ball throw
+        BtlController_EmitIntroTrainerBallThrow(battlerId, BUFFER_A);
+        MarkBattlerForControllerExec(battlerId);
+
+        gBattleMainFunc = BattleIntroPlayer2SendsOutMonAnimation;
+    }
+}
+```
+
+<LearnMore title="Controller Execution Flags" summary="Synchronizing animations">
+`gBattleControllerExecFlags` is a bitmask tracking which battlers have pending controller commands. When a controller finishes (animation complete, etc.), it clears its bit. State functions check this to know when to proceed:
+
+```c
+// Wait for all animations to finish
+if (gBattleControllerExecFlags == 0)
+{
+    // Safe to proceed to next state
+}
+```
+
+This prevents race conditions and ensures animations play to completion.
+</LearnMore>
+
+### Pre-Turn Effects
+
+Before the first turn begins:
+
+```c
+static void TryDoEventsBeforeFirstTurn(void)
+{
+    if (gBattleControllerExecFlags)
+        return;  // Wait for pending operations
+
+    // Process abilities that trigger on switch-in
+    if (AbilityBattleEffects(ABILITYEFFECT_ON_SWITCHIN, 0, 0, 0, 0))
+        return;  // Ability triggered, will call back
+
+    // Process weather effects
+    if (TryDoWeatherFormChange())
+        return;
+
+    // All pre-turn effects done
+    gBattleMainFunc = HandleTurnActionSelectionState;
+    gBattleCommunication[ACTIONS_CONFIRMED_COUNT] = 0;
+}
+```
+
+<DiagramContainer title="Pre-Turn Effect Order">
+<pre class="mermaid">
+{`flowchart TB
+    Start[TryDoEventsBeforeFirstTurn] --> Abilities{Switch-in Abilities?}
+    Abilities -->|Yes| Process1[Process Ability]
+    Process1 --> Return1[Return - callback will resume]
+    Abilities -->|No| Weather{Weather Effects?}
+    Weather -->|Yes| Process2[Process Weather]
+    Process2 --> Return2[Return - callback will resume]
+    Weather -->|No| Items{Item Effects?}
+    Items -->|Yes| Process3[Process Item]
+    Process3 --> Return3[Return - callback will resume]
+    Items -->|No| Done[Proceed to Action Selection]`}
+</pre>
+</DiagramContainer>
+
+## Action Selection Phase
+
+This is where the player (and AI) choose what to do each turn.
+
+### Action Selection State Machine
+
+```c
+// States for action selection
+enum {
+    STATE_BEFORE_ACTION_CHOSEN,    // 0 - Initial state
+    STATE_WAIT_ACTION_CHOSEN,      // 1 - Waiting for input
+    STATE_WAIT_ACTION_CASE_CHOSEN, // 2 - Processing choice
+    STATE_WAIT_ACTION_CONFIRMED_STANDBY, // 3 - Choice confirmed
+    STATE_WAIT_ACTION_CONFIRMED,   // 4 - Ready to execute
+    STATE_SELECTION_SCRIPT,        // 5 - Running selection script
+    STATE_WAIT_SET_BEFORE_ACTION,  // 6 - Pre-action setup
+    STATE_SELECTION_SCRIPT_MAY_RUN // 7 - Script may need to run
+};
+
+static void HandleTurnActionSelectionState(void)
+{
+    s32 battler;
+
+    // Check if all battlers have confirmed actions
+    gBattleCommunication[ACTIONS_CONFIRMED_COUNT] = 0;
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        if (gBattleCommunication[battler] == STATE_WAIT_ACTION_CONFIRMED)
+            gBattleCommunication[ACTIONS_CONFIRMED_COUNT]++;
+    }
+
+    // All actions confirmed - proceed to execution
+    if (gBattleCommunication[ACTIONS_CONFIRMED_COUNT] == gBattlersCount)
+    {
+        gBattleMainFunc = SetActionsAndBattlersTurnOrder;
+        return;
+    }
+
+    // Process each battler's state
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        switch (gBattleCommunication[battler])
+        {
+        case STATE_BEFORE_ACTION_CHOSEN:
+            HandleBeforeActionChosen(battler);
+            break;
+
+        case STATE_WAIT_ACTION_CHOSEN:
+            // Waiting for controller response
+            HandleWaitActionChosen(battler);
+            break;
+
+        case STATE_WAIT_ACTION_CASE_CHOSEN:
+            // Process the chosen action type
+            HandleActionCaseChosen(battler);
+            break;
+
+        // ... more states
+        }
+    }
+}
+```
+
+### Requesting Action Choice
+
+```c
+static void HandleBeforeActionChosen(u32 battler)
+{
+    // Check if battler can act
+    if (gBattleMons[battler].hp == 0)
+    {
+        // Fainted - auto-confirm
+        gBattleCommunication[battler] = STATE_WAIT_ACTION_CONFIRMED;
+        return;
+    }
+
+    // Request action choice from controller
+    // (Player sees Fight/Bag/Pokemon/Run menu)
+    // (AI calculates best action)
+    BtlController_EmitChooseAction(
+        battler,
+        BUFFER_A,
+        gChosenActionByBattler[battler],
+        gBattleResources->bufferB[battler]
+    );
+    MarkBattlerForControllerExec(battler);
+
+    gBattleCommunication[battler] = STATE_WAIT_ACTION_CHOSEN;
+}
+```
+
+<DiagramContainer title="Action Selection Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Main as HandleTurnActionSelectionState
+    participant Ctrl as Battle Controller
+    participant Player as Player/AI
+
+    Main->>Main: Check all battlers
+    loop For each battler
+        Main->>Ctrl: EmitChooseAction()
+        Ctrl->>Player: Show menu / Calculate
+        Player->>Ctrl: Select action
+        Ctrl->>Main: Return choice
+        Main->>Main: Process choice
+    end
+    Main->>Main: All confirmed?
+    Main->>Main: SetActionsAndBattlersTurnOrder()`}
+</pre>
+</DiagramContainer>
+
+### Processing Chosen Actions
+
+```c
+static void HandleActionCaseChosen(u32 battler)
+{
+    switch (gChosenActionByBattler[battler])
+    {
+    case B_ACTION_USE_MOVE:
+        // Player chose to attack
+        if (gProtectStructs[battler].noValidMoves)
+        {
+            // Forced to use Struggle
+            gBattleCommunication[battler] = STATE_WAIT_ACTION_CONFIRMED;
+        }
+        else
+        {
+            // Need to select which move
+            BtlController_EmitChooseMove(battler, BUFFER_A, ...);
+            MarkBattlerForControllerExec(battler);
+        }
+        break;
+
+    case B_ACTION_USE_ITEM:
+        // Player wants to use item
+        BtlController_EmitChooseItem(battler, BUFFER_A);
+        MarkBattlerForControllerExec(battler);
+        break;
+
+    case B_ACTION_SWITCH:
+        // Player wants to switch Pokemon
+        BtlController_EmitChoosePokemon(battler, BUFFER_A, ...);
+        MarkBattlerForControllerExec(battler);
+        break;
+
+    case B_ACTION_RUN:
+        // Player wants to flee
+        gBattleCommunication[battler] = STATE_WAIT_ACTION_CONFIRMED;
+        break;
+
+    case B_ACTION_SAFARI_BALL:
+    case B_ACTION_SAFARI_BAIT:
+    case B_ACTION_SAFARI_GO_NEAR:
+    case B_ACTION_SAFARI_RUN:
+        // Safari zone actions
+        gBattleCommunication[battler] = STATE_WAIT_ACTION_CONFIRMED;
+        break;
+    }
+}
+```
+
+## Turn Order Calculation
+
+Once all actions are chosen, determine execution order:
+
+```c
+static void SetActionsAndBattlersTurnOrder(void)
+{
+    s32 turnOrderId = 0;
+    s32 battler;
+
+    // First pass: High-priority actions (switching, items, fleeing)
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        if (gChosenActionByBattler[battler] == B_ACTION_SWITCH
+         || gChosenActionByBattler[battler] == B_ACTION_USE_ITEM
+         || gChosenActionByBattler[battler] == B_ACTION_RUN)
+        {
+            gBattlerByTurnOrder[turnOrderId] = battler;
+            gActionsByTurnOrder[turnOrderId] = gChosenActionByBattler[battler];
+            turnOrderId++;
+        }
+    }
+
+    // Second pass: Moves sorted by priority and speed
+    for (battler = 0; battler < gBattlersCount; battler++)
+    {
+        if (gChosenActionByBattler[battler] == B_ACTION_USE_MOVE)
+        {
+            gBattlerByTurnOrder[turnOrderId] = battler;
+            gActionsByTurnOrder[turnOrderId] = B_ACTION_USE_MOVE;
+            turnOrderId++;
+        }
+    }
+
+    // Sort move users by priority bracket, then speed
+    SortBattlersBySpeed(gBattlerByTurnOrder, FALSE);
+
+    gBattleMainFunc = RunTurnActionsFunctions;
+    gBattleStruct->turnEffectsTracker = 0;
+    gBattleStruct->turnEffectsBattlerId = 0;
+}
+```
+
+### Speed and Priority Sorting
+
+```c
+void SortBattlersBySpeed(u8 *battlers, bool8 slowToFast)
+{
+    s32 i, j;
+
+    for (i = 0; i < gBattlersCount - 1; i++)
+    {
+        for (j = i + 1; j < gBattlersCount; j++)
+        {
+            u8 battler1 = battlers[i];
+            u8 battler2 = battlers[j];
+
+            // Only compare if both are using moves
+            if (gActionsByTurnOrder[i] != B_ACTION_USE_MOVE)
+                continue;
+            if (gActionsByTurnOrder[j] != B_ACTION_USE_MOVE)
+                continue;
+
+            // Compare move priorities first
+            s8 priority1 = GetMovePriority(battler1, gChosenMoveByBattler[battler1]);
+            s8 priority2 = GetMovePriority(battler2, gChosenMoveByBattler[battler2]);
+
+            if (priority1 != priority2)
+            {
+                // Higher priority goes first
+                if (priority1 < priority2)
+                    SwapTurnOrder(i, j);
+            }
+            else
+            {
+                // Same priority - compare speed
+                u32 speed1 = GetBattlerTotalSpeedStat(battler1);
+                u32 speed2 = GetBattlerTotalSpeedStat(battler2);
+
+                if (IsAbilityOnField(ABILITY_TRICK_ROOM))
+                {
+                    // Trick Room: slower goes first
+                    if (speed1 > speed2)
+                        SwapTurnOrder(i, j);
+                }
+                else
+                {
+                    // Normal: faster goes first
+                    if (speed1 < speed2)
+                        SwapTurnOrder(i, j);
+                }
+
+                // Speed tie - random
+                if (speed1 == speed2 && (Random() & 1))
+                    SwapTurnOrder(i, j);
+            }
+        }
+    }
+}
+```
+
+<DiagramContainer title="Turn Order Priority">
+<pre class="mermaid">
+{`flowchart TB
+    subgraph Priority1[Highest Priority - Always First]
+        Switch[Switching Pokemon]
+        Item[Using Items]
+        Run[Fleeing]
+    end
+
+    subgraph Priority2[Move Priority Brackets]
+        P5["+5: Helping Hand"]
+        P4["+4: Protect, Detect"]
+        P3["+3: Fake Out"]
+        P2["+2: ExtremeSpeed"]
+        P1["+1: Quick Attack, Mach Punch"]
+        P0["0: Most moves"]
+        PN1["-1: Vital Throw"]
+        PN3["-3: Focus Punch"]
+        PN5["-5: Counter, Mirror Coat"]
+        PN6["-6: Roar, Whirlwind"]
+        PN7["-7: Trick Room"]
+    end
+
+    subgraph Speed[Within Same Priority]
+        Fast[Faster Speed First]
+        Trick[Trick Room: Slower First]
+        Tie[Speed Tie: Random]
+    end
+
+    Priority1 --> Priority2
+    Priority2 --> Speed`}
+</pre>
+</DiagramContainer>
+
+### Move Priority Values
+
+```c
+// Priority values for moves
+s8 GetMovePriority(u8 battler, u16 move)
+{
+    s8 priority = gBattleMoves[move].priority;
+
+    // Ability modifiers
+    if (GetBattlerAbility(battler) == ABILITY_PRANKSTER)
+    {
+        // Prankster boosts status moves
+        if (gBattleMoves[move].power == 0)
+            priority++;
+    }
+
+    if (GetBattlerAbility(battler) == ABILITY_GALE_WINGS)
+    {
+        // Gale Wings boosts Flying moves at full HP
+        if (gBattleMoves[move].type == TYPE_FLYING
+         && gBattleMons[battler].hp == gBattleMons[battler].maxHP)
+            priority++;
+    }
+
+    return priority;
+}
+```
+
+## Turn Execution Phase
+
+Execute each action in order:
+
+```c
+static void RunTurnActionsFunctions(void)
+{
+    if (gBattleControllerExecFlags)
+        return;  // Wait for pending operations
+
+    // Check if current battler fainted
+    if (gBattleStruct->turnEffectsTracker < gBattlersCount)
+    {
+        u8 battler = gBattlerByTurnOrder[gBattleStruct->turnEffectsTracker];
+
+        // Skip fainted Pokemon
+        if (gBattleMons[battler].hp == 0
+         && gActionsByTurnOrder[gBattleStruct->turnEffectsTracker] == B_ACTION_USE_MOVE)
+        {
+            gBattleStruct->turnEffectsTracker++;
+            return;
+        }
+
+        // Execute the action
+        gBattlerAttacker = battler;
+        gBattlescriptCurrInstr = gBattleScriptsForMoveEffects[
+            gActionsByTurnOrder[gBattleStruct->turnEffectsTracker]
+        ];
+
+        // Call action function
+        sTurnActionsFuncsTable[
+            gActionsByTurnOrder[gBattleStruct->turnEffectsTracker]
+        ]();
+    }
+    else
+    {
+        // All actions executed
+        gBattleMainFunc = HandleEndTurn_BattleWon;
+    }
+}
+```
+
+### Action Function Table
+
+```c
+static void (*const sTurnActionsFuncsTable[])(void) = {
+    [B_ACTION_USE_MOVE]        = HandleAction_UseMove,
+    [B_ACTION_USE_ITEM]        = HandleAction_UseItem,
+    [B_ACTION_SWITCH]          = HandleAction_Switch,
+    [B_ACTION_RUN]             = HandleAction_Run,
+    [B_ACTION_SAFARI_BALL]     = HandleAction_SafariBall,
+    [B_ACTION_SAFARI_BAIT]     = HandleAction_SafariBait,
+    [B_ACTION_SAFARI_GO_NEAR]  = HandleAction_SafariGoNear,
+    [B_ACTION_SAFARI_RUN]      = HandleAction_SafariRun,
+    [B_ACTION_WALLY_THROW]     = HandleAction_WallyBallThrow,
+    [B_ACTION_EXEC_SCRIPT]     = HandleAction_RunBattleScript,
+    [B_ACTION_TRY_FINISH]      = HandleAction_TryFinish,
+    [B_ACTION_FINISHED]        = HandleAction_ActionFinished,
+    [B_ACTION_NOTHING_FAINTED] = HandleAction_NothingIsFainted,
+};
+```
+
+### Using a Move
+
+```c
+static void HandleAction_UseMove(void)
+{
+    u8 battler = gBattlerByTurnOrder[gBattleStruct->turnEffectsTracker];
+    u16 move = gChosenMoveByBattler[battler];
+
+    gBattlerAttacker = battler;
+    gBattlerTarget = gBattleStruct->moveTarget[battler];
+    gCurrentMove = gChosenMove = move;
+
+    // Set up script based on move effect
+    gBattlescriptCurrInstr = gBattleScriptsForMoveEffects[
+        gBattleMoves[move].effect
+    ];
+
+    // Begin script execution
+    gBattleScripting.animTurn = 0;
+    gBattleScripting.animTargetsHit = 0;
+
+    gBattleMainFunc = RunBattleScriptCommands;
+}
+```
+
+<DiagramContainer title="Move Execution Flow">
+<pre class="mermaid">
+{`sequenceDiagram
+    participant Main as RunTurnActionsFunctions
+    participant Action as HandleAction_UseMove
+    participant Script as Battle Script
+    participant Util as battle_util
+
+    Main->>Action: Execute move action
+    Action->>Action: Set gBattlerAttacker
+    Action->>Action: Set gCurrentMove
+    Action->>Script: Load move effect script
+
+    loop Script Commands
+        Script->>Script: attackcanceler
+        Script->>Util: AccuracyCalc()
+        Script->>Util: CalculateBaseDamage()
+        Script->>Script: Apply damage
+        Script->>Script: Check effects
+    end
+
+    Script->>Main: moveend - Action complete
+    Main->>Main: Next battler's action`}
+</pre>
+</DiagramContainer>
+
+### Using an Item
+
+```c
+static void HandleAction_UseItem(void)
+{
+    u8 battler = gBattlerByTurnOrder[gBattleStruct->turnEffectsTracker];
+
+    gBattlerAttacker = battler;
+    gBattle_BG0_X = 0;
+    gBattle_BG0_Y = 0;
+
+    // Determine item type
+    if (gBattleStruct->throwingPokeBall)
+    {
+        // Throwing a Poke Ball
+        gBattlescriptCurrInstr = BattleScript_ItemUseBall;
+    }
+    else
+    {
+        // Using battle item (potion, etc.)
+        gBattlescriptCurrInstr = BattleScript_ItemUseBag;
+    }
+
+    gBattleMainFunc = RunBattleScriptCommands;
+}
+```
+
+### Switching Pokemon
+
+```c
+static void HandleAction_Switch(void)
+{
+    u8 battler = gBattlerByTurnOrder[gBattleStruct->turnEffectsTracker];
+
+    gBattlerAttacker = battler;
+    gBattle_BG0_X = 0;
+    gBattle_BG0_Y = 0;
+
+    // Get new Pokemon's party index
+    gBattleStruct->battlerPartyIndexes[battler] =
+        gBattleResources->bufferA[battler][1];
+
+    // Run switch-out script
+    gBattlescriptCurrInstr = BattleScript_ActionSwitch;
+
+    gBattleMainFunc = RunBattleScriptCommands;
+}
+```
+
+### Attempting to Run
+
+```c
+static void HandleAction_Run(void)
+{
+    u8 battler = gBattlerByTurnOrder[gBattleStruct->turnEffectsTracker];
+
+    gBattlerAttacker = battler;
+
+    if (gBattleTypeFlags & BATTLE_TYPE_LINK)
+    {
+        // Can always forfeit link battles
+        gBattlescriptCurrInstr = BattleScript_LinkBattleWonOrLost;
+        gBattleOutcome = B_OUTCOME_FORFEITED;
+    }
+    else if (GetBattlerSide(battler) == B_SIDE_PLAYER)
+    {
+        // Player trying to run
+        if (CanRunFromBattle(battler))
+        {
+            gBattlescriptCurrInstr = BattleScript_GotAwaySafely;
+            gBattleOutcome = B_OUTCOME_RAN;
+        }
+        else
+        {
+            gBattlescriptCurrInstr = BattleScript_CantEscape;
+        }
+    }
+
+    gBattleMainFunc = RunBattleScriptCommands;
+}
+```
+
+## End Turn Phase
+
+After all actions execute:
+
+```c
+static void HandleEndTurn_BattleWon(void)
+{
+    if (gBattleControllerExecFlags)
+        return;
+
+    // Check for battle end conditions
+    if (gBattleOutcome != 0)
+    {
+        gBattleMainFunc = HandleEndTurn_FinishBattle;
+        return;
+    }
+
+    // Process end-of-turn effects
+    gBattleMainFunc = HandleEndTurn_Effects;
+}
+```
+
+### End-of-Turn Effects
+
+<DiagramContainer title="End Turn Effect Order">
+<pre class="mermaid">
+{`flowchart TB
+    Start[HandleEndTurn_Effects] --> Weather{Weather Damage?}
+    Weather --> Sandstorm[Sandstorm damage]
+    Weather --> Hail[Hail damage]
+    Weather --> WeatherEnd[Weather ends?]
+
+    WeatherEnd --> Abilities{Ability Effects?}
+    Abilities --> SpeedBoost[Speed Boost]
+    Abilities --> ShedSkin[Shed Skin]
+    Abilities --> Poison[Poison Heal]
+
+    Abilities --> Status{Status Damage?}
+    Status --> Burn[Burn damage]
+    Status --> Poison2[Poison damage]
+    Status --> BadPoison[Toxic damage]
+
+    Status --> Trapping{Trapping Moves?}
+    Trapping --> Wrap[Wrap damage]
+    Trapping --> Bind[Bind damage]
+    Trapping --> FireSpin[Fire Spin damage]
+
+    Trapping --> Leech{Leech Seed?}
+    Leech --> Items{Item Effects?}
+    Items --> Leftovers[Leftovers heal]
+    Items --> BlackSludge[Black Sludge]
+
+    Items --> Wish{Wish?}
+    Wish --> Perish{Perish Song?}
+    Perish --> Future{Future Sight/Doom Desire?}
+    Future --> Done[End Turn Complete]
+
+    Done --> NewTurn[New Turn Begins]`}
+</pre>
+</DiagramContainer>
+
+```c
+static void HandleEndTurn_Effects(void)
+{
+    if (gBattleControllerExecFlags)
+        return;
+
+    // Effect tracker determines which effect to process
+    switch (gBattleStruct->turnEffectsTracker)
+    {
+    case ENDTURN_REFLECT:
+        // Decrement Reflect counter
+        if (--gSideTimers[B_SIDE_PLAYER].reflectTimer == 0)
+        {
+            gSideStatuses[B_SIDE_PLAYER] &= ~SIDE_STATUS_REFLECT;
+            BattleScriptPushCursor();
+            gBattlescriptCurrInstr = BattleScript_SideStatusWoreOff;
+            // Script will print "Reflect wore off!"
+        }
+        gBattleStruct->turnEffectsTracker++;
+        break;
+
+    case ENDTURN_LIGHT_SCREEN:
+        // Similar for Light Screen
+        break;
+
+    case ENDTURN_WEATHER:
+        // Weather damage and timer
+        HandleEndTurnWeather();
+        break;
+
+    case ENDTURN_STATUS_POISON:
+        // Poison damage
+        HandleEndTurnPoisonDamage();
+        break;
+
+    case ENDTURN_STATUS_BURN:
+        // Burn damage
+        HandleEndTurnBurnDamage();
+        break;
+
+    case ENDTURN_LEFTOVERS:
+        // Leftovers healing
+        HandleEndTurnLeftovers();
+        break;
+
+    // ... many more effect handlers
+
+    case ENDTURN_DONE:
+        // All end-turn effects processed
+        gBattleStruct->turnEffectsTracker = 0;
+        gBattleMainFunc = HandleTurnActionSelectionState;
+        break;
+    }
+}
+```
+
+### Weather End-Turn
+
+```c
+static void HandleEndTurnWeather(void)
+{
+    u8 battler;
+
+    // Check weather duration
+    if (gBattleWeather & B_WEATHER_SANDSTORM)
+    {
+        if (--gWishFutureKnock.weatherDuration == 0)
+        {
+            gBattleWeather &= ~B_WEATHER_SANDSTORM;
+            gBattlescriptCurrInstr = BattleScript_SandstormSubsided;
+            gBattleStruct->turnEffectsTracker++;
+            return;
+        }
+
+        // Apply sandstorm damage to each battler
+        for (battler = 0; battler < gBattlersCount; battler++)
+        {
+            if (gBattleMons[battler].hp == 0)
+                continue;
+
+            // Rock, Ground, Steel types are immune
+            if (IS_BATTLER_OF_TYPE(battler, TYPE_ROCK)
+             || IS_BATTLER_OF_TYPE(battler, TYPE_GROUND)
+             || IS_BATTLER_OF_TYPE(battler, TYPE_STEEL))
+                continue;
+
+            // Sand Veil, Magic Guard are immune
+            if (GetBattlerAbility(battler) == ABILITY_SAND_VEIL
+             || GetBattlerAbility(battler) == ABILITY_MAGIC_GUARD)
+                continue;
+
+            // Deal 1/16 max HP damage
+            gBattleMoveDamage = gBattleMons[battler].maxHP / 16;
+            if (gBattleMoveDamage == 0)
+                gBattleMoveDamage = 1;
+
+            gBattlerTarget = battler;
+            BattleScriptPushCursor();
+            gBattlescriptCurrInstr = BattleScript_SandstormDamage;
+        }
+    }
+
+    gBattleStruct->turnEffectsTracker++;
+}
+```
+
+## Battle End
+
+When a battle ends:
+
+```c
+static void HandleEndTurn_FinishBattle(void)
+{
+    if (gBattleControllerExecFlags)
+        return;
+
+    // Determine outcome
+    switch (gBattleOutcome)
+    {
+    case B_OUTCOME_WON:
+        gBattleTextBuff1[0] = gBattlerPartyIndexes[
+            GetBattlerAtPosition(B_POSITION_OPPONENT_LEFT)
+        ];
+        gBattlescriptCurrInstr = BattleScript_PayDayMoneyPrint;
+        break;
+
+    case B_OUTCOME_LOST:
+        gBattlescriptCurrInstr = BattleScript_PrintPlayerLost;
+        break;
+
+    case B_OUTCOME_DREW:
+        gBattlescriptCurrInstr = BattleScript_PrintDrawnGame;
+        break;
+
+    case B_OUTCOME_RAN:
+        // Already handled
+        break;
+
+    case B_OUTCOME_CAUGHT:
+        gBattlescriptCurrInstr = BattleScript_WildMonWasCaught;
+        break;
+    }
+
+    gBattleMainFunc = HandleEndTurn_Cleanup;
+}
+
+static void HandleEndTurn_Cleanup(void)
+{
+    if (gBattleControllerExecFlags)
+        return;
+
+    // Return to overworld
+    BeginFastPaletteFade(3);
+    FadeOutMapMusic(5);
+
+    // Set callback to return to field
+    gBattleMainFunc = ReturnFromBattleToOverworld;
+}
+```
+
+## Faint Handling
+
+When a Pokemon faints mid-turn:
+
+```c
+static void HandleFaintedMonActions(void)
+{
+    if (gBattleControllerExecFlags)
+        return;
+
+    // Check each battler for fainting
+    do
+    {
+        u8 battler = gBattleStruct->faintedActionsState;
+
+        if (gBattleMons[battler].hp == 0
+         && !(gAbsentBattlerFlags & gBitTable[battler]))
+        {
+            // Process faint
+            gBattlerTarget = battler;
+
+            // Award experience
+            if (GetBattlerSide(battler) == B_SIDE_OPPONENT)
+            {
+                BattleScriptPushCursor();
+                gBattlescriptCurrInstr = BattleScript_GiveExpToMon;
+            }
+
+            // Prompt for replacement (if applicable)
+            if (CanBattlerSwitch(battler))
+            {
+                gAbsentBattlerFlags |= gBitTable[battler];
+                BtlController_EmitChoosePokemon(battler, BUFFER_A, ...);
+                MarkBattlerForControllerExec(battler);
+            }
+        }
+
+        gBattleStruct->faintedActionsState++;
+
+    } while (gBattleStruct->faintedActionsState < gBattlersCount);
+}
+```
+
+<DiagramContainer title="Faint Handling Flow">
+<pre class="mermaid">
+{`flowchart TB
+    Faint[Pokemon HP = 0] --> Side{Which side?}
+
+    Side -->|Player| PlayerFaint[Player's Pokemon fainted]
+    Side -->|Opponent| OpponentFaint[Opponent's Pokemon fainted]
+
+    OpponentFaint --> Exp[Award Experience]
+    Exp --> EVs[Award EVs]
+    EVs --> LevelUp{Level up?}
+    LevelUp -->|Yes| CheckEvo[Queue evolution check]
+    LevelUp -->|No| Continue
+
+    PlayerFaint --> Continue[Check for replacement]
+    CheckEvo --> Continue
+
+    Continue --> HasMore{More Pokemon?}
+    HasMore -->|Yes| Prompt[Prompt switch choice]
+    HasMore -->|No| Lose[Battle Lost]
+
+    Prompt --> SendOut[Send out replacement]
+    SendOut --> Resume[Resume battle]`}
+</pre>
+</DiagramContainer>
+
+## Key Global Variables
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `gBattleMainFunc` | `void (*)(void)` | Current state function |
+| `gBattleControllerExecFlags` | `u32` | Pending controller operations |
+| `gBattlerByTurnOrder` | `u8[4]` | Battlers sorted by turn order |
+| `gActionsByTurnOrder` | `u8[4]` | Actions in turn order |
+| `gChosenActionByBattler` | `u8[4]` | Each battler's chosen action |
+| `gChosenMoveByBattler` | `u16[4]` | Each battler's chosen move |
+| `gBattleCommunication` | `u8[32]` | State tracking per battler |
+| `gBattleOutcome` | `u8` | Battle result (0 = ongoing) |
+| `gCurrentMove` | `u16` | Currently executing move |
+| `gBattlerAttacker` | `u8` | Who is attacking |
+| `gBattlerTarget` | `u8` | Who is being targeted |
+
+## Key Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `BattleMainCB2()` | Main frame callback |
+| `HandleTurnActionSelectionState()` | Manage action choice phase |
+| `SetActionsAndBattlersTurnOrder()` | Calculate turn order |
+| `SortBattlersBySpeed()` | Sort by priority/speed |
+| `RunTurnActionsFunctions()` | Execute actions in order |
+| `HandleAction_UseMove()` | Process move action |
+| `HandleAction_Switch()` | Process switch action |
+| `HandleEndTurn_Effects()` | End-of-turn effects |
+| `HandleFaintedMonActions()` | Handle fainting |

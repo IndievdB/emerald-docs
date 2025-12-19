@@ -5,7 +5,7 @@ description: High-level sprite management in pokeemerald - templates, callbacks,
 
 import DiagramContainer from '../../../components/DiagramContainer.astro';
 
-While the [GBA hardware](/gba-hardware/graphics/sprites) provides 128 OAM entries for sprites, Pokemon Emerald builds a comprehensive sprite engine on top with templates, animations, callbacks, and tile management. This deep dive covers the software layer.
+While the [GBA hardware](/emerald-docs/gba-hardware/graphics/sprites) provides 128 OAM entries for sprites, Pokemon Emerald builds a comprehensive sprite engine on top with templates, animations, callbacks, and tile management. This deep dive covers the software layer.
 
 ## System Architecture
 
@@ -659,6 +659,6 @@ void SpriteCB_FadeOut(struct Sprite *sprite)
 
 ## Related Topics
 
-- [Sprites (Hardware)](/gba-hardware/graphics/sprites) - OAM and hardware details
-- [Palettes](/gba-hardware/graphics/palettes) - Sprite palette management
-- [Task System](/deep-dives/task-system) - Coordinating with sprite callbacks
+- [Sprites (Hardware)](/emerald-docs/gba-hardware/graphics/sprites) - OAM and hardware details
+- [Palettes](/emerald-docs/gba-hardware/graphics/palettes) - Sprite palette management
+- [Task System](/emerald-docs/deep-dives/task-system) - Coordinating with sprite callbacks
